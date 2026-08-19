@@ -6,9 +6,6 @@ import tempfile
 from pymatgen.io.vasp import Poscar
 
 
-SSH_HOST = "powerslurm-bmdguest"
-
-
 @dataclass
 class StructureInfo:
     source: str
@@ -22,15 +19,16 @@ class StructureInfo:
 
 
 def read_remote_structure(
+    ssh_host: str,
     directory: str,
     filename: str = "POSCAR",
 ) -> StructureInfo:
-    """Read a VASP structure from PowerSLURM without modifying it."""
+    """Read a VASP structure remotely without modifying the source."""
 
     remote_path = str(Path(directory) / filename)
 
     result = subprocess.run(
-        ["ssh", SSH_HOST, "cat", remote_path],
+        ["ssh", ssh_host, "cat", remote_path],
         capture_output=True,
         check=True,
     )

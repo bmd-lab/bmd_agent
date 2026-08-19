@@ -1,0 +1,21 @@
+[repositories.bmd_compute]
+name = "BMD Compute"
+path = "/a/home/cc/enginer/leeburton/projects/bmd_compute"
+role = "compute"
+access = "read_only"
+protected = true
+live = true
+
+[repositories.bmdex]
+name = "BMDex"
+path = "/a/home/cc/enginer/leeburton/projects/BMDex"
+role = "curated_knowledge"
+access = "read_only"
+protected = true
+live = false
+
+[clusters.powerslurm]
+name = "PowerSLURM"
+ssh_host = "powerslurm-bmdguest"
+partition = "leeburton-pool"
+access = "observational"

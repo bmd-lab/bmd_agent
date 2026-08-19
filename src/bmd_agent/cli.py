@@ -2,6 +2,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+from bmd_agent.config import load_resources
 from bmd_agent.resources.slurm import get_queue
 from bmd_agent.resources.vasp import read_remote_structure
 
@@ -20,6 +21,8 @@ def run_git(path: Path, *args: str) -> str:
 
 
 def inspect_repository(name: str, path: Path) -> None:
+    """Display read-only information about a Git repository."""
+
     print(name)
     print(f"  path:   {path}")
 
@@ -54,39 +57,51 @@ def inspect_repository(name: str, path: Path) -> None:
 
 
 def show_status() -> None:
-    home = Path.home()
+    """Display the state of configured BMD repositories."""
 
-    resources = {
-        "BMD Compute": home / "projects" / "bmd_compute",
-        "BMDex": home / "projects" / "BMDex",
-    }
+    config = load_resources()
 
     print("BMD Agent")
     print("=========")
     print()
 
-    for name, path in resources.items():
-        inspect_repository(name, path)
+    for repository in config["repositories"].values():
+        inspect_repository(
+            repository["name"],
+            Path(repository["path"]),
+        )
 
 
 def show_queue() -> None:
+    """Display a summary of the configured BMD SLURM queue."""
+
+    config = load_resources()
+    cluster = config["clusters"]["powerslurm"]
+
     print("BMD PowerSLURM Queue")
     print("====================")
     print()
 
     try:
-        jobs = get_queue()
+        jobs = get_queue(
+            ssh_host=cluster["ssh_host"],
+            partition=cluster["partition"],
+        )
+
     except subprocess.TimeoutExpired:
         print("PowerSLURM connection timed out.")
         return
+
     except subprocess.CalledProcessError as exc:
         print("Unable to inspect PowerSLURM.")
+
         if exc.stderr:
             print(exc.stderr.strip())
+
         return
 
     if not jobs:
-        print("No jobs in leeburton-pool.")
+        print(f"No jobs in {cluster['partition']}.")
         return
 
     states: dict[str, int] = {}
@@ -100,27 +115,42 @@ def show_queue() -> None:
     print()
 
     print("States:")
+
     for state, count in sorted(states.items()):
         print(f"  {state}: {count}")
 
     print()
 
     print("Users:")
+
     for user, count in sorted(users.items()):
         print(f"  {user}: {count}")
 
+
 def show_structure(directory: str) -> None:
+    """Display structural information from a remote VASP POSCAR."""
+
+    config = load_resources()
+    cluster = config["clusters"]["powerslurm"]
+
     print("BMD VASP Structure")
     print("==================")
     print()
 
     try:
-        info = read_remote_structure(directory)
+        info = read_remote_structure(
+            ssh_host=cluster["ssh_host"],
+            directory=directory,
+        )
+
     except subprocess.CalledProcessError as exc:
         print("Unable to read structure from PowerSLURM.")
+
         if exc.stderr:
             print(exc.stderr.decode(errors="replace").strip())
+
         return
+
     except Exception as exc:
         print(f"Unable to parse structure: {exc}")
         return
@@ -131,12 +161,16 @@ def show_structure(directory: str) -> None:
     print(f"Sites:           {info.sites}")
     print(f"Volume:          {info.volume:.3f} A^3")
     print()
+
     print("Lattice:")
     print(f"  a: {info.a:.6f} A")
     print(f"  b: {info.b:.6f} A")
     print(f"  c: {info.c:.6f} A")
 
+
 def main() -> None:
+    """BMD Agent command-line entry point."""
+
     command = sys.argv[1] if len(sys.argv) > 1 else "status"
 
     if command == "status":
@@ -151,6 +185,7 @@ def main() -> None:
             raise SystemExit(2)
 
         show_structure(sys.argv[2])
+
     else:
         print(f"Unknown command: {command}")
         print()

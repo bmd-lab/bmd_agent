@@ -2,10 +2,6 @@ from dataclasses import dataclass
 import subprocess
 
 
-SSH_HOST = "powerslurm-bmdguest"
-PARTITION = "leeburton-pool"
-
-
 @dataclass
 class SlurmJob:
     job_id: str
@@ -16,19 +12,22 @@ class SlurmJob:
     reason: str
 
 
-def get_queue() -> list[SlurmJob]:
-    """Return jobs visible in the BMD PowerSLURM partition."""
+def get_queue(
+    ssh_host: str,
+    partition: str,
+) -> list[SlurmJob]:
+    """Return jobs visible in a configured SLURM partition."""
 
     remote_command = (
         "squeue "
-        f"-p {PARTITION} "
+        f"-p {partition} "
         "--noheader "
         "'--format=%i|%u|%j|%t|%M|%R'"
     )
 
     command = [
         "ssh",
-        SSH_HOST,
+        ssh_host,
         remote_command,
     ]
 
@@ -40,7 +39,7 @@ def get_queue() -> list[SlurmJob]:
         timeout=20,
     )
 
-    jobs = []
+    jobs: list[SlurmJob] = []
 
     for line in result.stdout.splitlines():
         if not line.strip():
