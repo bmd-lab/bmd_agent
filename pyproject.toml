@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bmd-agent"
+version = "0.1.0"
+description = "Persistent scientific reference and troubleshooting agent for the BMD Lab"
+requires-python = ">=3.12"
+
+[project.scripts]
+bmd-agent = "bmd_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
