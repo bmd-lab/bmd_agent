@@ -3,6 +3,7 @@ import subprocess
 import sys
 
 from bmd_agent.resources.slurm import get_queue
+from bmd_agent.resources.vasp import read_remote_structure
 
 
 def run_git(path: Path, *args: str) -> str:
@@ -108,19 +109,55 @@ def show_queue() -> None:
     for user, count in sorted(users.items()):
         print(f"  {user}: {count}")
 
+def show_structure(directory: str) -> None:
+    print("BMD VASP Structure")
+    print("==================")
+    print()
+
+    try:
+        info = read_remote_structure(directory)
+    except subprocess.CalledProcessError as exc:
+        print("Unable to read structure from PowerSLURM.")
+        if exc.stderr:
+            print(exc.stderr.decode(errors="replace").strip())
+        return
+    except Exception as exc:
+        print(f"Unable to parse structure: {exc}")
+        return
+
+    print(f"Source:          {info.source}")
+    print(f"Formula:         {info.formula}")
+    print(f"Reduced formula: {info.reduced_formula}")
+    print(f"Sites:           {info.sites}")
+    print(f"Volume:          {info.volume:.3f} A^3")
+    print()
+    print("Lattice:")
+    print(f"  a: {info.a:.6f} A")
+    print(f"  b: {info.b:.6f} A")
+    print(f"  c: {info.c:.6f} A")
+
 def main() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else "status"
 
     if command == "status":
         show_status()
+
     elif command == "queue":
         show_queue()
+
+    elif command == "structure":
+        if len(sys.argv) < 3:
+            print("Usage: bmd-agent structure <remote-directory>")
+            raise SystemExit(2)
+
+        show_structure(sys.argv[2])
     else:
         print(f"Unknown command: {command}")
         print()
         print("Available commands:")
         print("  status")
         print("  queue")
+        print("  structure <remote-directory>")
         raise SystemExit(2)
 
 
