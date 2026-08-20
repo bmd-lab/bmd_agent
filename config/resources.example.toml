@@ -23,6 +23,14 @@ access = "read_only"
 protected = true
 live = true
 
+# Python executable from BMD Compute's own environment. BMD Agent uses this
+# only to run:
+#
+#   python -m backend.calculations.capabilities
+#
+# from the configured checkout.
+capability_python = "/home/example/micromamba/envs/bmd-compute/bin/python"
+
 [repositories.bmdex]
 name = "BMDex"
 path = "/home/example/projects/BMDex"
