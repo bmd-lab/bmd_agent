@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "Persistent scientific reference and troubleshooting agent for the BMD Lab"
 requires-python = ">=3.12"
 dependencies = [
-    "pymatgen>=2026.8.13",
+    "pymatgen-core>=2026.4.16,<2027",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
 ]
 
 [project.scripts]
@@ -16,3 +21,7 @@ bmd-agent = "bmd_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

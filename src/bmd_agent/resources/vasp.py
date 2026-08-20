@@ -1,9 +1,17 @@
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import PurePosixPath
+import shlex
 import subprocess
-import tempfile
+from typing import Callable, Iterable
 
 from pymatgen.io.vasp import Poscar
+
+
+Runner = Callable[..., subprocess.CompletedProcess[bytes]]
+
+
+class RemotePathError(ValueError):
+    """Raised when a requested remote path is outside configured policy."""
 
 
 @dataclass
@@ -21,29 +29,61 @@ class StructureInfo:
 def read_remote_structure(
     ssh_host: str,
     directory: str,
+    allowed_roots: Iterable[PurePosixPath | str],
     filename: str = "POSCAR",
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
 ) -> StructureInfo:
     """Read a VASP structure remotely without modifying the source."""
 
-    remote_path = str(Path(directory) / filename)
-
-    result = subprocess.run(
-        ["ssh", ssh_host, "cat", remote_path],
-        capture_output=True,
-        check=True,
+    remote_path = build_remote_file_path(
+        directory,
+        filename,
+        allowed_roots=allowed_roots,
+    )
+    contents = retrieve_remote_file(
+        ssh_host,
+        remote_path,
+        runner=runner,
+        timeout=timeout,
     )
 
-    with tempfile.NamedTemporaryFile(mode="wb") as tmp:
-        tmp.write(result.stdout)
-        tmp.flush()
+    return parse_poscar(contents, source=str(remote_path))
 
-        poscar = Poscar.from_file(tmp.name)
-        structure = poscar.structure
+
+def retrieve_remote_file(
+    ssh_host: str,
+    remote_path: PurePosixPath,
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> bytes:
+    """Retrieve one already-authorized remote file over SSH."""
+
+    remote_command = "cat -- " + shlex.quote(str(remote_path))
+
+    result = runner(
+        ["ssh", ssh_host, remote_command],
+        capture_output=True,
+        check=True,
+        timeout=timeout,
+    )
+
+    return result.stdout
+
+
+def parse_poscar(contents: bytes | str, *, source: str) -> StructureInfo:
+    """Parse VASP POSCAR content using pymatgen."""
+
+    text = contents.decode("utf-8") if isinstance(contents, bytes) else contents
+    poscar = Poscar.from_str(text)
+    structure = poscar.structure
 
     lattice = structure.lattice
 
     return StructureInfo(
-        source=remote_path,
+        source=source,
         formula=structure.composition.formula,
         reduced_formula=structure.composition.reduced_formula,
         sites=len(structure),
@@ -52,3 +92,69 @@ def read_remote_structure(
         b=lattice.b,
         c=lattice.c,
     )
+
+
+def build_remote_file_path(
+    directory: str | PurePosixPath,
+    filename: str,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+) -> PurePosixPath:
+    """Build and authorize a POSIX remote file path."""
+
+    remote_directory = normalize_remote_path(directory)
+    remote_filename = PurePosixPath(filename)
+
+    if (
+        remote_filename.is_absolute()
+        or not remote_filename.parts
+        or remote_filename.parts == (".",)
+        or ".." in remote_filename.parts
+    ):
+        raise RemotePathError("remote filename must be relative and must not contain '..'")
+
+    remote_path = normalize_remote_path(remote_directory / remote_filename)
+    normalized_roots = tuple(normalize_remote_path(root) for root in allowed_roots)
+
+    if not normalized_roots:
+        raise RemotePathError("no allowed remote roots are configured")
+
+    if not any(is_relative_to(remote_path, root) for root in normalized_roots):
+        raise RemotePathError("remote path is outside configured allowed roots")
+
+    return remote_path
+
+
+def normalize_remote_path(path: str | PurePosixPath) -> PurePosixPath:
+    """Lexically normalize an absolute POSIX remote path."""
+
+    raw_path = PurePosixPath(str(path).replace("\\", "/"))
+
+    if not raw_path.is_absolute():
+        raise RemotePathError("remote path must be absolute")
+
+    parts: list[str] = []
+
+    for part in raw_path.parts:
+        if part in ("", "/", "."):
+            continue
+
+        if part == "..":
+            if not parts:
+                raise RemotePathError("remote path escapes the filesystem root")
+
+            parts.pop()
+            continue
+
+        parts.append(part)
+
+    if not parts:
+        return PurePosixPath("/")
+
+    return PurePosixPath("/" + "/".join(parts))
+
+
+def is_relative_to(path: PurePosixPath, root: PurePosixPath) -> bool:
+    """Return whether path is inside root using POSIX path parts."""
+
+    return path == root or path.parts[: len(root.parts)] == root.parts

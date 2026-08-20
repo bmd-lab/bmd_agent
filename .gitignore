@@ -14,6 +14,8 @@ venv/
 .env
 .env.*
 !.env.example
+config/resources.toml
+config/resources.local.toml
 
 # Agent runtime state
 state/

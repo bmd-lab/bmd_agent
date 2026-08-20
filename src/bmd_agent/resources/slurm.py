@@ -1,5 +1,14 @@
 from dataclasses import dataclass
+import re
+import shlex
 import subprocess
+from typing import Callable
+
+
+Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+_PARTITION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SQUEUE_FORMAT = "%i|%u|%j|%t|%M|%R"
 
 
 @dataclass
@@ -15,33 +24,52 @@ class SlurmJob:
 def get_queue(
     ssh_host: str,
     partition: str,
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
 ) -> list[SlurmJob]:
     """Return jobs visible in a configured SLURM partition."""
-
-    remote_command = (
-        "squeue "
-        f"-p {partition} "
-        "--noheader "
-        "'--format=%i|%u|%j|%t|%M|%R'"
-    )
 
     command = [
         "ssh",
         ssh_host,
-        remote_command,
+        build_squeue_command(partition),
     ]
 
-    result = subprocess.run(
+    result = runner(
         command,
         capture_output=True,
         text=True,
         check=True,
-        timeout=20,
+        timeout=timeout,
     )
+
+    return parse_squeue_output(result.stdout)
+
+
+def build_squeue_command(partition: str) -> str:
+    """Build a shell-quoted read-only remote squeue command."""
+
+    if not _PARTITION_RE.fullmatch(partition):
+        raise ValueError("partition contains unsafe characters")
+
+    return " ".join(
+        [
+            "squeue",
+            "-p",
+            shlex.quote(partition),
+            "--noheader",
+            shlex.quote(f"--format={_SQUEUE_FORMAT}"),
+        ]
+    )
+
+
+def parse_squeue_output(output: str) -> list[SlurmJob]:
+    """Parse pipe-delimited squeue output."""
 
     jobs: list[SlurmJob] = []
 
-    for line in result.stdout.splitlines():
+    for line in output.splitlines():
         if not line.strip():
             continue
 

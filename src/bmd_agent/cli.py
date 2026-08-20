@@ -1,82 +1,70 @@
-from pathlib import Path
 import subprocess
 import sys
 
-from bmd_agent.config import load_resources
+from bmd_agent.config import (
+    ConfigurationError,
+    ResourceRegistry,
+    SlurmClusterResource,
+    load_resources,
+)
+from bmd_agent.resources.git import GitInspection, inspect_repository
 from bmd_agent.resources.slurm import get_queue
-from bmd_agent.resources.vasp import read_remote_structure
+from bmd_agent.resources.vasp import RemotePathError, read_remote_structure
 
 
-def run_git(path: Path, *args: str) -> str:
-    """Run a read-only Git query in a repository."""
+def show_repository(inspection: GitInspection) -> None:
+    """Display read-only information about a Git repository inspection."""
 
-    result = subprocess.run(
-        ["git", "-C", str(path), *args],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    print(inspection.name)
+    print(f"  path:   {inspection.path}")
 
-    return result.stdout.strip()
-
-
-def inspect_repository(name: str, path: Path) -> None:
-    """Display read-only information about a Git repository."""
-
-    print(name)
-    print(f"  path:   {path}")
-
-    if not path.exists():
+    if not inspection.exists:
         print("  exists: no")
         print()
         return
 
     print("  exists: yes")
 
-    try:
-        branch = run_git(path, "branch", "--show-current")
-        commit = run_git(path, "rev-parse", "HEAD")
-        status = run_git(path, "status", "--porcelain")
+    if inspection.error:
+        print(f"  git:    inspection failed: {inspection.error}")
+        print()
+        return
 
-        print(f"  branch: {branch}")
-        print(f"  commit: {commit[:12]}")
+    print(f"  branch: {inspection.branch}")
+    print(f"  commit: {inspection.commit[:12] if inspection.commit else ''}")
 
-        if status:
-            print("  state:  modified")
-            print("  changes:")
+    if inspection.modified:
+        print("  state:  modified")
+        print("  changes:")
 
-            for line in status.splitlines():
-                print(f"    {line}")
-        else:
-            print("  state:  clean")
-
-    except subprocess.CalledProcessError:
-        print("  git:    inspection failed")
+        for line in inspection.status_lines:
+            print(f"    {line}")
+    else:
+        print("  state:  clean")
 
     print()
 
 
-def show_status() -> None:
+def show_status(registry: ResourceRegistry | None = None) -> int:
     """Display the state of configured BMD repositories."""
 
-    config = load_resources()
+    registry = registry or load_resources()
 
     print("BMD Agent")
     print("=========")
     print()
 
-    for repository in config["repositories"].values():
-        inspect_repository(
-            repository["name"],
-            Path(repository["path"]),
-        )
+    for repository in registry.repositories.values():
+        show_repository(inspect_repository(repository))
+
+    return 0
 
 
-def show_queue() -> None:
+def show_queue(registry: ResourceRegistry | None = None) -> int:
     """Display a summary of the configured BMD SLURM queue."""
 
-    config = load_resources()
-    cluster = config["clusters"]["powerslurm"]
+    registry = registry or load_resources()
+    cluster = powerslurm_cluster(registry)
 
     print("BMD PowerSLURM Queue")
     print("====================")
@@ -84,13 +72,13 @@ def show_queue() -> None:
 
     try:
         jobs = get_queue(
-            ssh_host=cluster["ssh_host"],
-            partition=cluster["partition"],
+            ssh_host=cluster.ssh_host,
+            partition=cluster.partition,
         )
 
     except subprocess.TimeoutExpired:
         print("PowerSLURM connection timed out.")
-        return
+        return 1
 
     except subprocess.CalledProcessError as exc:
         print("Unable to inspect PowerSLURM.")
@@ -98,11 +86,11 @@ def show_queue() -> None:
         if exc.stderr:
             print(exc.stderr.strip())
 
-        return
+        return 1
 
     if not jobs:
-        print(f"No jobs in {cluster['partition']}.")
-        return
+        print(f"No jobs in {cluster.partition}.")
+        return 0
 
     states: dict[str, int] = {}
     users: dict[str, int] = {}
@@ -126,12 +114,14 @@ def show_queue() -> None:
     for user, count in sorted(users.items()):
         print(f"  {user}: {count}")
 
+    return 0
 
-def show_structure(directory: str) -> None:
+
+def show_structure(directory: str, registry: ResourceRegistry | None = None) -> int:
     """Display structural information from a remote VASP POSCAR."""
 
-    config = load_resources()
-    cluster = config["clusters"]["powerslurm"]
+    registry = registry or load_resources()
+    cluster = powerslurm_cluster(registry)
 
     print("BMD VASP Structure")
     print("==================")
@@ -139,9 +129,14 @@ def show_structure(directory: str) -> None:
 
     try:
         info = read_remote_structure(
-            ssh_host=cluster["ssh_host"],
+            ssh_host=cluster.ssh_host,
             directory=directory,
+            allowed_roots=cluster.allowed_remote_roots,
         )
+
+    except RemotePathError as exc:
+        print(f"Refusing remote read: {exc}")
+        return 2
 
     except subprocess.CalledProcessError as exc:
         print("Unable to read structure from PowerSLURM.")
@@ -149,11 +144,11 @@ def show_structure(directory: str) -> None:
         if exc.stderr:
             print(exc.stderr.decode(errors="replace").strip())
 
-        return
+        return 1
 
     except Exception as exc:
         print(f"Unable to parse structure: {exc}")
-        return
+        return 1
 
     print(f"Source:          {info.source}")
     print(f"Formula:         {info.formula}")
@@ -167,34 +162,53 @@ def show_structure(directory: str) -> None:
     print(f"  b: {info.b:.6f} A")
     print(f"  c: {info.c:.6f} A")
 
+    return 0
 
-def main() -> None:
+
+def powerslurm_cluster(registry: ResourceRegistry) -> SlurmClusterResource:
+    """Return the configured PowerSLURM resource."""
+
+    try:
+        return registry.clusters["powerslurm"]
+
+    except KeyError as exc:
+        raise ConfigurationError(
+            "Resource configuration must include [clusters.powerslurm]."
+        ) from exc
+
+
+def main(argv: list[str] | None = None) -> int:
     """BMD Agent command-line entry point."""
 
-    command = sys.argv[1] if len(sys.argv) > 1 else "status"
+    argv = list(sys.argv[1:] if argv is None else argv)
+    command = argv[0] if argv else "status"
 
-    if command == "status":
-        show_status()
+    try:
+        if command == "status":
+            return show_status()
 
-    elif command == "queue":
-        show_queue()
+        if command == "queue":
+            return show_queue()
 
-    elif command == "structure":
-        if len(sys.argv) < 3:
-            print("Usage: bmd-agent structure <remote-directory>")
-            raise SystemExit(2)
+        if command == "structure":
+            if len(argv) < 2:
+                print("Usage: bmd-agent structure <remote-directory>")
+                return 2
 
-        show_structure(sys.argv[2])
+            return show_structure(argv[1])
 
-    else:
-        print(f"Unknown command: {command}")
-        print()
-        print("Available commands:")
-        print("  status")
-        print("  queue")
-        print("  structure <remote-directory>")
-        raise SystemExit(2)
+    except ConfigurationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    print(f"Unknown command: {command}")
+    print()
+    print("Available commands:")
+    print("  status")
+    print("  queue")
+    print("  structure <remote-directory>")
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

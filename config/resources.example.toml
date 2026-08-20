@@ -1,0 +1,45 @@
+# Example BMD Agent resource configuration.
+#
+# Copy this file to a deployment-local location and edit the values:
+#
+#   Linux:
+#     ~/.config/bmd-agent/resources.toml
+#
+#   Windows:
+#     %APPDATA%\bmd-agent\resources.toml
+#
+# Or point BMD Agent at a specific file:
+#
+#   BMD_AGENT_RESOURCES=/path/to/resources.toml
+#
+# This example is documentation only. BMD Agent never uses it as the
+# runtime configuration.
+
+[repositories.bmd_compute]
+name = "BMD Compute"
+path = "/home/example/projects/bmd_compute"
+role = "compute"
+access = "read_only"
+protected = true
+live = true
+
+[repositories.bmdex]
+name = "BMDex"
+path = "/home/example/projects/BMDex"
+role = "curated_knowledge"
+access = "read_only"
+protected = true
+live = false
+
+[clusters.powerslurm]
+name = "PowerSLURM"
+ssh_host = "powerslurm-bmdguest"
+partition = "leeburton-pool"
+access = "observational"
+
+# Absolute POSIX directories that BMD Agent may read through this SSH
+# identity when inspecting calculation files. User-supplied paths must
+# stay within one of these roots after lexical normalization.
+allowed_remote_roots = [
+    "/home/example/calculations",
+]
