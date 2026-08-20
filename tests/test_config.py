@@ -23,6 +23,7 @@ def valid_config() -> dict:
                 "access": "read_only",
                 "protected": True,
                 "live": True,
+                "capability_python": "/home/example/micromamba/envs/bmd-compute/bin/python",
             }
         },
         "clusters": {
@@ -64,6 +65,12 @@ def test_parse_resources_returns_typed_resources() -> None:
 
     assert registry.repositories["bmd_compute"].access == "read_only"
     assert registry.repositories["bmd_compute"].protected is True
+    assert registry.repositories["bmd_compute"].capability_python is not None
+    assert registry.repositories["bmd_compute"].capability_python.parts[-3:] == (
+        "bmd-compute",
+        "bin",
+        "python",
+    )
     assert registry.clusters["powerslurm"].partition == "leeburton-pool"
     assert registry.clusters["powerslurm"].allowed_remote_roots == (
         PurePosixPath("/home/example/calculations"),

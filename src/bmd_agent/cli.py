@@ -3,9 +3,15 @@ import sys
 
 from bmd_agent.config import (
     ConfigurationError,
+    GitRepositoryResource,
     ResourceRegistry,
     SlurmClusterResource,
     load_resources,
+)
+from bmd_agent.resources.compute import (
+    ComputeCapabilities,
+    ComputeCapabilityError,
+    inspect_compute_capabilities,
 )
 from bmd_agent.resources.git import GitInspection, inspect_repository
 from bmd_agent.resources.slurm import get_queue
@@ -117,6 +123,49 @@ def show_queue(registry: ResourceRegistry | None = None) -> int:
     return 0
 
 
+def show_compute(registry: ResourceRegistry | None = None) -> int:
+    """Display BMD Compute's advertised executable capabilities."""
+
+    registry = registry or load_resources()
+    repository = bmd_compute_repository(registry)
+
+    try:
+        capabilities = inspect_compute_capabilities(repository)
+
+    except ComputeCapabilityError as exc:
+        print(f"Unable to inspect BMD Compute capabilities: {exc}")
+        return 1
+
+    print_compute_capabilities(capabilities)
+    return 0
+
+
+def print_compute_capabilities(capabilities: ComputeCapabilities) -> None:
+    """Print a concise user-facing BMD Compute capability summary."""
+
+    source = capabilities.source
+
+    print("BMD Compute Capabilities")
+    print("========================")
+    print()
+
+    print("Source:")
+    print(f"  repository: {source.get('repository', 'unknown')}")
+    print(f"  commit:     {_display_commit(source.get('commit'))}")
+    print(f"  state:      {_display_dirty_state(source.get('dirty'))}")
+    print()
+
+    print("Scope:")
+    print(f"  {capabilities.scope}")
+    print()
+
+    print("Supported capabilities:")
+    for capability in capabilities.capabilities:
+        theory = _display_theory(capability["theory"])
+        stage = _display_stage(capability["stage_type"])
+        print(f"  {theory:<6} {stage}")
+
+
 def show_structure(directory: str, registry: ResourceRegistry | None = None) -> int:
     """Display structural information from a remote VASP POSCAR."""
 
@@ -165,6 +214,24 @@ def show_structure(directory: str, registry: ResourceRegistry | None = None) -> 
     return 0
 
 
+def bmd_compute_repository(registry: ResourceRegistry) -> GitRepositoryResource:
+    """Return the configured BMD Compute repository resource."""
+
+    try:
+        return registry.repositories["bmd_compute"]
+
+    except KeyError:
+        pass
+
+    for repository in registry.repositories.values():
+        if repository.role == "compute":
+            return repository
+
+    raise ConfigurationError(
+        "Resource configuration must include a BMD Compute repository resource."
+    )
+
+
 def powerslurm_cluster(registry: ResourceRegistry) -> SlurmClusterResource:
     """Return the configured PowerSLURM resource."""
 
@@ -190,6 +257,9 @@ def main(argv: list[str] | None = None) -> int:
         if command == "queue":
             return show_queue()
 
+        if command == "compute":
+            return show_compute()
+
         if command == "structure":
             if len(argv) < 2:
                 print("Usage: bmd-agent structure <remote-directory>")
@@ -206,8 +276,45 @@ def main(argv: list[str] | None = None) -> int:
     print("Available commands:")
     print("  status")
     print("  queue")
+    print("  compute")
     print("  structure <remote-directory>")
     return 2
+
+
+def _display_commit(value: object) -> str:
+    if isinstance(value, str) and value:
+        return value[:12]
+
+    return "unavailable"
+
+
+def _display_dirty_state(value: object) -> str:
+    if value is True:
+        return "dirty"
+
+    if value is False:
+        return "clean"
+
+    return "unavailable"
+
+
+def _display_theory(value: object) -> str:
+    return str(value).upper()
+
+
+def _display_stage(value: object) -> str:
+    text = str(value)
+    labels = {
+        "band_structure": "Band Structure",
+        "dos": "DOS",
+        "relax": "Geometry Optimisation",
+        "static": "Static Energy",
+    }
+
+    if text in labels:
+        return labels[text]
+
+    return text.replace("_", " ").title()
 
 
 if __name__ == "__main__":

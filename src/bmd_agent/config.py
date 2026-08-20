@@ -26,6 +26,7 @@ class GitRepositoryResource:
     access: str
     protected: bool
     live: bool
+    capability_python: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,7 @@ def _parse_repository(
         access=access,
         protected=_required_bool(table, "protected", f"repositories.{key}", source=source),
         live=_required_bool(table, "live", f"repositories.{key}", source=source),
+        capability_python=_optional_path(table, "capability_python", f"repositories.{key}", source=source),
     )
 
 
@@ -278,6 +280,24 @@ def _required_list(
         raise ConfigurationError(f"{source}: {field}.{key} must be a list")
 
     return value
+
+
+def _optional_path(
+    table: Mapping[str, Any],
+    key: str,
+    field: str,
+    *,
+    source: Path | str,
+) -> Path | None:
+    value = table.get(key)
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str) or not value:
+        raise ConfigurationError(f"{source}: {field}.{key} must be a non-empty string")
+
+    return Path(value).expanduser()
 
 
 def _missing_config_message(path: Path) -> str:
