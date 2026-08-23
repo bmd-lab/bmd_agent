@@ -50,9 +50,11 @@ _SCIENTIFIC_READ_KEYS = ("contcar", "vasprun", "kpoints")
 _PACKAGE_RE = re.compile(r"^\[runner\]\s+(\w+)\s+version:\s*(.+)$")
 _PYTHON_RE = re.compile(r"^\[runner\]\s+python:\s*(.+)$")
 _ENV_RE = re.compile(r"\b(PMG_VASP_PSP_DIR)=([^\s]+)")
-_UUID_RE = re.compile(
-    r"\b([A-Za-z0-9_.-]+)\b.*?"
-    r"\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
+_STARTING_JOB_RE = re.compile(
+    r"\bStarting job\s*-\s*(?P<label>[^()\r\n]+?)\s*"
+    r"\((?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\)",
+    re.IGNORECASE,
 )
 
 
@@ -276,73 +278,113 @@ def parse_vasp_output_files(
             unavailable=("vasprun.xml is unavailable",),
         )
 
+    source_paths = tuple(display_paths[key] for key in local_paths)
     try:
         from pymatgen.core import Structure
         from pymatgen.io.vasp.outputs import Vasprun
-
-        parse_eigenvalues = (
-            "kpoints" in local_paths
-            or _workflow_has_stage(workflow_spec, "band_structure")
+    except Exception as exc:
+        return ScientificResult(
+            source_paths=source_paths,
+            error=str(exc),
         )
+
+    unavailable: list[str] = []
+    parse_eigenvalues = (
+        "kpoints" in local_paths
+        or _workflow_has_stage(workflow_spec, "band_structure")
+    )
+    vasprun = None
+    try:
         vasprun = _load_vasprun(
             Vasprun,
             local_paths["vasprun"],
             parse_eigenvalues=parse_eigenvalues,
         )
-        final_structure = getattr(vasprun, "final_structure", None)
-        if final_structure is None and "contcar" in local_paths:
-            final_structure = Structure.from_file(str(local_paths["contcar"]))
+    except Exception as exc:
+        unavailable.append(f"vasprun.xml could not be parsed: {exc}")
 
-        final_formula = None
-        natoms = None
-        if final_structure is not None:
+    final_structure = None
+    if vasprun is not None:
+        final_structure = getattr(vasprun, "final_structure", None)
+    if final_structure is None and "contcar" in local_paths:
+        try:
+            final_structure = Structure.from_file(str(local_paths["contcar"]))
+        except Exception as exc:
+            unavailable.append(f"CONTCAR could not be parsed: {exc}")
+
+    final_formula = None
+    natoms = None
+    if final_structure is not None:
+        try:
             final_formula = final_structure.composition.reduced_formula
             natoms = len(final_structure)
+        except Exception as exc:
+            unavailable.append(f"final structure summary could not be derived: {exc}")
+    else:
+        unavailable.append("final formula unavailable: final structure could not be derived")
 
-        final_energy = _float_or_none(getattr(vasprun, "final_energy", None))
-        energy_per_atom = (
-            final_energy / natoms
-            if final_energy is not None and natoms
-            else None
-        )
-        electronic_convergence = getattr(vasprun, "converged_electronic", None)
-        if electronic_convergence is None:
-            electronic_convergence = getattr(vasprun, "converged", None)
+    final_energy = _float_or_none(getattr(vasprun, "final_energy", None))
+    if final_energy is None:
+        unavailable.append("final energy unavailable: vasprun.xml did not provide final_energy")
 
-        band_gap = None
-        band_kpoints = None
-        bands = None
-        unavailable: list[str] = []
-        band_structure = _band_structure_from_vasprun(vasprun, local_paths)
+    energy_per_atom = (
+        final_energy / natoms
+        if final_energy is not None and natoms
+        else None
+    )
+    if energy_per_atom is None:
+        unavailable.append("energy/atom unavailable: final energy or atom count unavailable")
+
+    electronic_convergence = getattr(vasprun, "converged_electronic", None)
+    if electronic_convergence is None:
+        electronic_convergence = getattr(vasprun, "converged", None)
+    if electronic_convergence is None:
+        unavailable.append("electronic convergence unavailable: vasprun.xml did not provide convergence status")
+
+    band_gap = None
+    band_kpoints = None
+    bands = None
+    band_requested = "kpoints" in local_paths or _workflow_has_stage(workflow_spec, "band_structure")
+    if band_requested:
+        band_structure = None
+        if vasprun is None:
+            unavailable.append("band structure unavailable: vasprun.xml could not be parsed")
+        else:
+            try:
+                band_structure = _band_structure_from_vasprun(vasprun, local_paths)
+            except Exception as exc:
+                unavailable.append(f"band structure could not be derived: {exc}")
+
         if band_structure is not None:
             band_data = getattr(band_structure, "bands", None) or {}
             band_kpoints = _band_kpoint_count(band_structure, band_data)
             bands = _band_count(band_data)
+            if band_kpoints is None:
+                unavailable.append("band k-points unavailable: band structure did not provide k-points")
+            if bands is None:
+                unavailable.append("bands unavailable: band structure did not provide eigenvalue bands")
             try:
                 gap = band_structure.get_band_gap()
                 band_gap = _float_or_none(gap.get("energy"))
-            except Exception:
-                unavailable.append("band gap could not be derived")
-        elif "kpoints" in local_paths or _workflow_has_stage(workflow_spec, "band_structure"):
+            except Exception as exc:
+                unavailable.append(f"band gap could not be derived: {exc}")
+        elif vasprun is not None and not any(
+            item.startswith("band structure could not be derived")
+            for item in unavailable
+        ):
             unavailable.append("band structure could not be derived")
 
-        return ScientificResult(
-            source_paths=tuple(display_paths[key] for key in local_paths),
-            final_formula=final_formula,
-            final_energy_ev=_round_float(final_energy),
-            energy_per_atom_ev=_round_float(energy_per_atom),
-            electronic_convergence=_bool_or_none(electronic_convergence),
-            band_gap_ev=_round_float(band_gap),
-            band_kpoints=band_kpoints,
-            bands=bands,
-            unavailable=tuple(unavailable),
-        )
-
-    except Exception as exc:
-        return ScientificResult(
-            source_paths=tuple(display_paths.values()),
-            error=str(exc),
-        )
+    return ScientificResult(
+        source_paths=source_paths,
+        final_formula=final_formula,
+        final_energy_ev=_round_float(final_energy),
+        energy_per_atom_ev=_round_float(energy_per_atom),
+        electronic_convergence=_bool_or_none(electronic_convergence),
+        band_gap_ev=_round_float(band_gap),
+        band_kpoints=band_kpoints,
+        bands=bands,
+        unavailable=tuple(unavailable),
+    )
 
 
 def compare_with_producer_result(
@@ -638,9 +680,10 @@ def _parse_runtime_logs(
                 packages[package_match.group(1)] = package_match.group(2).strip()
             for env_match in _ENV_RE.finditer(line):
                 environment[env_match.group(1)] = env_match.group(2)
-            uuid_match = _UUID_RE.search(line)
-            if uuid_match:
-                stage_uuids.setdefault(uuid_match.group(1), uuid_match.group(2).lower())
+            for uuid_match in _STARTING_JOB_RE.finditer(line):
+                label = uuid_match.group("label").strip()
+                if label:
+                    stage_uuids.setdefault(label, uuid_match.group("uuid").lower())
 
     return LogRuntimeObservation(
         evidence_type=LOG_OBSERVATION,
@@ -773,21 +816,24 @@ def _load_vasprun(vasprun_cls: Any, path: Path, *, parse_eigenvalues: bool):
     common = {
         "exception_on_bad_xml": False,
         "parse_potcar_file": False,
-        "parse_dos": False,
     }
     if parse_eigenvalues:
         return vasprun_cls(str(path), **common)
+    scalar_only = {
+        "parse_dos": False,
+        **common,
+    }
     try:
         return vasprun_cls(
             str(path),
             parse_eigenvalues=False,
-            **common,
+            **scalar_only,
         )
     except TypeError:
         return vasprun_cls(
             str(path),
             parse_eigen=False,
-            **common,
+            **scalar_only,
         )
 
 

@@ -1,7 +1,10 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 import shlex
 import subprocess
+import sys
+import types
 
 import pytest
 
@@ -19,6 +22,7 @@ from bmd_agent.resources.run import (
     ScientificResult,
     WorkflowStage,
     inspect_remote_run,
+    parse_vasp_output_files,
 )
 from bmd_agent.resources.slurm import SlurmAccountingRecord
 from bmd_agent.resources.vasp import RemotePathError
@@ -165,7 +169,9 @@ def default_files(*, include_vasprun: bool = True, invalid_job_id: bool = False)
             "[runner] pymatgen version: 2026.8.13\n"
             "[runner] custodian version: 2025.12.14\n"
             "PMG_VASP_PSP_DIR=/bmd-db/potcars\n"
-            "producer-alpha completed 64210872-5626-40c7-a7eb-79f7e49272ba\n"
+            "2026-08-21 12:00:00 Starting job - stage_01 (64210872-5626-40c7-a7eb-79f7e49272ba)\n"
+            "2026-08-21 12:10:00 Starting job - custom.second (328290de-b493-4d39-a4c7-238eb9055720)\n"
+            "2026-08-21 12:20:00 Starting job - final stage (48F52369-D3B9-40B5-9A9F-A87BAE6D007F)\n"
         ).encode("utf-8"),
         f"{LOG_ROOT}/validation-run.err": b"",
         f"{LOG_ROOT}/validation-run.slurm.out": b"",
@@ -261,6 +267,11 @@ def test_inspect_run_uses_submission_stage_dirs_and_preserves_sources() -> None:
     assert inspection.runtime.evidence_type == LOG_OBSERVATION
     assert inspection.runtime.packages["pymatgen"] == "2026.8.13"
     assert inspection.runtime.environment["PMG_VASP_PSP_DIR"] == "/bmd-db/potcars"
+    assert inspection.runtime.stage_uuids == {
+        "stage_01": "64210872-5626-40c7-a7eb-79f7e49272ba",
+        "custom.second": "328290de-b493-4d39-a4c7-238eb9055720",
+        "final stage": "48f52369-d3b9-40b5-9a9f-a87bae6d007f",
+    }
     assert inspection.scientific.evidence_type == PYMATGEN_DERIVED
     assert inspection.scientific.final_formula == "Example2"
     assert all(item.evidence_type == ARTIFACT_OBSERVATION for item in inspection.final_artifacts)
@@ -338,6 +349,158 @@ def test_run_inspector_source_has_no_validation_run_specific_logic() -> None:
 
     assert "hse06" not in source
     assert "stage_03" not in source
+
+
+class FakeComposition:
+    reduced_formula = "X2"
+
+
+class FakeStructure:
+    composition = FakeComposition()
+
+    def __len__(self) -> int:
+        return 2
+
+
+class FakeBandStructure:
+    kpoints = [object(), object(), object(), object()]
+    bands = {
+        "up": [
+            [-2.0, -1.9, -1.8, -1.7],
+            [0.4, 0.5, 0.6, 0.7],
+        ]
+    }
+
+    def get_band_gap(self) -> dict[str, float]:
+        return {"energy": 1.25}
+
+
+class FakeBandVasprun:
+    calls: list[dict[str, object]] = []
+    band_calls: list[dict[str, object]] = []
+
+    def __init__(self, path: str, **kwargs: object) -> None:
+        self.calls.append({"path": path, "kwargs": kwargs})
+        self.final_structure = FakeStructure()
+        self.final_energy = -4.0
+        self.converged_electronic = True
+        self.converged = True
+        self.efermi = None if kwargs.get("parse_dos") is False else 0.3
+
+    def get_band_structure(self, **kwargs: object) -> FakeBandStructure:
+        self.band_calls.append(kwargs)
+        if self.efermi is None:
+            raise ValueError("e_fermi is None.")
+        return FakeBandStructure()
+
+
+class FakeFailingBandVasprun(FakeBandVasprun):
+    def get_band_structure(self, **kwargs: object) -> FakeBandStructure:
+        self.band_calls.append(kwargs)
+        raise ValueError("e_fermi is None.")
+
+
+@contextmanager
+def fake_pymatgen_modules(vasprun_cls: type[FakeBandVasprun]):
+    modules = {
+        "pymatgen": types.ModuleType("pymatgen"),
+        "pymatgen.core": types.ModuleType("pymatgen.core"),
+        "pymatgen.io": types.ModuleType("pymatgen.io"),
+        "pymatgen.io.vasp": types.ModuleType("pymatgen.io.vasp"),
+        "pymatgen.io.vasp.outputs": types.ModuleType("pymatgen.io.vasp.outputs"),
+    }
+    modules["pymatgen.core"].Structure = types.SimpleNamespace(
+        from_file=lambda path: FakeStructure(),
+    )
+    modules["pymatgen.io.vasp.outputs"].Vasprun = vasprun_cls
+
+    previous = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def fake_vasp_paths(tmp_path: Path) -> tuple[dict[str, Path], dict[str, str]]:
+    local_paths = {
+        "contcar": tmp_path / "CONTCAR",
+        "vasprun": tmp_path / "vasprun.xml",
+        "kpoints": tmp_path / "KPOINTS",
+    }
+    display_paths = {
+        "contcar": "/remote/result/CONTCAR",
+        "vasprun": "/remote/result/vasprun.xml",
+        "kpoints": "/remote/result/KPOINTS",
+    }
+    return local_paths, display_paths
+
+
+def arbitrary_band_workflow_spec() -> dict[str, object]:
+    return {
+        "stages": [
+            {"stage_type": "prepare", "theory": "example"},
+            {"stage_type": "screen", "theory": "example"},
+            {"stage_type": "static", "theory": "example"},
+            {"stage_type": "checkpoint", "theory": "example"},
+            {"stage_type": "band_structure", "theory": "example"},
+        ]
+    }
+
+
+def test_band_parsing_keeps_final_vasprun_fermi_reference(tmp_path: Path) -> None:
+    FakeBandVasprun.calls = []
+    FakeBandVasprun.band_calls = []
+    local_paths, display_paths = fake_vasp_paths(tmp_path)
+
+    with fake_pymatgen_modules(FakeBandVasprun):
+        result = parse_vasp_output_files(
+            local_paths,
+            display_paths,
+            arbitrary_band_workflow_spec(),
+        )
+
+    assert FakeBandVasprun.calls
+    vasprun_kwargs = FakeBandVasprun.calls[-1]["kwargs"]
+    assert "parse_dos" not in vasprun_kwargs
+    assert "parse_eigenvalues" not in vasprun_kwargs
+    assert FakeBandVasprun.band_calls[-1]["line_mode"] is True
+    assert FakeBandVasprun.band_calls[-1]["kpoints_filename"].endswith("KPOINTS")
+    assert result.error is None
+    assert result.final_formula == "X2"
+    assert result.final_energy_ev == -4.0
+    assert result.energy_per_atom_ev == -2.0
+    assert result.electronic_convergence is True
+    assert result.band_gap_ev == 1.25
+    assert result.band_kpoints == 4
+    assert result.bands == 2
+
+
+def test_scalar_observations_survive_band_structure_failure(tmp_path: Path) -> None:
+    FakeFailingBandVasprun.calls = []
+    FakeFailingBandVasprun.band_calls = []
+    local_paths, display_paths = fake_vasp_paths(tmp_path)
+
+    with fake_pymatgen_modules(FakeFailingBandVasprun):
+        result = parse_vasp_output_files(
+            local_paths,
+            display_paths,
+            arbitrary_band_workflow_spec(),
+        )
+
+    assert result.error is None
+    assert result.final_formula == "X2"
+    assert result.final_energy_ev == -4.0
+    assert result.energy_per_atom_ev == -2.0
+    assert result.electronic_convergence is True
+    assert result.band_gap_ev is None
+    assert result.band_kpoints is None
+    assert result.bands is None
+    assert "band structure could not be derived: e_fermi is None." in result.unavailable
 
 
 def test_cli_inspect_run_summary_is_evidence_oriented(
