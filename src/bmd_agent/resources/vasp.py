@@ -73,6 +73,61 @@ def retrieve_remote_file(
     return result.stdout
 
 
+def remote_file_exists(
+    ssh_host: str,
+    remote_path: PurePosixPath,
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> bool:
+    """Return whether one already-authorized remote file exists."""
+
+    return _remote_path_exists(
+        ssh_host,
+        remote_path,
+        test_flag="-f",
+        runner=runner,
+        timeout=timeout,
+    )
+
+
+def remote_directory_exists(
+    ssh_host: str,
+    remote_path: PurePosixPath,
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> bool:
+    """Return whether one already-authorized remote directory exists."""
+
+    return _remote_path_exists(
+        ssh_host,
+        remote_path,
+        test_flag="-d",
+        runner=runner,
+        timeout=timeout,
+    )
+
+
+def _remote_path_exists(
+    ssh_host: str,
+    remote_path: PurePosixPath,
+    *,
+    test_flag: str,
+    runner: Runner,
+    timeout: float,
+) -> bool:
+    remote_command = "test " + test_flag + " " + shlex.quote(str(remote_path))
+    result = runner(
+        ["ssh", ssh_host, remote_command],
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+
+    return result.returncode == 0
+
+
 def parse_poscar(contents: bytes | str, *, source: str) -> StructureInfo:
     """Parse VASP POSCAR content using pymatgen."""
 
@@ -113,7 +168,20 @@ def build_remote_file_path(
     ):
         raise RemotePathError("remote filename must be relative and must not contain '..'")
 
-    remote_path = normalize_remote_path(remote_directory / remote_filename)
+    return authorize_remote_path(
+        remote_directory / remote_filename,
+        allowed_roots=allowed_roots,
+    )
+
+
+def authorize_remote_path(
+    path: str | PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+) -> PurePosixPath:
+    """Authorize one absolute POSIX remote path against configured roots."""
+
+    remote_path = normalize_remote_path(path)
     normalized_roots = tuple(normalize_remote_path(root) for root in allowed_roots)
 
     if not normalized_roots:
