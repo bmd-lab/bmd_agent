@@ -14,6 +14,11 @@ from bmd_agent.resources.compute import (
     inspect_compute_capabilities,
 )
 from bmd_agent.resources.git import GitInspection, inspect_repository
+from bmd_agent.resources.run import (
+    RunInspection,
+    RunInspectionError,
+    inspect_remote_run,
+)
 from bmd_agent.resources.slurm import get_queue
 from bmd_agent.resources.vasp import RemotePathError, read_remote_structure
 
@@ -214,6 +219,149 @@ def show_structure(directory: str, registry: ResourceRegistry | None = None) -> 
     return 0
 
 
+def show_inspect_run(flow_root: str, registry: ResourceRegistry | None = None) -> int:
+    """Display evidence gathered for a BMD Compute run."""
+
+    registry = registry or load_resources()
+    cluster = powerslurm_cluster(registry)
+
+    print("BMD Compute Run Inspection")
+    print("==========================")
+    print()
+
+    try:
+        inspection = inspect_remote_run(cluster, flow_root)
+
+    except RemotePathError as exc:
+        print(f"Refusing remote read: {exc}")
+        return 2
+
+    except subprocess.TimeoutExpired:
+        print("Run inspection timed out.")
+        return 1
+
+    except subprocess.CalledProcessError as exc:
+        print("Unable to inspect run through PowerSLURM.")
+        if exc.stderr:
+            stderr = (
+                exc.stderr.decode(errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else str(exc.stderr)
+            )
+            print(stderr.strip())
+        return 1
+
+    except RunInspectionError as exc:
+        print(f"Unable to inspect run: {exc}")
+        return 1
+
+    print_run_inspection(inspection)
+    return 0
+
+
+def print_run_inspection(inspection: RunInspection) -> None:
+    """Print a concise evidence-oriented run inspection summary."""
+
+    print("Producer provenance (producer_provenance):")
+    print(f"  flow root:   {inspection.flow_root}")
+    print(f"  submission:  {inspection.submission_path}")
+    print(f"  git commit:  {_display_commit(inspection.producer_git.get('git_commit'))}")
+    print(f"  git state:   {inspection.producer_git.get('state', 'unavailable')}")
+    print()
+
+    print("Requested workflow (producer_provenance):")
+    for stage in inspection.workflow_stages:
+        modifiers = f" [{', '.join(stage.modifiers)}]" if stage.modifiers else ""
+        print(
+            f"  {stage.index}. {_display_theory(stage.theory):<6} "
+            f"{_display_stage(stage.stage_type)}{modifiers}"
+        )
+    print()
+
+    print("Requested execution (producer_provenance):")
+    _print_mapping_values(
+        inspection.cluster_request,
+        ("partition", "account"),
+    )
+    _print_mapping_values(
+        inspection.resources_request,
+        ("nodes", "ntasks", "mem_gb", "walltime"),
+    )
+    _print_mapping_values(
+        inspection.environment_policy,
+        ("VASP_CMD", "JOBFLOW_CONFIG_FILE", "PMG_VASP_PSP_DIR"),
+    )
+    print()
+
+    print("Scheduler (scheduler_observation):")
+    if inspection.scheduler is None:
+        print(f"  unavailable: {inspection.scheduler_error or 'no accounting record found'}")
+    else:
+        record = inspection.scheduler
+        print(f"  job id:    {record.job_id}")
+        print(f"  state:     {record.state}")
+        print(f"  exit:      {record.exit_code}")
+        print(f"  elapsed:   {record.elapsed}")
+        print(f"  start:     {record.start}")
+        print(f"  end:       {record.end}")
+        print(f"  partition: {record.partition}")
+    print()
+
+    print("Logs (log_observation):")
+    if inspection.runtime.sources:
+        if inspection.runtime.python:
+            print(f"  python: {inspection.runtime.python}")
+        for package, version in sorted(inspection.runtime.packages.items()):
+            print(f"  {package}: {version}")
+        for key, value in sorted(inspection.runtime.environment.items()):
+            print(f"  {key}: {value}")
+        if inspection.runtime.stage_uuids:
+            print("  stage UUIDs:")
+            for label, uuid in sorted(inspection.runtime.stage_uuids.items()):
+                print(f"    {label}: {uuid}")
+    else:
+        print("  unavailable: no runner log content was readable")
+    print()
+
+    print("Evidence paths (artifact_observation):")
+    print(f"  result_dir: {_present_text(inspection.result_directory)}")
+    if inspection.stage_directories:
+        print("  stage directories:")
+        for observation in inspection.stage_directories:
+            print(f"    {observation.label}: {_present_text(observation)}")
+    if inspection.log_paths:
+        print("  logs:")
+        for observation in inspection.log_paths:
+            print(f"    {observation.label}: {_present_text(observation)}")
+    print("  final artifacts:")
+    for observation in inspection.final_artifacts:
+        print(f"    {observation.label}: {_present_text(observation)}")
+    print()
+
+    print("Independent parsing (pymatgen_derived):")
+    scientific = inspection.scientific
+    if scientific.error:
+        print(f"  unavailable: {scientific.error}")
+    else:
+        _print_optional_value("final formula", scientific.final_formula)
+        _print_optional_value("final energy eV", scientific.final_energy_ev)
+        _print_optional_value("energy/atom eV", scientific.energy_per_atom_ev)
+        _print_optional_value("electronic convergence", scientific.electronic_convergence)
+        _print_optional_value("band gap eV", scientific.band_gap_ev)
+        _print_optional_value("band k-points", scientific.band_kpoints)
+        _print_optional_value("bands", scientific.bands)
+        for item in scientific.unavailable:
+            print(f"  unavailable: {item}")
+    print()
+
+    print("Comparison with durable producer result:")
+    print(f"  {inspection.comparison.status}")
+    if inspection.comparison.reason:
+        print(f"  reason: {inspection.comparison.reason}")
+    if inspection.comparison.mismatches:
+        print(f"  mismatches: {', '.join(inspection.comparison.mismatches)}")
+
+
 def bmd_compute_repository(registry: ResourceRegistry) -> GitRepositoryResource:
     """Return the configured BMD Compute repository resource."""
 
@@ -267,6 +415,13 @@ def main(argv: list[str] | None = None) -> int:
 
             return show_structure(argv[1])
 
+        if command == "inspect-run":
+            if len(argv) < 2:
+                print("Usage: bmd-agent inspect-run <remote-flow-root>")
+                return 2
+
+            return show_inspect_run(argv[1])
+
     except ConfigurationError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -278,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     print("  queue")
     print("  compute")
     print("  structure <remote-directory>")
+    print("  inspect-run <remote-flow-root>")
     return 2
 
 
@@ -315,6 +471,26 @@ def _display_stage(value: object) -> str:
         return labels[text]
 
     return text.replace("_", " ").title()
+
+
+def _print_mapping_values(mapping: object, keys: tuple[str, ...]) -> None:
+    if not isinstance(mapping, dict):
+        return
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            print(f"  {key}: {value}")
+
+
+def _present_text(observation: object) -> str:
+    path = getattr(observation, "path")
+    state = "present" if getattr(observation, "present") else "absent"
+    return f"{state} ({path})"
+
+
+def _print_optional_value(label: str, value: object) -> None:
+    if value is not None:
+        print(f"  {label}: {value}")
 
 
 if __name__ == "__main__":
