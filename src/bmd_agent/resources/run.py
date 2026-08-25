@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -38,6 +39,9 @@ SCHEDULER_OBSERVATION = "scheduler_observation"
 LOG_OBSERVATION = "log_observation"
 ARTIFACT_OBSERVATION = "artifact_observation"
 PYMATGEN_DERIVED = "pymatgen_derived"
+PRODUCER_REQUESTED = "producer_requested"
+EXECUTED_INPUT = "executed_input"
+AGENT_COMPARISON = "agent_comparison"
 
 _ARTIFACT_FILENAMES = {
     "contcar": "CONTCAR",
@@ -69,6 +73,8 @@ class WorkflowStage:
     theory: str
     modifiers: tuple[str, ...]
     label: str | None
+    options: Mapping[str, Any] = field(default_factory=dict)
+    evidence_type: str = PRODUCER_REQUESTED
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,35 @@ class LogRuntimeObservation:
 
 
 @dataclass(frozen=True)
+class InitialStructureObservation:
+    status: str
+    evidence_type: str = PRODUCER_PROVENANCE
+    representation_type: str | None = None
+    representation_hash: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class StructureObservation:
+    source_path: str | None
+    evidence_type: str = PYMATGEN_DERIVED
+    formula: str | None = None
+    reduced_formula: str | None = None
+    site_count: int | None = None
+    lattice_a: float | None = None
+    lattice_b: float | None = None
+    lattice_c: float | None = None
+    alpha: float | None = None
+    beta: float | None = None
+    gamma: float | None = None
+    volume: float | None = None
+    density: float | None = None
+    c_over_a: float | None = None
+    unavailable: tuple[str, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class ScientificResult:
     source_paths: tuple[str, ...]
     evidence_type: str = PYMATGEN_DERIVED
@@ -111,6 +146,32 @@ class ScientificResult:
     bands: int | None = None
     unavailable: tuple[str, ...] = ()
     error: str | None = None
+    structure: StructureObservation | None = None
+
+
+@dataclass(frozen=True)
+class IncarObservation:
+    label: str
+    path: str
+    present: bool
+    stage_index: int | None
+    evidence_type: str = EXECUTED_INPUT
+    values: Mapping[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class InputExpectationObservation:
+    stage_label: str
+    stage_index: int | None
+    option_path: str
+    requested_value: Any
+    input_key: str
+    expected_value: Any
+    observed_value: Any
+    status: str
+    evidence_type: str = AGENT_COMPARISON
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +203,54 @@ class RunInspection:
     runtime: LogRuntimeObservation
     scientific: ScientificResult
     comparison: ComparisonObservation
+    initial_structure: InitialStructureObservation = field(
+        default_factory=lambda: InitialStructureObservation(
+            status="unavailable",
+            reason="Submitted structure provenance was not inspected.",
+        )
+    )
+    executed_inputs: tuple[IncarObservation, ...] = ()
+    input_expectations: tuple[InputExpectationObservation, ...] = ()
+
+
+@dataclass(frozen=True)
+class QuantityComparison:
+    run_label: str
+    flow_root: str
+    quantity: str
+    label: str
+    unit: str | None
+    baseline_value: float | None
+    comparison_value: float | None
+    delta: float | None
+    percent_delta: float | None
+    status: str
+    evidence_type: str = AGENT_COMPARISON
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class InitialStructureComparison:
+    status: str
+    evidence_type: str = AGENT_COMPARISON
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RunComparison:
+    inspections: tuple[RunInspection, ...]
+    labels: Mapping[str, str]
+    quantities: tuple[QuantityComparison, ...]
+    initial_structure: InitialStructureComparison
+    energy_warning: str | None = None
+
+
+@dataclass(frozen=True)
+class _ComparableQuantity:
+    key: str
+    label: str
+    unit: str | None
+    value: Callable[[RunInspection], float | None]
 
 
 def inspect_remote_run(
@@ -151,6 +260,7 @@ def inspect_remote_run(
     remote_runner: RemoteRunner = subprocess.run,
     slurm_runner: SlurmRunner = subprocess.run,
     scientific_parser: ScientificParser | None = None,
+    modifier_policies: Iterable[Mapping[str, Any]] = (),
     timeout: float = 20,
 ) -> RunInspection:
     """Inspect a BMD Compute run through configured read-only resources."""
@@ -213,6 +323,19 @@ def inspect_remote_run(
         )
         for key, filename in _ARTIFACT_FILENAMES.items()
     )
+    executed_inputs = _observe_executed_inputs(
+        cluster.ssh_host,
+        producer["stage_dirs"],
+        producer["result_dir"],
+        allowed_roots=cluster.allowed_remote_roots,
+        runner=remote_runner,
+        timeout=timeout,
+    )
+    input_expectations = compare_requested_options_to_executed_inputs(
+        producer["workflow_stages"],
+        executed_inputs,
+        modifier_policies,
+    )
 
     attempt_state, attempt_payload = _read_attempt_state(
         cluster.ssh_host,
@@ -262,6 +385,104 @@ def inspect_remote_run(
         runtime=runtime,
         scientific=scientific,
         comparison=comparison,
+        initial_structure=producer["initial_structure"],
+        executed_inputs=executed_inputs,
+        input_expectations=input_expectations,
+    )
+
+
+def compare_remote_runs(
+    cluster: SlurmClusterResource,
+    flow_roots: Sequence[str],
+    *,
+    remote_runner: RemoteRunner = subprocess.run,
+    slurm_runner: SlurmRunner = subprocess.run,
+    scientific_parser: ScientificParser | None = None,
+    modifier_policies: Iterable[Mapping[str, Any]] = (),
+    timeout: float = 20,
+) -> RunComparison:
+    """Inspect and compare multiple remote runs through the read-only boundary."""
+
+    if len(flow_roots) < 2:
+        raise RunInspectionError("compare-runs requires at least two remote flow roots")
+
+    policy_tuple = tuple(modifier_policies)
+    inspections = tuple(
+        inspect_remote_run(
+            cluster,
+            flow_root,
+            remote_runner=remote_runner,
+            slurm_runner=slurm_runner,
+            scientific_parser=scientific_parser,
+            modifier_policies=policy_tuple,
+            timeout=timeout,
+        )
+        for flow_root in flow_roots
+    )
+    return build_run_comparison(inspections, modifier_policies=policy_tuple)
+
+
+def build_run_comparison(
+    inspections: Sequence[RunInspection],
+    *,
+    modifier_policies: Iterable[Mapping[str, Any]] = (),
+) -> RunComparison:
+    """Build numeric comparisons from already inspected run evidence."""
+
+    if len(inspections) < 2:
+        raise RunInspectionError("compare-runs requires at least two inspected runs")
+
+    policy_tuple = tuple(modifier_policies)
+    labels = {
+        inspection.flow_root: run_label_from_provenance(
+            inspection,
+            modifier_policies=policy_tuple,
+        )
+        for inspection in inspections
+    }
+    baseline = inspections[0]
+    quantities: list[QuantityComparison] = []
+    for inspection in inspections[1:]:
+        run_label = labels[inspection.flow_root]
+        for spec in _COMPARABLE_QUANTITIES:
+            baseline_value = spec.value(baseline)
+            comparison_value = spec.value(inspection)
+            status = "available"
+            reason = None
+            delta = None
+            percent_delta = None
+            if baseline_value is None:
+                status = "unavailable"
+                reason = "baseline value unavailable"
+            elif comparison_value is None:
+                status = "unavailable"
+                reason = "comparison value unavailable"
+            else:
+                delta = comparison_value - baseline_value
+                if baseline_value != 0:
+                    percent_delta = (delta / abs(baseline_value)) * 100
+            quantities.append(
+                QuantityComparison(
+                    run_label=run_label,
+                    flow_root=inspection.flow_root,
+                    quantity=spec.key,
+                    label=spec.label,
+                    unit=spec.unit,
+                    baseline_value=_round_float(baseline_value),
+                    comparison_value=_round_float(comparison_value),
+                    delta=_round_float(delta),
+                    percent_delta=_round_float(percent_delta),
+                    status=status,
+                    reason=reason,
+                )
+            )
+
+    return RunComparison(
+        inspections=tuple(inspections),
+        labels=labels,
+        quantities=tuple(quantities),
+        initial_structure=_compare_initial_structures(inspections),
+        energy_warning=_energy_warning(inspections),
     )
 
 
@@ -271,12 +492,6 @@ def parse_vasp_output_files(
     workflow_spec: Mapping[str, Any],
 ) -> ScientificResult:
     """Derive compact scientific observations from local temporary VASP files."""
-
-    if "vasprun" not in local_paths:
-        return ScientificResult(
-            source_paths=tuple(display_paths.values()),
-            unavailable=("vasprun.xml is unavailable",),
-        )
 
     source_paths = tuple(display_paths[key] for key in local_paths)
     try:
@@ -294,14 +509,17 @@ def parse_vasp_output_files(
         or _workflow_has_stage(workflow_spec, "band_structure")
     )
     vasprun = None
-    try:
-        vasprun = _load_vasprun(
-            Vasprun,
-            local_paths["vasprun"],
-            parse_eigenvalues=parse_eigenvalues,
-        )
-    except Exception as exc:
-        unavailable.append(f"vasprun.xml could not be parsed: {exc}")
+    if "vasprun" in local_paths:
+        try:
+            vasprun = _load_vasprun(
+                Vasprun,
+                local_paths["vasprun"],
+                parse_eigenvalues=parse_eigenvalues,
+            )
+        except Exception as exc:
+            unavailable.append(f"vasprun.xml could not be parsed: {exc}")
+    else:
+        unavailable.append("vasprun.xml is unavailable")
 
     final_structure = None
     if vasprun is not None:
@@ -314,14 +532,28 @@ def parse_vasp_output_files(
 
     final_formula = None
     natoms = None
+    structure_observation = None
     if final_structure is not None:
         try:
             final_formula = final_structure.composition.reduced_formula
             natoms = len(final_structure)
+            structure_source = (
+                display_paths.get("vasprun")
+                if vasprun is not None and getattr(vasprun, "final_structure", None) is final_structure
+                else display_paths.get("contcar")
+            )
+            structure_observation = structure_observation_from_structure(
+                final_structure,
+                source_path=structure_source,
+            )
         except Exception as exc:
             unavailable.append(f"final structure summary could not be derived: {exc}")
     else:
         unavailable.append("final formula unavailable: final structure could not be derived")
+        structure_observation = StructureObservation(
+            source_path=None,
+            unavailable=("final structure unavailable: final structure could not be derived",),
+        )
 
     final_energy = _float_or_none(getattr(vasprun, "final_energy", None))
     if final_energy is None:
@@ -383,6 +615,65 @@ def parse_vasp_output_files(
         band_gap_ev=_round_float(band_gap),
         band_kpoints=band_kpoints,
         bands=bands,
+        unavailable=tuple(unavailable),
+        structure=structure_observation,
+    )
+
+
+def structure_observation_from_structure(
+    structure: Any,
+    *,
+    source_path: str | None,
+) -> StructureObservation:
+    """Derive generic final-structure observations from a pymatgen Structure."""
+
+    unavailable: list[str] = []
+    composition = getattr(structure, "composition", None)
+    lattice = getattr(structure, "lattice", None)
+    formula = getattr(composition, "formula", None)
+    reduced_formula = getattr(composition, "reduced_formula", None)
+    try:
+        site_count = len(structure)
+    except Exception:
+        site_count = None
+        unavailable.append("site count unavailable: final structure length could not be read")
+
+    lattice_a = _float_or_none(getattr(lattice, "a", None))
+    lattice_b = _float_or_none(getattr(lattice, "b", None))
+    lattice_c = _float_or_none(getattr(lattice, "c", None))
+    alpha = _float_or_none(getattr(lattice, "alpha", None))
+    beta = _float_or_none(getattr(lattice, "beta", None))
+    gamma = _float_or_none(getattr(lattice, "gamma", None))
+    volume = _float_or_none(getattr(structure, "volume", None))
+    density = _float_or_none(getattr(structure, "density", None))
+
+    if lattice_a is None or lattice_b is None or lattice_c is None:
+        unavailable.append("lattice lengths unavailable: final structure lattice is incomplete")
+    if alpha is None or beta is None or gamma is None:
+        unavailable.append("lattice angles unavailable: final structure lattice is incomplete")
+    if volume is None:
+        unavailable.append("volume unavailable: final structure volume could not be read")
+    if density is None:
+        unavailable.append("density unavailable: final structure density could not be read")
+
+    c_over_a = lattice_c / lattice_a if lattice_a not in (None, 0) and lattice_c is not None else None
+    if c_over_a is None:
+        unavailable.append("c/a unavailable: lattice a or c is unavailable")
+
+    return StructureObservation(
+        source_path=source_path,
+        formula=str(formula) if formula is not None else None,
+        reduced_formula=str(reduced_formula) if reduced_formula is not None else None,
+        site_count=site_count,
+        lattice_a=_round_float(lattice_a),
+        lattice_b=_round_float(lattice_b),
+        lattice_c=_round_float(lattice_c),
+        alpha=_round_float(alpha),
+        beta=_round_float(beta),
+        gamma=_round_float(gamma),
+        volume=_round_float(volume),
+        density=_round_float(density),
+        c_over_a=_round_float(c_over_a),
         unavailable=tuple(unavailable),
     )
 
@@ -475,6 +766,7 @@ def _parse_submission(
 
     return {
         "workflow_stages": _parse_workflow_stages(workflow_spec),
+        "initial_structure": _initial_structure_observation(flow_spec),
         "stage_dirs": _parse_stage_dirs(paths, allowed_roots=allowed_roots),
         "result_dir": _required_authorized_path(
             paths,
@@ -508,6 +800,9 @@ def _parse_workflow_stages(workflow_spec: Mapping[str, Any]) -> tuple[WorkflowSt
         modifiers = stage.get("modifiers") or []
         if not isinstance(modifiers, list) or not all(isinstance(item, str) for item in modifiers):
             raise RunInspectionError("workflow stage modifiers must be a list of strings")
+        options = stage.get("options") or {}
+        if not isinstance(options, Mapping):
+            raise RunInspectionError("workflow stage options must be a JSON object")
         label = stage.get("label")
         if label is not None and not isinstance(label, str):
             raise RunInspectionError("workflow stage label must be a string or null")
@@ -518,6 +813,7 @@ def _parse_workflow_stages(workflow_spec: Mapping[str, Any]) -> tuple[WorkflowSt
                 theory=theory,
                 modifiers=tuple(modifiers),
                 label=label,
+                options=_json_safe_value(options),
             )
         )
 
@@ -597,6 +893,191 @@ def _read_attempt_state(
         )
     except RunInspectionError as exc:
         return AttemptStateObservation(path=str(path), present=True, error=str(exc)), None
+
+
+def _observe_executed_inputs(
+    ssh_host: str,
+    stage_dirs: Mapping[str, PurePosixPath],
+    result_dir: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> tuple[IncarObservation, ...]:
+    observations: list[IncarObservation] = []
+    seen_paths: set[str] = set()
+
+    for index, (label, directory) in enumerate(stage_dirs.items(), start=1):
+        observation = _observe_incar(
+            ssh_host,
+            label=label,
+            directory=directory,
+            stage_index=index,
+            allowed_roots=allowed_roots,
+            runner=runner,
+            timeout=timeout,
+        )
+        observations.append(observation)
+        seen_paths.add(observation.path)
+
+    result_observation = _observe_incar(
+        ssh_host,
+        label="result_dir",
+        directory=result_dir,
+        stage_index=None,
+        allowed_roots=allowed_roots,
+        runner=runner,
+        timeout=timeout,
+    )
+    if result_observation.path not in seen_paths:
+        observations.append(result_observation)
+
+    return tuple(observations)
+
+
+def _observe_incar(
+    ssh_host: str,
+    *,
+    label: str,
+    directory: PurePosixPath,
+    stage_index: int | None,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> IncarObservation:
+    path = build_remote_file_path(
+        directory,
+        "INCAR",
+        allowed_roots=allowed_roots,
+    )
+    present = remote_file_exists(ssh_host, path, runner=runner, timeout=timeout)
+    if not present:
+        return IncarObservation(
+            label=label,
+            path=str(path),
+            present=False,
+            stage_index=stage_index,
+        )
+
+    try:
+        contents = retrieve_remote_file(
+            ssh_host,
+            path,
+            runner=runner,
+            timeout=timeout,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return IncarObservation(
+            label=label,
+            path=str(path),
+            present=True,
+            stage_index=stage_index,
+            error=str(exc),
+        )
+
+    values, error = parse_incar_contents(contents)
+    return IncarObservation(
+        label=label,
+        path=str(path),
+        present=True,
+        stage_index=stage_index,
+        values=values,
+        error=error,
+    )
+
+
+def parse_incar_contents(contents: bytes | str) -> tuple[Mapping[str, Any], str | None]:
+    """Parse VASP INCAR content with pymatgen into JSON-safe key/value evidence."""
+
+    text = contents.decode("utf-8") if isinstance(contents, bytes) else contents
+    try:
+        from pymatgen.io.vasp.inputs import Incar
+    except Exception as exc:
+        return {}, str(exc)
+
+    try:
+        if hasattr(Incar, "from_str"):
+            incar = Incar.from_str(text)
+        else:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+                handle.write(text)
+                temporary_path = handle.name
+            try:
+                incar = Incar.from_file(temporary_path)
+            finally:
+                Path(temporary_path).unlink(missing_ok=True)
+    except Exception as exc:
+        return {}, str(exc)
+
+    return {
+        str(key).upper(): _json_safe_value(value)
+        for key, value in dict(incar).items()
+    }, None
+
+
+def compare_requested_options_to_executed_inputs(
+    stages: Sequence[WorkflowStage],
+    executed_inputs: Sequence[IncarObservation],
+    modifier_policies: Iterable[Mapping[str, Any]],
+) -> tuple[InputExpectationObservation, ...]:
+    """Compare producer-requested option effects with observed VASP inputs."""
+
+    policies = tuple(_input_expectation_policies(modifier_policies))
+    if not policies:
+        return ()
+
+    inputs_by_index = {
+        observation.stage_index: observation
+        for observation in executed_inputs
+        if observation.stage_index is not None
+    }
+    observations: list[InputExpectationObservation] = []
+    for stage in stages:
+        executed = inputs_by_index.get(stage.index)
+        for policy in policies:
+            if policy["modifier"] not in stage.modifiers:
+                continue
+            requested_value = _nested_option_value(
+                stage.options,
+                policy["option_key"],
+                policy["method_key"],
+            )
+            if requested_value is None:
+                continue
+            effect = policy["effects"].get(str(requested_value))
+            if not isinstance(effect, Mapping):
+                continue
+            for input_key, expected_value in effect.items():
+                observed_value = None
+                status = "unavailable"
+                reason = "executed INCAR is unavailable"
+                if executed is not None and executed.present and not executed.error:
+                    observed_value = executed.values.get(str(input_key).upper())
+                    if observed_value is None:
+                        status = "mismatch"
+                        reason = "expected INCAR key is absent"
+                    elif _values_match(expected_value, observed_value):
+                        status = "match"
+                        reason = None
+                    else:
+                        status = "mismatch"
+                        reason = "observed INCAR value differs from producer-requested option effect"
+                elif executed is not None and executed.error:
+                    reason = executed.error
+                observations.append(
+                    InputExpectationObservation(
+                        stage_label=executed.label if executed is not None else stage.label or f"stage_{stage.index}",
+                        stage_index=stage.index,
+                        option_path=f"{policy['option_key']}.{policy['method_key']}",
+                        requested_value=requested_value,
+                        input_key=str(input_key).upper(),
+                        expected_value=expected_value,
+                        observed_value=observed_value,
+                        status=status,
+                        reason=reason,
+                    )
+                )
+    return tuple(observations)
 
 
 def _find_job_id(
@@ -709,10 +1190,10 @@ def _derive_scientific_result(
         for observation in artifacts
         if observation.present
     }
-    if "vasprun" not in present:
+    if not any(key in present for key in _SCIENTIFIC_READ_KEYS):
         return ScientificResult(
             source_paths=tuple(observation.path for observation in present.values()),
-            unavailable=("vasprun.xml is unavailable",),
+            unavailable=("final VASP structure/result artifacts are unavailable",),
         )
 
     with tempfile.TemporaryDirectory(prefix="bmd-agent-run-") as tmpdir:
@@ -766,6 +1247,189 @@ def _observe_remote_path(
 def _producer_git_provenance(provenance: Mapping[str, Any]) -> Mapping[str, Any]:
     bmd_compute = _optional_mapping(provenance, "bmd_compute")
     return dict(_optional_mapping(bmd_compute, "source"))
+
+
+def _initial_structure_observation(flow_spec: Mapping[str, Any]) -> InitialStructureObservation:
+    structure = flow_spec.get("structure")
+    if not isinstance(structure, Mapping):
+        return InitialStructureObservation(
+            status="unavailable",
+            reason="flow_spec.structure was not preserved as a JSON object.",
+        )
+
+    structure_type = structure.get("type")
+    representation_type = str(structure_type) if structure_type is not None else "unknown"
+    text = structure.get("text")
+    if isinstance(text, str) and text:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        structure_format = structure.get("format")
+        if isinstance(structure_format, str) and structure_format:
+            representation_type = f"{representation_type}:{structure_format}"
+        return InitialStructureObservation(
+            status="available",
+            representation_type=representation_type,
+            representation_hash=digest,
+        )
+
+    return InitialStructureObservation(
+        status="unavailable",
+        representation_type=representation_type,
+        reason=(
+            "Submitted structure content was not preserved in a stable exact "
+            "representation; path-only or parsed provenance cannot establish identity."
+        ),
+    )
+
+
+def run_label_from_provenance(
+    inspection: RunInspection,
+    *,
+    modifier_policies: Iterable[Mapping[str, Any]] = (),
+) -> str:
+    """Create a concise display label from producer-requested workflow provenance."""
+
+    theories = _ordered_unique(stage.theory.upper() for stage in inspection.workflow_stages)
+    base = " -> ".join(theories) if theories else inspection.flow_root
+    modifiers: list[str] = []
+    for stage in inspection.workflow_stages:
+        for modifier in stage.modifiers:
+            label = _modifier_option_label(stage, modifier, modifier_policies)
+            if label not in modifiers:
+                modifiers.append(label)
+    if modifiers:
+        return f"{base} + {' + '.join(modifiers)}"
+    return base
+
+
+def _modifier_option_label(
+    stage: WorkflowStage,
+    modifier: str,
+    modifier_policies: Iterable[Mapping[str, Any]],
+) -> str:
+    for policy in modifier_policies:
+        if policy.get("modifier") != modifier:
+            continue
+        option_key = policy.get("option_key")
+        method_key = policy.get("method_key")
+        if not isinstance(option_key, str) or not isinstance(method_key, str):
+            continue
+        requested_value = _nested_option_value(stage.options, option_key, method_key)
+        if requested_value is None:
+            continue
+        for method in policy.get("methods") or []:
+            if not isinstance(method, Mapping):
+                continue
+            if method.get("value") == requested_value and isinstance(method.get("label"), str):
+                return str(method["label"])
+        return f"{modifier}:{requested_value}"
+    return str(modifier).replace("_", " ")
+
+
+def _input_expectation_policies(
+    modifier_policies: Iterable[Mapping[str, Any]],
+) -> Iterable[Mapping[str, Any]]:
+    for policy in modifier_policies:
+        modifier = policy.get("modifier")
+        option_key = policy.get("option_key")
+        method_key = policy.get("method_key")
+        methods = policy.get("methods")
+        if not all(isinstance(value, str) and value for value in (modifier, option_key, method_key)):
+            continue
+        if not isinstance(methods, list):
+            continue
+        effects: dict[str, Mapping[str, Any]] = {}
+        for method in methods:
+            if not isinstance(method, Mapping):
+                continue
+            value = method.get("value")
+            effect = method.get("incar_effect")
+            if isinstance(value, str) and isinstance(effect, Mapping):
+                effects[value] = {
+                    str(key).upper(): _json_safe_value(item)
+                    for key, item in effect.items()
+                }
+        if effects:
+            yield {
+                "modifier": modifier,
+                "option_key": option_key,
+                "method_key": method_key,
+                "effects": effects,
+            }
+
+
+def _nested_option_value(
+    options: Mapping[str, Any],
+    option_key: str,
+    method_key: str,
+) -> Any:
+    option_value = options.get(option_key)
+    if isinstance(option_value, Mapping):
+        return option_value.get(method_key)
+    return option_value
+
+
+def _compare_initial_structures(
+    inspections: Sequence[RunInspection],
+) -> InitialStructureComparison:
+    observations = [inspection.initial_structure for inspection in inspections]
+    if not all(observation.status == "available" and observation.representation_hash for observation in observations):
+        return InitialStructureComparison(
+            status="unavailable",
+            reason="Not every run preserved an exact submitted structure representation.",
+        )
+    hashes = {observation.representation_hash for observation in observations}
+    if len(hashes) == 1:
+        return InitialStructureComparison(
+            status="match",
+            reason="Exact submitted structure representations have identical hashes.",
+        )
+    return InitialStructureComparison(
+        status="mismatch",
+        reason="Exact submitted structure representation hashes differ.",
+    )
+
+
+def _energy_warning(inspections: Sequence[RunInspection]) -> str | None:
+    baseline = _requested_configuration_signature(inspections[0])
+    if any(_requested_configuration_signature(inspection) != baseline for inspection in inspections[1:]):
+        return (
+            "Requested theory/modifier configurations differ; total energy and "
+            "energy/atom are observations, not a ranking of method quality."
+        )
+    return None
+
+
+def _requested_configuration_signature(inspection: RunInspection) -> tuple[Any, ...]:
+    return tuple(
+        (
+            stage.stage_type,
+            stage.theory,
+            tuple(stage.modifiers),
+            json.dumps(stage.options, sort_keys=True, separators=(",", ":")),
+        )
+        for stage in inspection.workflow_stages
+    )
+
+
+def _ordered_unique(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            ordered.append(value)
+            seen.add(value)
+    return ordered
+
+
+def _structure_value(inspection: RunInspection, field_name: str) -> float | None:
+    structure = inspection.scientific.structure
+    if structure is None:
+        return None
+    return _float_or_none(getattr(structure, field_name, None))
+
+
+def _scientific_value(inspection: RunInspection, field_name: str) -> float | None:
+    return _float_or_none(getattr(inspection.scientific, field_name, None))
 
 
 def _required_authorized_path(
@@ -921,6 +1585,16 @@ def _values_match(expected: Any, observed: Any) -> bool:
     return str(expected) == str(observed)
 
 
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
@@ -936,3 +1610,73 @@ def _bool_or_none(value: Any) -> bool | None:
     if value is None:
         return None
     return bool(value)
+
+
+_COMPARABLE_QUANTITIES = (
+    _ComparableQuantity(
+        "lattice_a",
+        "lattice a",
+        "A",
+        lambda inspection: _structure_value(inspection, "lattice_a"),
+    ),
+    _ComparableQuantity(
+        "lattice_b",
+        "lattice b",
+        "A",
+        lambda inspection: _structure_value(inspection, "lattice_b"),
+    ),
+    _ComparableQuantity(
+        "lattice_c",
+        "lattice c",
+        "A",
+        lambda inspection: _structure_value(inspection, "lattice_c"),
+    ),
+    _ComparableQuantity(
+        "alpha",
+        "alpha",
+        "deg",
+        lambda inspection: _structure_value(inspection, "alpha"),
+    ),
+    _ComparableQuantity(
+        "beta",
+        "beta",
+        "deg",
+        lambda inspection: _structure_value(inspection, "beta"),
+    ),
+    _ComparableQuantity(
+        "gamma",
+        "gamma",
+        "deg",
+        lambda inspection: _structure_value(inspection, "gamma"),
+    ),
+    _ComparableQuantity(
+        "volume",
+        "volume",
+        "A^3",
+        lambda inspection: _structure_value(inspection, "volume"),
+    ),
+    _ComparableQuantity(
+        "density",
+        "density",
+        "g/cm^3",
+        lambda inspection: _structure_value(inspection, "density"),
+    ),
+    _ComparableQuantity(
+        "c_over_a",
+        "c/a cell-axis ratio",
+        None,
+        lambda inspection: _structure_value(inspection, "c_over_a"),
+    ),
+    _ComparableQuantity(
+        "energy_per_atom_ev",
+        "energy/atom",
+        "eV/atom",
+        lambda inspection: _scientific_value(inspection, "energy_per_atom_ev"),
+    ),
+    _ComparableQuantity(
+        "band_gap_ev",
+        "band gap",
+        "eV",
+        lambda inspection: _scientific_value(inspection, "band_gap_ev"),
+    ),
+)

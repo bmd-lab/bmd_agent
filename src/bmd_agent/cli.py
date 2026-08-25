@@ -1,5 +1,7 @@
+from collections.abc import Mapping
 import subprocess
 import sys
+from typing import Any
 
 from bmd_agent.config import (
     ConfigurationError,
@@ -15,8 +17,11 @@ from bmd_agent.resources.compute import (
 )
 from bmd_agent.resources.git import GitInspection, inspect_repository
 from bmd_agent.resources.run import (
+    PRODUCER_REQUESTED,
     RunInspection,
+    RunComparison,
     RunInspectionError,
+    compare_remote_runs,
     inspect_remote_run,
 )
 from bmd_agent.resources.slurm import get_queue
@@ -224,13 +229,18 @@ def show_inspect_run(flow_root: str, registry: ResourceRegistry | None = None) -
 
     registry = registry or load_resources()
     cluster = powerslurm_cluster(registry)
+    modifier_policies, _ = modifier_policies_from_compute(registry)
 
     print("BMD Compute Run Inspection")
     print("==========================")
     print()
 
     try:
-        inspection = inspect_remote_run(cluster, flow_root)
+        inspection = inspect_remote_run(
+            cluster,
+            flow_root,
+            modifier_policies=modifier_policies,
+        )
 
     except RemotePathError as exc:
         print(f"Refusing remote read: {exc}")
@@ -259,6 +269,55 @@ def show_inspect_run(flow_root: str, registry: ResourceRegistry | None = None) -
     return 0
 
 
+def show_compare_runs(flow_roots: list[str], registry: ResourceRegistry | None = None) -> int:
+    """Display baseline-relative evidence comparisons for completed runs."""
+
+    if len(flow_roots) < 2:
+        print("Usage: bmd-agent compare-runs <flow-a> <flow-b> [<flow-c> ...]")
+        return 2
+
+    registry = registry or load_resources()
+    cluster = powerslurm_cluster(registry)
+    modifier_policies, policy_warning = modifier_policies_from_compute(registry)
+
+    print("BMD Compute Run Comparison")
+    print("==========================")
+    print()
+
+    try:
+        comparison = compare_remote_runs(
+            cluster,
+            flow_roots,
+            modifier_policies=modifier_policies,
+        )
+
+    except RemotePathError as exc:
+        print(f"Refusing remote read: {exc}")
+        return 2
+
+    except subprocess.TimeoutExpired:
+        print("Run comparison timed out.")
+        return 1
+
+    except subprocess.CalledProcessError as exc:
+        print("Unable to compare runs through PowerSLURM.")
+        if exc.stderr:
+            stderr = (
+                exc.stderr.decode(errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else str(exc.stderr)
+            )
+            print(stderr.strip())
+        return 1
+
+    except RunInspectionError as exc:
+        print(f"Unable to compare runs: {exc}")
+        return 1
+
+    print_run_comparison(comparison, policy_warning=policy_warning)
+    return 0
+
+
 def print_run_inspection(inspection: RunInspection) -> None:
     """Print a concise evidence-oriented run inspection summary."""
 
@@ -269,13 +328,16 @@ def print_run_inspection(inspection: RunInspection) -> None:
     print(f"  git state:   {inspection.producer_git.get('state', 'unavailable')}")
     print()
 
-    print("Requested workflow (producer_provenance):")
+    print(f"Requested workflow ({PRODUCER_REQUESTED}):")
     for stage in inspection.workflow_stages:
         modifiers = f" [{', '.join(stage.modifiers)}]" if stage.modifiers else ""
         print(
             f"  {stage.index}. {_display_theory(stage.theory):<6} "
             f"{_display_stage(stage.stage_type)}{modifiers}"
         )
+        options = _format_options(stage.options)
+        if options:
+            print(f"     options: {options}")
     print()
 
     print("Requested execution (producer_provenance):")
@@ -338,12 +400,30 @@ def print_run_inspection(inspection: RunInspection) -> None:
         print(f"    {observation.label}: {_present_text(observation)}")
     print()
 
+    print("Executed VASP inputs (executed_input):")
+    if inspection.executed_inputs:
+        for observation in inspection.executed_inputs:
+            print(f"  {observation.label}: {_incar_summary(observation)}")
+    else:
+        print("  unavailable: no INCAR observations were gathered")
+    if inspection.input_expectations:
+        print("  requested/executed checks (agent_comparison):")
+        for expectation in inspection.input_expectations:
+            print(f"    {expectation.stage_label}: {expectation.option_path}={expectation.requested_value} -> "
+                  f"{expectation.input_key} expected {expectation.expected_value}, "
+                  f"observed {_display_missing(expectation.observed_value)}: {expectation.status}")
+            if expectation.reason:
+                print(f"      reason: {expectation.reason}")
+    print()
+
     print("Independent parsing (pymatgen_derived):")
     scientific = inspection.scientific
     if scientific.error:
         print(f"  unavailable: {scientific.error}")
     else:
         _print_optional_value("final formula", scientific.final_formula)
+        if scientific.structure:
+            _print_structure_observation(scientific.structure)
         _print_optional_value("final energy eV", scientific.final_energy_ev)
         _print_optional_value("energy/atom eV", scientific.energy_per_atom_ev)
         _print_optional_value("electronic convergence", scientific.electronic_convergence)
@@ -360,6 +440,77 @@ def print_run_inspection(inspection: RunInspection) -> None:
         print(f"  reason: {inspection.comparison.reason}")
     if inspection.comparison.mismatches:
         print(f"  mismatches: {', '.join(inspection.comparison.mismatches)}")
+
+
+def print_run_comparison(
+    comparison: RunComparison,
+    *,
+    policy_warning: str | None = None,
+) -> None:
+    """Print a concise baseline-relative run comparison."""
+
+    baseline = comparison.inspections[0]
+    baseline_label = comparison.labels[baseline.flow_root]
+
+    print("Runs:")
+    for index, inspection in enumerate(comparison.inspections):
+        role = "baseline" if index == 0 else "comparison"
+        label = comparison.labels[inspection.flow_root]
+        scheduler_state = inspection.scheduler.state if inspection.scheduler else "unavailable"
+        print(f"  {index + 1}. {label} ({role})")
+        print(f"     flow root: {inspection.flow_root}")
+        print(f"     git: {_display_commit(inspection.producer_git.get('git_commit'))} "
+              f"{inspection.producer_git.get('state', 'unavailable')}")
+        print(f"     scheduler: {scheduler_state}")
+    print()
+
+    print("Initial structure (agent_comparison):")
+    print(f"  {comparison.initial_structure.status}")
+    if comparison.initial_structure.reason:
+        print(f"  reason: {comparison.initial_structure.reason}")
+    print()
+
+    print("Executed-input checks:")
+    any_checks = False
+    for inspection in comparison.inspections:
+        label = comparison.labels[inspection.flow_root]
+        for expectation in inspection.input_expectations:
+            any_checks = True
+            print(f"  {label} {expectation.stage_label}: "
+                  f"{expectation.input_key} observed {_display_missing(expectation.observed_value)}, "
+                  f"expected {expectation.expected_value}: {expectation.status}")
+            if expectation.reason:
+                print(f"    reason: {expectation.reason}")
+    if not any_checks:
+        print("  unavailable: no producer option/input-effect checks were available")
+    print()
+
+    print("Final structure/result differences (agent_comparison):")
+    print(f"  baseline: {baseline_label}")
+    current_flow = None
+    for quantity in comparison.quantities:
+        if quantity.flow_root != current_flow:
+            current_flow = quantity.flow_root
+            print(f"  {quantity.run_label}:")
+        if quantity.status != "available":
+            print(f"    {quantity.label}: unavailable ({quantity.reason})")
+            continue
+        unit = f" {quantity.unit}" if quantity.unit else ""
+        percent = (
+            f", {quantity.percent_delta:+.3f}%"
+            if quantity.percent_delta is not None
+            else ""
+        )
+        print(
+            f"    {quantity.label}: {quantity.baseline_value} -> "
+            f"{quantity.comparison_value}{unit}, delta {quantity.delta:+.6f}{unit}{percent}"
+        )
+    if comparison.energy_warning:
+        print()
+        print(f"Warning: {comparison.energy_warning}")
+    if policy_warning:
+        print()
+        print(f"Modifier policy warning: {policy_warning}")
 
 
 def bmd_compute_repository(registry: ResourceRegistry) -> GitRepositoryResource:
@@ -422,6 +573,9 @@ def main(argv: list[str] | None = None) -> int:
 
             return show_inspect_run(argv[1])
 
+        if command == "compare-runs":
+            return show_compare_runs(argv[1:])
+
     except ConfigurationError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -434,7 +588,29 @@ def main(argv: list[str] | None = None) -> int:
     print("  compute")
     print("  structure <remote-directory>")
     print("  inspect-run <remote-flow-root>")
+    print("  compare-runs <flow-a> <flow-b> [<flow-c> ...]")
     return 2
+
+
+def modifier_policies_from_compute(
+    registry: ResourceRegistry,
+) -> tuple[tuple[Mapping[str, Any], ...], str | None]:
+    """Return configured producer modifier policies when the capability adapter can read them."""
+
+    try:
+        repository = bmd_compute_repository(registry)
+    except ConfigurationError:
+        return (), None
+
+    try:
+        capabilities = inspect_compute_capabilities(repository)
+    except ComputeCapabilityError as exc:
+        return (), str(exc)
+
+    policies = capabilities.payload.get("modifier_policies")
+    if not isinstance(policies, list):
+        return (), None
+    return tuple(policy for policy in policies if isinstance(policy, Mapping)), None
 
 
 def _display_commit(value: object) -> str:
@@ -491,6 +667,65 @@ def _present_text(observation: object) -> str:
 def _print_optional_value(label: str, value: object) -> None:
     if value is not None:
         print(f"  {label}: {value}")
+
+
+def _print_structure_observation(observation: object) -> None:
+    print("  final structure:")
+    _print_optional_nested_value("formula", getattr(observation, "formula", None))
+    _print_optional_nested_value("reduced formula", getattr(observation, "reduced_formula", None))
+    _print_optional_nested_value("site count", getattr(observation, "site_count", None))
+    _print_optional_nested_value("lattice a A", getattr(observation, "lattice_a", None))
+    _print_optional_nested_value("lattice b A", getattr(observation, "lattice_b", None))
+    _print_optional_nested_value("lattice c A", getattr(observation, "lattice_c", None))
+    _print_optional_nested_value("alpha deg", getattr(observation, "alpha", None))
+    _print_optional_nested_value("beta deg", getattr(observation, "beta", None))
+    _print_optional_nested_value("gamma deg", getattr(observation, "gamma", None))
+    _print_optional_nested_value("volume A^3", getattr(observation, "volume", None))
+    _print_optional_nested_value("density g/cm^3", getattr(observation, "density", None))
+    _print_optional_nested_value("c/a cell-axis ratio", getattr(observation, "c_over_a", None))
+    for item in getattr(observation, "unavailable", ()):
+        print(f"    unavailable: {item}")
+
+
+def _print_optional_nested_value(label: str, value: object) -> None:
+    if value is not None:
+        print(f"    {label}: {value}")
+
+
+def _format_options(options: Mapping[str, Any]) -> str:
+    flattened = []
+    for key, value in _flatten_options(options):
+        flattened.append(f"{key}={value}")
+    return ", ".join(flattened)
+
+
+def _flatten_options(options: Mapping[str, Any], prefix: str = "") -> list[tuple[str, object]]:
+    flattened: list[tuple[str, object]] = []
+    for key, value in sorted(options.items()):
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, Mapping):
+            flattened.extend(_flatten_options(value, path))
+        else:
+            flattened.append((path, value))
+    return flattened
+
+
+def _incar_summary(observation: object) -> str:
+    path = getattr(observation, "path")
+    if not getattr(observation, "present"):
+        return f"absent ({path})"
+    error = getattr(observation, "error")
+    if error:
+        return f"present but unparsed ({path}): {error}"
+    values = getattr(observation, "values")
+    ivdw = values.get("IVDW") if isinstance(values, Mapping) else None
+    if ivdw is None:
+        return f"present ({path}); IVDW absent"
+    return f"present ({path}); IVDW={ivdw}"
+
+
+def _display_missing(value: object) -> object:
+    return "absent" if value is None else value
 
 
 if __name__ == "__main__":
