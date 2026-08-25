@@ -11,18 +11,30 @@ import pytest
 from bmd_agent import cli
 from bmd_agent.config import ResourceRegistry, SlurmClusterResource
 from bmd_agent.resources.run import (
+    AGENT_COMPARISON,
     ARTIFACT_OBSERVATION,
+    EXECUTED_INPUT,
     LOG_OBSERVATION,
     PYMATGEN_DERIVED,
     AttemptStateObservation,
     ComparisonObservation,
+    IncarObservation,
+    InitialStructureObservation,
+    InputExpectationObservation,
     LogRuntimeObservation,
     PathObservation,
     RunInspection,
+    RunInspectionError,
     ScientificResult,
+    StructureObservation,
     WorkflowStage,
+    build_run_comparison,
+    compare_remote_runs,
+    compare_requested_options_to_executed_inputs,
     inspect_remote_run,
+    parse_incar_contents,
     parse_vasp_output_files,
+    run_label_from_provenance,
 )
 from bmd_agent.resources.slurm import SlurmAccountingRecord
 from bmd_agent.resources.vasp import RemotePathError
@@ -100,14 +112,20 @@ def submission_payload(*, outside_path: bool = False) -> dict:
     workflow_spec = {
         "stages": [
             {"stage_type": "relax", "theory": "pbe", "modifiers": [], "label": None, "options": {}},
-            {"stage_type": "static", "theory": "r2scan", "modifiers": [], "label": None, "options": {}},
+            {
+                "stage_type": "static",
+                "theory": "r2scan",
+                "modifiers": ["custom_modifier"],
+                "label": None,
+                "options": {"custom_modifier": {"nested": "kept"}},
+            },
             {"stage_type": "dos", "theory": "pbe", "modifiers": [], "label": None, "options": {}},
             {
                 "stage_type": "band_structure",
                 "theory": "pbe",
-                "modifiers": ["spin_polarized"],
+                "modifiers": ["dispersion"],
                 "label": None,
-                "options": {},
+                "options": {"dispersion": {"method": "dftd3"}},
             },
         ],
         "label": None,
@@ -117,7 +135,11 @@ def submission_payload(*, outside_path: bool = False) -> dict:
         "flow_spec": {
             "workflow": "custom_workflow",
             "workflow_spec": workflow_spec,
-            "structure": {"type": "parsed"},
+            "structure": {
+                "type": "pasted_text",
+                "format": "poscar",
+                "text": "Example\n1\n1 0 0\n0 1 0\n0 0 1\nX\n1\ndirect\n0 0 0\n",
+            },
         },
         "paths": {
             "run_dir": FLOW_ROOT,
@@ -179,6 +201,8 @@ def default_files(*, include_vasprun: bool = True, invalid_job_id: bool = False)
         f"{RESULT_DIR}/CONTCAR": b"contcar",
         f"{RESULT_DIR}/OUTCAR": b"outcar",
         f"{RESULT_DIR}/KPOINTS": b"kpoints",
+        f"{FLOW_ROOT}/producer-alpha/INCAR": b"ENCUT = 520\nIVDW = 11\n",
+        f"{FLOW_ROOT}/producer-delta/INCAR": b"ENCUT = 600\nIVDW = 11\n",
     }
     if include_vasprun:
         files[f"{RESULT_DIR}/vasprun.xml"] = b"vasprun"
@@ -254,6 +278,10 @@ def test_inspect_run_uses_submission_stage_dirs_and_preserves_sources() -> None:
         "dos",
         "band_structure",
     ]
+    assert inspection.workflow_stages[1].options == {"custom_modifier": {"nested": "kept"}}
+    assert inspection.workflow_stages[3].options == {"dispersion": {"method": "dftd3"}}
+    assert inspection.initial_structure.status == "available"
+    assert inspection.initial_structure.representation_hash is not None
     assert [item.label for item in inspection.stage_directories] == [
         "producer-alpha",
         "producer-beta",
@@ -275,6 +303,10 @@ def test_inspect_run_uses_submission_stage_dirs_and_preserves_sources() -> None:
     assert inspection.scientific.evidence_type == PYMATGEN_DERIVED
     assert inspection.scientific.final_formula == "Example2"
     assert all(item.evidence_type == ARTIFACT_OBSERVATION for item in inspection.final_artifacts)
+    incar_inputs = {item.label: item for item in inspection.executed_inputs}
+    assert incar_inputs["producer-alpha"].evidence_type == EXECUTED_INPUT
+    assert incar_inputs["producer-alpha"].values["IVDW"] == 11
+    assert incar_inputs["producer-beta"].present is False
 
 
 def test_producer_supplied_paths_outside_allowed_roots_are_rejected() -> None:
@@ -303,19 +335,29 @@ def test_missing_artifacts_are_reported_not_invented() -> None:
         directories=default_directories(),
     )
 
-    def parser_should_not_run(*args: object, **kwargs: object) -> ScientificResult:
-        raise AssertionError("missing vasprun.xml should prevent scientific parsing")
+    def parser_reports_missing_vasprun(
+        local_paths: dict[str, Path],
+        display_paths: dict[str, str],
+        workflow_spec: dict,
+    ) -> ScientificResult:
+        assert set(local_paths) == {"contcar", "kpoints"}
+        return ScientificResult(
+            source_paths=tuple(display_paths.values()),
+            final_formula="Example2",
+            unavailable=("vasprun.xml is unavailable",),
+        )
 
     inspection = inspect_remote_run(
         cluster(),
         FLOW_ROOT,
         remote_runner=remote,
         slurm_runner=slurm_runner,
-        scientific_parser=parser_should_not_run,
+        scientific_parser=parser_reports_missing_vasprun,
     )
 
     artifacts = {item.label: item for item in inspection.final_artifacts}
     assert artifacts["vasprun"].present is False
+    assert inspection.scientific.final_formula == "Example2"
     assert "vasprun.xml is unavailable" in inspection.scientific.unavailable
 
 
@@ -348,15 +390,30 @@ def test_run_inspector_source_has_no_validation_run_specific_logic() -> None:
     source = Path("src/bmd_agent/resources/run.py").read_text(encoding="utf-8").lower()
 
     assert "hse06" not in source
+    assert "sns2" not in source
+    assert "dftd3" not in source
     assert "stage_03" not in source
 
 
 class FakeComposition:
+    formula = "X2"
     reduced_formula = "X2"
+
+
+class FakeLattice:
+    a = 3.0
+    b = 4.0
+    c = 6.0
+    alpha = 90.0
+    beta = 91.0
+    gamma = 120.0
 
 
 class FakeStructure:
     composition = FakeComposition()
+    lattice = FakeLattice()
+    volume = 62.5
+    density = 4.2
 
     def __len__(self) -> int:
         return 2
@@ -478,6 +535,19 @@ def test_band_parsing_keeps_final_vasprun_fermi_reference(tmp_path: Path) -> Non
     assert result.band_gap_ev == 1.25
     assert result.band_kpoints == 4
     assert result.bands == 2
+    assert result.structure is not None
+    assert result.structure.formula == "X2"
+    assert result.structure.reduced_formula == "X2"
+    assert result.structure.site_count == 2
+    assert result.structure.lattice_a == 3.0
+    assert result.structure.lattice_b == 4.0
+    assert result.structure.lattice_c == 6.0
+    assert result.structure.alpha == 90.0
+    assert result.structure.beta == 91.0
+    assert result.structure.gamma == 120.0
+    assert result.structure.volume == 62.5
+    assert result.structure.density == 4.2
+    assert result.structure.c_over_a == 2.0
 
 
 def test_scalar_observations_survive_band_structure_failure(tmp_path: Path) -> None:
@@ -501,6 +571,225 @@ def test_scalar_observations_survive_band_structure_failure(tmp_path: Path) -> N
     assert result.band_kpoints is None
     assert result.bands is None
     assert "band structure could not be derived: e_fermi is None." in result.unavailable
+
+
+def modifier_policy() -> dict:
+    return {
+        "modifier": "dispersion",
+        "option_key": "dispersion",
+        "method_key": "method",
+        "methods": [
+            {"value": "dftd3", "label": "DFT-D3", "incar_effect": {"IVDW": 11}},
+            {"value": "dftd3-bj", "label": "DFT-D3(BJ)", "incar_effect": {"IVDW": 12}},
+        ],
+    }
+
+
+def test_parse_incar_observes_absent_and_selected_ivdw_values() -> None:
+    no_dispersion, error = parse_incar_contents("ENCUT = 520\n")
+    assert error is None
+    assert "IVDW" not in no_dispersion
+
+    d3, error = parse_incar_contents("IVDW = 11\n")
+    assert error is None
+    assert d3["IVDW"] == 11
+
+    d3bj, error = parse_incar_contents("IVDW = 12\n")
+    assert error is None
+    assert d3bj["IVDW"] == 12
+
+
+def test_requested_options_are_compared_to_executed_input_by_policy() -> None:
+    stages = (
+        WorkflowStage(
+            1,
+            "relax",
+            "pbe",
+            ("dispersion",),
+            None,
+            {"dispersion": {"method": "dftd3"}},
+        ),
+    )
+    executed = (
+        IncarObservation(
+            "producer-alpha",
+            f"{FLOW_ROOT}/producer-alpha/INCAR",
+            True,
+            1,
+            values={"IVDW": 12},
+        ),
+    )
+
+    observations = compare_requested_options_to_executed_inputs(
+        stages,
+        executed,
+        (modifier_policy(),),
+    )
+
+    assert observations == (
+        InputExpectationObservation(
+            stage_label="producer-alpha",
+            stage_index=1,
+            option_path="dispersion.method",
+            requested_value="dftd3",
+            input_key="IVDW",
+            expected_value=11,
+            observed_value=12,
+            status="mismatch",
+            reason="observed INCAR value differs from producer-requested option effect",
+        ),
+    )
+
+
+def comparison_inspection(
+    flow_root: str,
+    *,
+    a: float | None,
+    b: float | None,
+    c: float | None,
+    volume: float | None,
+    density: float | None,
+    energy_per_atom: float | None,
+    band_gap: float | None,
+    modifiers: tuple[str, ...] = (),
+    options: dict | None = None,
+) -> RunInspection:
+    structure = None
+    if a is not None:
+        structure = StructureObservation(
+            source_path=f"{flow_root}/result/CONTCAR",
+            formula="X2",
+            reduced_formula="X2",
+            site_count=2,
+            lattice_a=a,
+            lattice_b=b,
+            lattice_c=c,
+            alpha=90.0,
+            beta=90.0,
+            gamma=120.0,
+            volume=volume,
+            density=density,
+            c_over_a=c / a if a and c is not None else None,
+        )
+
+    return RunInspection(
+        flow_root=flow_root,
+        submission_path=f"{flow_root}/submission.json",
+        workflow_stages=(
+            WorkflowStage(1, "relax", "pbe", modifiers, None, options or {}),
+        ),
+        stage_directories=(),
+        result_directory=PathObservation("result_dir", f"{flow_root}/result", "directory", True, ARTIFACT_OBSERVATION),
+        log_paths=(),
+        final_artifacts=(),
+        producer_git={"git_commit": "abcdef012345", "state": "clean"},
+        cluster_request={},
+        resources_request={},
+        environment_policy={},
+        attempt_state=AttemptStateObservation(path=None, present=False),
+        job_id="1",
+        scheduler=SlurmAccountingRecord(
+            job_id="1",
+            name="comparison",
+            state="COMPLETED",
+            elapsed="00:01:00",
+            start="2026-08-25T00:00:00",
+            end="2026-08-25T00:01:00",
+            partition="leeburton-pool",
+            exit_code="0:0",
+        ),
+        scheduler_error=None,
+        runtime=LogRuntimeObservation(LOG_OBSERVATION, (), None, {}, {}, {}),
+        scientific=ScientificResult(
+            source_paths=(),
+            final_formula="X2",
+            energy_per_atom_ev=energy_per_atom,
+            band_gap_ev=band_gap,
+            structure=structure,
+        ),
+        comparison=ComparisonObservation("unavailable", "producer_provenance"),
+        initial_structure=InitialStructureObservation(
+            status="available",
+            representation_type="pasted_text:poscar",
+            representation_hash="same-hash",
+        ),
+    )
+
+
+def test_run_labels_are_derived_from_provenance_and_modifier_policy() -> None:
+    control = comparison_inspection("/flow/control", a=3, b=3, c=6, volume=54, density=4, energy_per_atom=-1, band_gap=1)
+    corrected = comparison_inspection(
+        "/flow/corrected",
+        a=3,
+        b=3,
+        c=6,
+        volume=54,
+        density=4,
+        energy_per_atom=-1,
+        band_gap=1,
+        modifiers=("dispersion",),
+        options={"dispersion": {"method": "dftd3-bj"}},
+    )
+
+    assert run_label_from_provenance(control, modifier_policies=(modifier_policy(),)) == "PBE"
+    assert run_label_from_provenance(corrected, modifier_policies=(modifier_policy(),)) == "PBE + DFT-D3(BJ)"
+
+
+def test_build_run_comparison_uses_first_run_as_baseline_and_handles_three_runs() -> None:
+    baseline = comparison_inspection("/flow/baseline", a=3.0, b=4.0, c=6.0, volume=72.0, density=4.0, energy_per_atom=-4.0, band_gap=2.0)
+    second = comparison_inspection("/flow/second", a=3.0, b=4.1, c=5.4, volume=66.42, density=4.2, energy_per_atom=-4.2, band_gap=1.8)
+    third = comparison_inspection("/flow/third", a=2.9, b=4.0, c=5.1, volume=59.16, density=4.4, energy_per_atom=-4.5, band_gap=1.5)
+
+    comparison = build_run_comparison(
+        (baseline, second, third),
+        modifier_policies=(modifier_policy(),),
+    )
+
+    assert comparison.initial_structure.status == "match"
+    assert len({quantity.flow_root for quantity in comparison.quantities}) == 2
+    c_quantity = next(
+        quantity
+        for quantity in comparison.quantities
+        if quantity.flow_root == "/flow/second" and quantity.quantity == "lattice_c"
+    )
+    assert c_quantity.baseline_value == 6.0
+    assert c_quantity.comparison_value == 5.4
+    assert c_quantity.delta == -0.6
+    assert c_quantity.percent_delta == -10.0
+
+
+def test_comparison_reports_missing_values_and_energy_warning_for_different_configs() -> None:
+    baseline = comparison_inspection("/flow/baseline", a=3.0, b=4.0, c=6.0, volume=72.0, density=4.0, energy_per_atom=-4.0, band_gap=2.0)
+    comparison_run = comparison_inspection(
+        "/flow/missing",
+        a=None,
+        b=None,
+        c=None,
+        volume=None,
+        density=None,
+        energy_per_atom=-4.2,
+        band_gap=None,
+        modifiers=("dispersion",),
+        options={"dispersion": {"method": "dftd3"}},
+    )
+
+    comparison = build_run_comparison(
+        (baseline, comparison_run),
+        modifier_policies=(modifier_policy(),),
+    )
+
+    lattice_a = next(quantity for quantity in comparison.quantities if quantity.quantity == "lattice_a")
+    band_gap = next(quantity for quantity in comparison.quantities if quantity.quantity == "band_gap_ev")
+    assert lattice_a.status == "unavailable"
+    assert lattice_a.reason == "comparison value unavailable"
+    assert band_gap.status == "unavailable"
+    assert comparison.energy_warning is not None
+    assert "not a ranking of method quality" in comparison.energy_warning
+
+
+def test_compare_remote_runs_requires_at_least_two_roots() -> None:
+    with pytest.raises(RunInspectionError, match="at least two"):
+        compare_remote_runs(cluster(), [FLOW_ROOT])
 
 
 def test_cli_inspect_run_summary_is_evidence_oriented(
@@ -562,7 +851,7 @@ def test_cli_inspect_run_summary_is_evidence_oriented(
     )
 
     monkeypatch.setattr(cli, "load_resources", lambda: registry)
-    monkeypatch.setattr(cli, "inspect_remote_run", lambda cluster, flow_root: inspection)
+    monkeypatch.setattr(cli, "inspect_remote_run", lambda cluster, flow_root, **kwargs: inspection)
 
     exit_code = cli.main(["inspect-run", FLOW_ROOT])
 
