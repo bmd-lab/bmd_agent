@@ -282,6 +282,55 @@ def single_stage_files(*, custom: bool = False) -> dict[str, bytes]:
     }
 
 
+def legacy_static_submission_payload() -> dict:
+    workflow_spec = {
+        "stages": [
+            {
+                "stage_type": "static",
+                "theory": "pbe",
+                "modifiers": [],
+                "label": None,
+                "options": {},
+            },
+        ],
+        "label": None,
+        "recipe": "static",
+    }
+    return {
+        "flow_spec": {
+            "workflow": "static",
+            "workflow_spec": workflow_spec,
+            "structure": {
+                "type": "pasted_text",
+                "format": "poscar",
+                "text": "Example\n1\n1 0 0\n0 1 0\n0 0 1\nX\n1\ndirect\n0 0 0\n",
+            },
+        },
+        "paths": {
+            "run_dir": FLOW_ROOT,
+            "logs_dir": LOG_ROOT,
+            "result_dir": FLOW_ROOT,
+            "log_out": f"{LOG_ROOT}/legacy-static.out",
+            "log_err": f"{LOG_ROOT}/legacy-static.err",
+        },
+        "cluster": {"partition": "leeburton-pool", "account": "account-name"},
+        "resources": {"nodes": 1, "ntasks": 24, "mem_gb": 128, "walltime": "72:00:00"},
+        "environment": {"VASP_CMD": "mpirun -n $SLURM_NTASKS vasp_std"},
+    }
+
+
+def legacy_static_files() -> dict[str, bytes]:
+    return {
+        f"{FLOW_ROOT}/submission.json": json.dumps(legacy_static_submission_payload()).encode("utf-8"),
+        f"{LOG_ROOT}/legacy-static.out": b"[runner] python: 3.12.13 (main)\n",
+        f"{LOG_ROOT}/legacy-static.err": b"",
+        f"{FLOW_ROOT}/CONTCAR": b"contcar",
+        f"{FLOW_ROOT}/OUTCAR": b"outcar",
+        f"{FLOW_ROOT}/vasprun.xml": b"vasprun",
+        f"{FLOW_ROOT}/INCAR": b"ENCUT = 520\n",
+    }
+
+
 def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
     assert command == [
         "ssh",
@@ -414,6 +463,70 @@ def test_single_stage_runs_bind_result_dir_to_stage_one(custom: bool) -> None:
     )
     assert inspection.input_expectations[0].status == "supported"
     assert inspection.input_expectations[0].observed_value == 11
+
+
+def test_legacy_submission_without_provenance_remains_inspectable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    remote = RemoteFixture(files=legacy_static_files(), directories={FLOW_ROOT})
+
+    def parser(
+        local_paths: dict[str, Path],
+        display_paths: dict[str, str],
+        workflow_spec: dict,
+    ) -> ScientificResult:
+        assert set(local_paths) == {"contcar", "vasprun"}
+        assert workflow_spec["stages"][0]["stage_type"] == "static"
+        return ScientificResult(
+            source_paths=tuple(display_paths.values()),
+            final_formula="MgO",
+            executed_parameters=(
+                IncarObservation(
+                    "vasprun_xml.parameters",
+                    f"{FLOW_ROOT}/vasprun.xml",
+                    True,
+                    1,
+                    source_type="vasprun_xml.parameters",
+                    values={"ENCUT": 520},
+                ),
+            ),
+        )
+
+    inspection = inspect_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        scientific_parser=parser,
+    )
+
+    assert inspection.producer_git == {}
+    assert inspection.workflow_stages == (
+        WorkflowStage(
+            1,
+            "static",
+            "pbe",
+            (),
+            None,
+            {},
+        ),
+    )
+    assert inspection.result_directory.present is True
+    assert inspection.executed_inputs[0] == IncarObservation(
+        "result_dir",
+        f"{FLOW_ROOT}/INCAR",
+        True,
+        1,
+        values={"ENCUT": 520},
+    )
+    assert inspection.executed_inputs[1].source_type == "vasprun_xml.parameters"
+    assert inspection.executed_inputs[1].values["ENCUT"] == 520
+    assert inspection.input_expectations == ()
+
+    cli.print_run_inspection(inspection)
+    captured = capsys.readouterr()
+    assert "git commit:  unavailable" in captured.out
+    assert "git state:   unavailable" in captured.out
 
 
 def test_producer_supplied_paths_outside_allowed_roots_are_rejected() -> None:

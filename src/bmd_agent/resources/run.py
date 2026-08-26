@@ -819,12 +819,17 @@ def _parse_submission(
     flow_spec = _required_mapping(submission, "flow_spec")
     workflow_spec = _required_mapping(flow_spec, "workflow_spec")
     paths = _required_mapping(submission, "paths")
-    provenance = _required_mapping(submission, "provenance")
+    workflow_stages = _parse_workflow_stages(workflow_spec)
+    provenance = _optional_mapping(submission, "provenance")
 
     return {
-        "workflow_stages": _parse_workflow_stages(workflow_spec),
+        "workflow_stages": workflow_stages,
         "initial_structure": _initial_structure_observation(flow_spec),
-        "stage_dirs": _parse_stage_dirs(paths, allowed_roots=allowed_roots),
+        "stage_dirs": _parse_stage_dirs(
+            paths,
+            stage_count=len(workflow_stages),
+            allowed_roots=allowed_roots,
+        ),
         "result_dir": _required_authorized_path(
             paths,
             "result_dir",
@@ -880,11 +885,19 @@ def _parse_workflow_stages(workflow_spec: Mapping[str, Any]) -> tuple[WorkflowSt
 def _parse_stage_dirs(
     paths: Mapping[str, Any],
     *,
+    stage_count: int,
     allowed_roots: Iterable[PurePosixPath | str],
 ) -> dict[str, PurePosixPath]:
-    stage_dirs = _required_mapping(paths, "stage_dirs")
+    value = paths.get("stage_dirs")
+    if value is None:
+        if stage_count == 1:
+            return {}
+        raise RunInspectionError("submission paths.stage_dirs is required for multi-stage runs")
+    if not isinstance(value, Mapping):
+        raise RunInspectionError("submission paths.stage_dirs must be a JSON object")
+
     parsed: dict[str, PurePosixPath] = {}
-    for label, path in stage_dirs.items():
+    for label, path in value.items():
         if not isinstance(label, str) or not label:
             raise RunInspectionError("stage directory labels must be non-empty strings")
         parsed[label] = _authorize_path_value(
