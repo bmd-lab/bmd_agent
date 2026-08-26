@@ -1,4 +1,5 @@
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+import hashlib
 import subprocess
 import sys
 from typing import Any
@@ -26,6 +27,41 @@ from bmd_agent.resources.run import (
 )
 from bmd_agent.resources.slurm import get_queue
 from bmd_agent.resources.vasp import RemotePathError, read_remote_structure
+
+
+_EXECUTED_INPUT_DISPLAY_KEYS = (
+    "ENCUT",
+    "EDIFF",
+    "EDIFFG",
+    "NSW",
+    "ISIF",
+    "IBRION",
+    "ISMEAR",
+    "SIGMA",
+    "ISPIN",
+    "MAGMOM",
+    "LDAU",
+    "LDAUTYPE",
+    "LDAUL",
+    "LDAUU",
+    "LDAUJ",
+    "LMAXMIX",
+    "LHFCALC",
+    "HFSCREEN",
+    "AEXX",
+    "ALGO",
+    "PRECFOCK",
+    "LSORBIT",
+    "LNONCOLLINEAR",
+    "SAXIS",
+    "ISYM",
+    "GGA_COMPAT",
+    "IVDW",
+    "NCORE",
+    "NBANDS",
+    "LWAVE",
+    "LCHARG",
+)
 
 
 def show_repository(inspection: GitInspection) -> None:
@@ -401,17 +437,16 @@ def print_run_inspection(inspection: RunInspection) -> None:
     print()
 
     print("Executed VASP inputs (executed_input):")
-    if inspection.executed_inputs:
-        for observation in inspection.executed_inputs:
-            print(f"  {observation.label}: {_incar_summary(observation)}")
-    else:
-        print("  unavailable: no INCAR observations were gathered")
+    _print_executed_input_summary(inspection)
     if inspection.input_expectations:
         print("  requested/executed checks (agent_comparison):")
         for expectation in inspection.input_expectations:
             print(f"    {expectation.stage_label}: {expectation.option_path}={expectation.requested_value} -> "
-                  f"{expectation.input_key} expected {expectation.expected_value}, "
-                  f"observed {_display_missing(expectation.observed_value)}: {expectation.status}")
+                  f"{expectation.input_key} {_expectation_observed_text(expectation)}, "
+                  f"expected {_expectation_expected_text(expectation)}: "
+                  f"{expectation.status}")
+            for source, value in sorted(expectation.source_values.items()):
+                print(f"      {source}: {_expectation_source_value(expectation, value)}")
             if expectation.reason:
                 print(f"      reason: {expectation.reason}")
     print()
@@ -477,8 +512,11 @@ def print_run_comparison(
         for expectation in inspection.input_expectations:
             any_checks = True
             print(f"  {label} {expectation.stage_label}: "
-                  f"{expectation.input_key} observed {_display_missing(expectation.observed_value)}, "
-                  f"expected {expectation.expected_value}: {expectation.status}")
+                  f"{expectation.input_key} {_expectation_observed_text(expectation)}, "
+                  f"expected {_expectation_expected_text(expectation)}: "
+                  f"{expectation.status}")
+            for source, value in sorted(expectation.source_values.items()):
+                print(f"    {source}: {_expectation_source_value(expectation, value)}")
             if expectation.reason:
                 print(f"    reason: {expectation.reason}")
     if not any_checks:
@@ -710,22 +748,291 @@ def _flatten_options(options: Mapping[str, Any], prefix: str = "") -> list[tuple
     return flattened
 
 
-def _incar_summary(observation: object) -> str:
+def _print_executed_input_summary(inspection: RunInspection) -> None:
+    groups = _executed_input_groups(inspection.executed_inputs)
+    if not groups:
+        print("  unavailable: no executed-input observations were gathered")
+        return
+
+    stages = {stage.index: stage for stage in inspection.workflow_stages}
+    for stage_index, observations in groups:
+        print(f"  {_executed_stage_heading(stage_index, observations, stages)}:")
+        for observation in observations:
+            print(f"    source {_executed_source_label(observation)}: {_executed_source_state(observation)}")
+
+        settings, discrepancies = _reconciled_executed_settings(observations)
+        if settings:
+            print(f"    settings: {', '.join(settings)}")
+        elif any(_readable_executed_source(observation) for observation in observations):
+            print("    settings: no displayed INCAR settings present")
+        else:
+            print("    settings: unavailable")
+
+        for key, source_values in discrepancies:
+            values = "; ".join(
+                f"{source}={_format_executed_value(key, value, fingerprint=True)}"
+                for source, value in source_values
+            )
+            print(f"    discrepancy: {key}: {values}")
+
+
+def _executed_input_groups(
+    observations: tuple[object, ...],
+) -> list[tuple[int | None, tuple[object, ...]]]:
+    grouped: dict[int | None, list[object]] = {}
+    ordered_keys: list[int | None] = []
+    for observation in observations:
+        key = getattr(observation, "stage_index", None)
+        if key not in grouped:
+            grouped[key] = []
+            ordered_keys.append(key)
+        grouped[key].append(observation)
+
+    return [
+        (key, tuple(grouped[key]))
+        for key in sorted(
+            ordered_keys,
+            key=lambda value: (value is None, value if isinstance(value, int) else 0),
+        )
+    ]
+
+
+def _executed_stage_heading(
+    stage_index: int | None,
+    observations: tuple[object, ...],
+    stages: Mapping[int, object],
+) -> str:
+    if stage_index is None:
+        base = "unindexed"
+    else:
+        stage = stages.get(stage_index)
+        if stage is None:
+            base = f"stage {stage_index}"
+        else:
+            base = (
+                f"stage {stage_index}: "
+                f"{_display_theory(getattr(stage, 'theory'))} "
+                f"{_display_stage(getattr(stage, 'stage_type'))}"
+            )
+
+    labels = _ordered_unique(
+        str(getattr(observation, "label"))
+        for observation in observations
+        if getattr(observation, "source_type", None) == "retained_incar"
+    )
+    if labels:
+        return f"{base} ({', '.join(labels)})"
+    return base
+
+
+def _executed_source_label(observation: object) -> str:
+    source_type = getattr(observation, "source_type")
+    label = getattr(observation, "label")
+    return f"{source_type}:{label}"
+
+
+def _executed_source_state(observation: object) -> str:
     path = getattr(observation, "path")
     if not getattr(observation, "present"):
-        return f"absent ({path})"
+        return f"unavailable ({path})"
     error = getattr(observation, "error")
     if error:
         return f"present but unparsed ({path}): {error}"
-    values = getattr(observation, "values")
-    ivdw = values.get("IVDW") if isinstance(values, Mapping) else None
-    if ivdw is None:
-        return f"present ({path}); IVDW absent"
-    return f"present ({path}); IVDW={ivdw}"
+    return f"present ({path})"
 
 
-def _display_missing(value: object) -> object:
-    return "absent" if value is None else value
+def _reconciled_executed_settings(
+    observations: tuple[object, ...],
+) -> tuple[list[str], list[tuple[str, list[tuple[str, object]]]]]:
+    readable = [
+        observation
+        for observation in observations
+        if _readable_executed_source(observation)
+    ]
+    settings: list[str] = []
+    discrepancies: list[tuple[str, list[tuple[str, object]]]] = []
+
+    for key in _EXECUTED_INPUT_DISPLAY_KEYS:
+        source_values = [
+            (_executed_source_label(observation), getattr(observation, "values").get(key))
+            for observation in readable
+            if key in getattr(observation, "values")
+        ]
+        if not source_values:
+            continue
+
+        values = [value for _, value in source_values]
+        if _all_values_match(values):
+            context = _first_mapping_with_key(readable, key)
+            settings.append(f"{key}={_format_executed_value(key, values[0], context)}")
+        else:
+            discrepancies.append((key, source_values))
+
+    return settings, discrepancies
+
+
+def _readable_executed_source(observation: object) -> bool:
+    return (
+        bool(getattr(observation, "present"))
+        and getattr(observation, "error") is None
+        and isinstance(getattr(observation, "values"), Mapping)
+    )
+
+
+def _first_mapping_with_key(observations: list[object], key: str) -> Mapping[str, object]:
+    for observation in observations:
+        values = getattr(observation, "values")
+        if isinstance(values, Mapping) and key in values:
+            return values
+    return {}
+
+
+def _all_values_match(values: list[object]) -> bool:
+    if not values:
+        return True
+    first = values[0]
+    return all(_display_values_match(first, value) for value in values[1:])
+
+
+def _display_values_match(left: object, right: object) -> bool:
+    return _format_canonical_value(left) == _format_canonical_value(right)
+
+
+def _format_canonical_value(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(_format_canonical_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_format_canonical_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted((str(key), _format_canonical_value(item)) for key, item in value.items())
+        )
+    return value
+
+
+def _expectation_observed_text(expectation: object) -> str:
+    status = getattr(expectation, "status")
+    value = getattr(expectation, "observed_value")
+    if status == "unavailable":
+        return "unavailable"
+    if status == "absent":
+        return "absent"
+    formatted = _format_executed_value(
+        getattr(expectation, 'input_key'),
+        value,
+        fingerprint=status == 'discrepancy',
+    )
+    return f"observed {formatted}"
+
+
+def _expectation_expected_text(expectation: object) -> str:
+    return _format_executed_value(
+        getattr(expectation, "input_key"),
+        getattr(expectation, "expected_value"),
+        fingerprint=getattr(expectation, "status") == "discrepancy",
+    )
+
+
+def _expectation_source_value(expectation: object, value: object) -> str:
+    return _format_executed_value(
+        getattr(expectation, "input_key"),
+        value,
+        fingerprint=getattr(expectation, "status") == "discrepancy",
+    )
+
+
+def _format_executed_value(
+    key: object,
+    value: object,
+    context: Mapping[str, object] | None = None,
+    *,
+    fingerprint: bool = False,
+) -> str:
+    if value is None:
+        return "absent"
+    if str(key).upper() == "MAGMOM":
+        return _format_magmom(value, context or {}, fingerprint=fingerprint)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list | tuple):
+        return _format_sequence(value)
+    if isinstance(value, Mapping):
+        return "{" + ", ".join(
+            f"{item_key}: {_format_executed_value(item_key, item_value)}"
+            for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
+        ) + "}"
+    return str(value)
+
+
+def _format_sequence(value: list[object] | tuple[object, ...]) -> str:
+    if len(value) <= 8:
+        return "[" + ", ".join(_format_executed_value("", item) for item in value) + "]"
+    return f"present, {len(value)} values"
+
+
+def _format_magmom(
+    value: object,
+    context: Mapping[str, object],
+    *,
+    fingerprint: bool = False,
+) -> str:
+    flattened = _flatten_numeric_values(value)
+    if flattened is None:
+        return "present"
+    count = len(flattened)
+    if count == 0:
+        return "present, 0 values"
+    if count <= 8:
+        return "[" + ", ".join(_format_executed_value("", item) for item in flattened) + "]"
+
+    noncollinear = (
+        _truthy_vasp_value(context.get("LNONCOLLINEAR"))
+        or _truthy_vasp_value(context.get("LSORBIT"))
+    )
+    if noncollinear and count % 3 == 0:
+        summary = f"present, {count // 3} sites / {count} noncollinear components"
+    else:
+        summary = f"present, {count} sites"
+    if fingerprint:
+        summary = f"{summary}, fingerprint {_value_fingerprint(value)}"
+    return summary
+
+
+def _value_fingerprint(value: object) -> str:
+    canonical = repr(_format_canonical_value(value)).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:12]
+
+
+def _flatten_numeric_values(value: object) -> list[object] | None:
+    if isinstance(value, int | float):
+        return [value]
+    if not isinstance(value, list | tuple):
+        return None
+    flattened: list[object] = []
+    for item in value:
+        nested = _flatten_numeric_values(item)
+        if nested is None:
+            return None
+        flattened.extend(nested)
+    return flattened
+
+
+def _truthy_vasp_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().strip(".").upper() in {"T", "TRUE"}
+    return bool(value)
+
+
+def _ordered_unique(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            ordered.append(value)
+            seen.add(value)
+    return ordered
 
 
 if __name__ == "__main__":
