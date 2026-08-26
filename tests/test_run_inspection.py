@@ -1136,6 +1136,138 @@ def test_compare_remote_runs_requires_at_least_two_roots() -> None:
         compare_remote_runs(cluster(), [FLOW_ROOT])
 
 
+def cli_run_inspection(
+    *,
+    workflow_stages: tuple[WorkflowStage, ...],
+    executed_inputs: tuple[IncarObservation, ...],
+    input_expectations: tuple[InputExpectationObservation, ...] = (),
+) -> RunInspection:
+    return RunInspection(
+        flow_root=FLOW_ROOT,
+        submission_path=f"{FLOW_ROOT}/submission.json",
+        workflow_stages=workflow_stages,
+        stage_directories=(),
+        result_directory=PathObservation("result_dir", RESULT_DIR, "directory", True, ARTIFACT_OBSERVATION),
+        log_paths=(),
+        final_artifacts=(),
+        producer_git={},
+        cluster_request={},
+        resources_request={},
+        environment_policy={},
+        attempt_state=AttemptStateObservation(path=None, present=False),
+        job_id=None,
+        scheduler=None,
+        scheduler_error=None,
+        runtime=LogRuntimeObservation(LOG_OBSERVATION, (), None, {}, {}, {}),
+        scientific=ScientificResult(source_paths=()),
+        comparison=ComparisonObservation("unavailable", "producer_provenance"),
+        executed_inputs=executed_inputs,
+        input_expectations=input_expectations,
+    )
+
+
+def test_cli_executed_input_summary_reports_present_settings_without_optional_absences(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    magmom = [1.0, 0.0, 0.0] * 30
+    inspection = cli_run_inspection(
+        workflow_stages=(
+            WorkflowStage(1, "static", "pbe", ("hubbard",), None),
+            WorkflowStage(2, "static", "pbe", ("hubbard", "soc"), None),
+        ),
+        executed_inputs=(
+            IncarObservation(
+                "stage_01",
+                f"{FLOW_ROOT}/stage_01/INCAR",
+                True,
+                1,
+                values={
+                    "ENCUT": 520,
+                    "LDAU": True,
+                    "LDAUTYPE": 2,
+                    "LDAUL": [2, -1],
+                    "LDAUU": [5.3, 0],
+                    "LMAXMIX": 4,
+                },
+            ),
+            IncarObservation(
+                "stage_02",
+                f"{FLOW_ROOT}/stage_02/INCAR",
+                True,
+                2,
+                values={
+                    "ENCUT": 520,
+                    "LDAU": True,
+                    "LDAUU": [5.3, 0],
+                    "LSORBIT": True,
+                    "LNONCOLLINEAR": True,
+                    "SAXIS": [0, 0, 1],
+                    "MAGMOM": magmom,
+                },
+            ),
+            IncarObservation(
+                "vasprun_xml.incar",
+                f"{FLOW_ROOT}/stage_02/vasprun.xml",
+                True,
+                2,
+                source_type="vasprun_xml.incar",
+                values={
+                    "ENCUT": 520,
+                    "LSORBIT": True,
+                    "LNONCOLLINEAR": True,
+                    "SAXIS": [0, 0, 1],
+                    "MAGMOM": magmom,
+                },
+            ),
+        ),
+    )
+
+    cli.print_run_inspection(inspection)
+
+    captured = capsys.readouterr()
+    assert "stage 1: PBE Static Energy (stage_01)" in captured.out
+    assert "stage 2: PBE Static Energy (stage_02)" in captured.out
+    assert "LDAU=true" in captured.out
+    assert "LDAUU=[5.3, 0]" in captured.out
+    assert "LSORBIT=true" in captured.out
+    assert "SAXIS=[0, 0, 1]" in captured.out
+    assert "MAGMOM=present, 30 sites / 90 noncollinear components" in captured.out
+    assert captured.out.count("LSORBIT=true") == 1
+    assert "IVDW absent" not in captured.out
+
+
+def test_cli_executed_input_summary_reports_source_disagreement(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    inspection = cli_run_inspection(
+        workflow_stages=(WorkflowStage(1, "static", "pbe", (), None),),
+        executed_inputs=(
+            IncarObservation(
+                "stage_01",
+                f"{FLOW_ROOT}/stage_01/INCAR",
+                True,
+                1,
+                values={"ENCUT": 520},
+            ),
+            IncarObservation(
+                "vasprun_xml.incar",
+                f"{FLOW_ROOT}/stage_01/vasprun.xml",
+                True,
+                1,
+                source_type="vasprun_xml.incar",
+                values={"ENCUT": 400},
+            ),
+        ),
+    )
+
+    cli.print_run_inspection(inspection)
+
+    captured = capsys.readouterr()
+    assert "discrepancy: ENCUT" in captured.out
+    assert "retained_incar:stage_01=520" in captured.out
+    assert "vasprun_xml.incar:vasprun_xml.incar=400" in captured.out
+
+
 def test_cli_inspect_run_summary_is_evidence_oriented(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1269,3 +1401,50 @@ def test_cli_executed_input_wording_distinguishes_unavailable_and_absent(
     assert "IVDW unavailable, expected 11: unavailable" in captured.out
     assert "IVDW absent, expected 11: absent" in captured.out
     assert "observed absent" not in captured.out
+    assert "present (retained_incar, /bmd-db/guest/flows/validation-run/INCAR); IVDW absent" not in captured.out
+
+
+def test_cli_requested_executed_magmom_discrepancy_remains_visible(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    expected_magmom = [1.0, 0.0, 0.0] * 30
+    observed_magmom = [0.0, 1.0, 0.0] * 30
+    inspection = cli_run_inspection(
+        workflow_stages=(WorkflowStage(1, "static", "pbe", ("soc",), None),),
+        executed_inputs=(
+            IncarObservation(
+                "stage_01",
+                f"{FLOW_ROOT}/stage_01/INCAR",
+                True,
+                1,
+                values={
+                    "LSORBIT": True,
+                    "LNONCOLLINEAR": True,
+                    "MAGMOM": observed_magmom,
+                },
+            ),
+        ),
+        input_expectations=(
+            InputExpectationObservation(
+                stage_label="stage_01",
+                stage_index=1,
+                option_path="magnetism.magmom",
+                requested_value="noncollinear",
+                input_key="MAGMOM",
+                expected_value=expected_magmom,
+                observed_value=observed_magmom,
+                status="discrepancy",
+                source_values={"retained_incar:stage_01": observed_magmom},
+                reason="executed value differs from producer-requested option effect",
+            ),
+        ),
+    )
+
+    cli.print_run_inspection(inspection)
+
+    captured = capsys.readouterr()
+    assert "MAGMOM=present, 30 sites / 90 noncollinear components" in captured.out
+    assert "MAGMOM observed present, 90 sites" in captured.out
+    assert "expected present, 90 sites" in captured.out
+    assert "discrepancy" in captured.out
+    assert "retained_incar:stage_01: present, 90 sites, fingerprint" in captured.out
