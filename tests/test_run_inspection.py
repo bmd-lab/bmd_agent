@@ -35,6 +35,7 @@ from bmd_agent.resources.run import (
     parse_incar_contents,
     parse_vasp_output_files,
     run_label_from_provenance,
+    vasp_reported_parameter_observations,
 )
 from bmd_agent.resources.slurm import SlurmAccountingRecord
 from bmd_agent.resources.vasp import RemotePathError
@@ -219,6 +220,68 @@ def default_directories() -> set[str]:
     }
 
 
+def single_stage_submission_payload(*, custom: bool = False) -> dict:
+    workflow_spec = {
+        "stages": [
+            {
+                "stage_type": "relax",
+                "theory": "pbe",
+                "modifiers": ["dispersion"],
+                "label": None,
+                "options": {"dispersion": {"method": "dftd3"}},
+            },
+        ],
+        "label": None,
+        "recipe": "custom" if custom else "relax",
+    }
+    return {
+        "flow_spec": {
+            "workflow": "custom_workflow" if custom else "relax",
+            "workflow_spec": workflow_spec,
+            "structure": {
+                "type": "pasted_text",
+                "format": "poscar",
+                "text": "Example\n1\n1 0 0\n0 1 0\n0 0 1\nX\n1\ndirect\n0 0 0\n",
+            },
+        },
+        "paths": {
+            "run_dir": FLOW_ROOT,
+            "logs_dir": LOG_ROOT,
+            "stage_dirs": {},
+            "result_dir": FLOW_ROOT,
+            "log_out": f"{LOG_ROOT}/validation-run.out",
+            "log_err": f"{LOG_ROOT}/validation-run.err",
+        },
+        "cluster": {"partition": "leeburton-pool", "account": "account-name"},
+        "resources": {"nodes": 1, "ntasks": 24, "mem_gb": 160, "walltime": "04:00:00"},
+        "environment": {"VASP_CMD": "mpirun -n $SLURM_NTASKS vasp_std"},
+        "provenance": {
+            "bmd_compute": {
+                "source": {
+                    "git_commit": "abcdef0123456789",
+                    "state": "clean",
+                    "dirty": False,
+                }
+            },
+            "execution": {"workflow_spec": workflow_spec},
+        },
+    }
+
+
+def single_stage_files(*, custom: bool = False) -> dict[str, bytes]:
+    return {
+        f"{FLOW_ROOT}/submission.json": json.dumps(
+            single_stage_submission_payload(custom=custom)
+        ).encode("utf-8"),
+        f"{LOG_ROOT}/validation-run.out": b"",
+        f"{LOG_ROOT}/validation-run.err": b"",
+        f"{FLOW_ROOT}/CONTCAR": b"contcar",
+        f"{FLOW_ROOT}/OUTCAR": b"outcar",
+        f"{FLOW_ROOT}/vasprun.xml": b"vasprun",
+        f"{FLOW_ROOT}/INCAR": b"IVDW = 11\n",
+    }
+
+
 def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
     assert command == [
         "ssh",
@@ -270,6 +333,7 @@ def test_inspect_run_uses_submission_stage_dirs_and_preserves_sources() -> None:
         remote_runner=remote,
         slurm_runner=slurm_runner,
         scientific_parser=fake_scientific_parser,
+        modifier_policies=(modifier_policy(),),
     )
 
     assert [stage.stage_type for stage in inspection.workflow_stages] == [
@@ -305,8 +369,51 @@ def test_inspect_run_uses_submission_stage_dirs_and_preserves_sources() -> None:
     assert all(item.evidence_type == ARTIFACT_OBSERVATION for item in inspection.final_artifacts)
     incar_inputs = {item.label: item for item in inspection.executed_inputs}
     assert incar_inputs["producer-alpha"].evidence_type == EXECUTED_INPUT
+    assert incar_inputs["producer-alpha"].stage_index == 1
     assert incar_inputs["producer-alpha"].values["IVDW"] == 11
+    assert incar_inputs["producer-delta"].stage_index == 4
     assert incar_inputs["producer-beta"].present is False
+    assert "result_dir" not in incar_inputs
+    assert all(item.stage_index is not None for item in inspection.executed_inputs)
+    assert inspection.input_expectations[0].status == "supported"
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_single_stage_runs_bind_result_dir_to_stage_one(custom: bool) -> None:
+    remote = RemoteFixture(files=single_stage_files(custom=custom), directories={FLOW_ROOT})
+
+    def parser(
+        local_paths: dict[str, Path],
+        display_paths: dict[str, str],
+        workflow_spec: dict,
+    ) -> ScientificResult:
+        assert set(local_paths) == {"contcar", "vasprun"}
+        return ScientificResult(
+            source_paths=tuple(display_paths.values()),
+            final_formula="Example",
+        )
+
+    inspection = inspect_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        scientific_parser=parser,
+        modifier_policies=(modifier_policy(),),
+    )
+
+    assert inspection.workflow_stages[0].options == {"dispersion": {"method": "dftd3"}}
+    assert inspection.executed_inputs == (
+        IncarObservation(
+            "result_dir",
+            f"{FLOW_ROOT}/INCAR",
+            True,
+            1,
+            values={"IVDW": 11},
+        ),
+    )
+    assert inspection.input_expectations[0].status == "supported"
+    assert inspection.input_expectations[0].observed_value == 11
 
 
 def test_producer_supplied_paths_outside_allowed_roots_are_rejected() -> None:
@@ -442,6 +549,8 @@ class FakeBandVasprun:
         self.final_energy = -4.0
         self.converged_electronic = True
         self.converged = True
+        self.incar = {"IVDW": 11}
+        self.parameters = {"ENCUT": 520}
         self.efermi = None if kwargs.get("parse_dos") is False else 0.3
 
     def get_band_structure(self, **kwargs: object) -> FakeBandStructure:
@@ -548,6 +657,11 @@ def test_band_parsing_keeps_final_vasprun_fermi_reference(tmp_path: Path) -> Non
     assert result.structure.volume == 62.5
     assert result.structure.density == 4.2
     assert result.structure.c_over_a == 2.0
+    assert result.executed_parameters[0].source_type == "vasprun_xml.incar"
+    assert result.executed_parameters[0].stage_index == 5
+    assert result.executed_parameters[0].values["IVDW"] == 11
+    assert result.executed_parameters[1].source_type == "vasprun_xml.parameters"
+    assert result.executed_parameters[1].values["ENCUT"] == 520
 
 
 def test_scalar_observations_survive_band_structure_failure(tmp_path: Path) -> None:
@@ -635,10 +749,127 @@ def test_requested_options_are_compared_to_executed_input_by_policy() -> None:
             input_key="IVDW",
             expected_value=11,
             observed_value=12,
-            status="mismatch",
-            reason="observed INCAR value differs from producer-requested option effect",
+            status="discrepancy",
+            source_values={"retained_incar:producer-alpha": 12},
+            reason="executed value differs from producer-requested option effect",
         ),
     )
+
+
+def test_requested_check_statuses_distinguish_unavailable_absent_supported_and_disagreement() -> None:
+    stages = (
+        WorkflowStage(
+            1,
+            "relax",
+            "pbe",
+            ("dispersion",),
+            None,
+            {"dispersion": {"method": "dftd3"}},
+        ),
+    )
+
+    unavailable = compare_requested_options_to_executed_inputs(
+        stages,
+        (
+            IncarObservation(
+                "result_dir",
+                f"{FLOW_ROOT}/INCAR",
+                False,
+                1,
+            ),
+        ),
+        (modifier_policy(),),
+    )[0]
+    assert unavailable.status == "unavailable"
+    assert unavailable.reason == "no readable executed-input evidence was bound to this stage"
+
+    absent = compare_requested_options_to_executed_inputs(
+        stages,
+        (
+            IncarObservation(
+                "result_dir",
+                f"{FLOW_ROOT}/INCAR",
+                True,
+                1,
+                values={"ENCUT": 520},
+            ),
+        ),
+        (modifier_policy(),),
+    )[0]
+    assert absent.status == "absent"
+    assert absent.source_values == {"retained_incar:result_dir": None}
+
+    supported = compare_requested_options_to_executed_inputs(
+        stages,
+        (
+            IncarObservation(
+                "result_dir",
+                f"{FLOW_ROOT}/INCAR",
+                False,
+                1,
+            ),
+            IncarObservation(
+                "vasprun_xml.incar",
+                f"{FLOW_ROOT}/vasprun.xml",
+                True,
+                1,
+                source_type="vasprun_xml.incar",
+                values={"IVDW": 11},
+            ),
+        ),
+        (modifier_policy(),),
+    )[0]
+    assert supported.status == "supported"
+    assert supported.observed_value == 11
+    assert supported.source_values == {"vasprun_xml.incar:vasprun_xml.incar": 11}
+
+    disagreement = compare_requested_options_to_executed_inputs(
+        stages,
+        (
+            IncarObservation(
+                "result_dir",
+                f"{FLOW_ROOT}/INCAR",
+                True,
+                1,
+                values={"IVDW": 11},
+            ),
+            IncarObservation(
+                "vasprun_xml.incar",
+                f"{FLOW_ROOT}/vasprun.xml",
+                True,
+                1,
+                source_type="vasprun_xml.incar",
+                values={"IVDW": 12},
+            ),
+        ),
+        (modifier_policy(),),
+    )[0]
+    assert disagreement.status == "discrepancy"
+    assert disagreement.source_values == {
+        "retained_incar:result_dir": 11,
+        "vasprun_xml.incar:vasprun_xml.incar": 12,
+    }
+    assert disagreement.reason == "executed-input sources disagree about parameter value"
+
+
+def test_vasp_reported_parameter_observations_are_generic() -> None:
+    vasprun = types.SimpleNamespace(
+        incar={"IVDW": 11},
+        parameters={"ENCUT": 520},
+    )
+
+    observations = vasp_reported_parameter_observations(
+        vasprun,
+        source_path="/remote/result/vasprun.xml",
+        stage_index=1,
+    )
+
+    assert [observation.source_type for observation in observations] == [
+        "vasprun_xml.incar",
+        "vasprun_xml.parameters",
+    ]
+    assert observations[0].values["IVDW"] == 11
+    assert observations[1].values["ENCUT"] == 520
 
 
 def comparison_inspection(
@@ -862,3 +1093,66 @@ def test_cli_inspect_run_summary_is_evidence_oriented(
     assert "Logs (log_observation)" in captured.out
     assert "Evidence paths (artifact_observation)" in captured.out
     assert "Independent parsing (pymatgen_derived)" in captured.out
+
+
+def test_cli_executed_input_wording_distinguishes_unavailable_and_absent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    inspection = RunInspection(
+        flow_root=FLOW_ROOT,
+        submission_path=f"{FLOW_ROOT}/submission.json",
+        workflow_stages=(
+            WorkflowStage(1, "relax", "pbe", ("dispersion",), None, {"dispersion": {"method": "dftd3"}}),
+        ),
+        stage_directories=(),
+        result_directory=PathObservation("result_dir", FLOW_ROOT, "directory", True, ARTIFACT_OBSERVATION),
+        log_paths=(),
+        final_artifacts=(),
+        producer_git={},
+        cluster_request={},
+        resources_request={},
+        environment_policy={},
+        attempt_state=AttemptStateObservation(path=None, present=False),
+        job_id=None,
+        scheduler=None,
+        scheduler_error=None,
+        runtime=LogRuntimeObservation(LOG_OBSERVATION, (), None, {}, {}, {}),
+        scientific=ScientificResult(source_paths=()),
+        comparison=ComparisonObservation("unavailable", "producer_provenance"),
+        executed_inputs=(
+            IncarObservation("missing_result", f"{FLOW_ROOT}/INCAR", False, 1),
+            IncarObservation("parsed_result", f"{FLOW_ROOT}/INCAR", True, 1, values={"ENCUT": 520}),
+        ),
+        input_expectations=(
+            InputExpectationObservation(
+                stage_label="missing_result",
+                stage_index=1,
+                option_path="dispersion.method",
+                requested_value="dftd3",
+                input_key="IVDW",
+                expected_value=11,
+                observed_value=None,
+                status="unavailable",
+                reason="no readable executed-input evidence was bound to this stage",
+            ),
+            InputExpectationObservation(
+                stage_label="parsed_result",
+                stage_index=1,
+                option_path="dispersion.method",
+                requested_value="dftd3",
+                input_key="IVDW",
+                expected_value=11,
+                observed_value=None,
+                status="absent",
+                source_values={"retained_incar:parsed_result": None},
+                reason="IVDW was absent from readable executed-input evidence",
+            ),
+        ),
+    )
+
+    cli.print_run_inspection(inspection)
+
+    captured = capsys.readouterr()
+    assert "IVDW unavailable, expected 11: unavailable" in captured.out
+    assert "IVDW absent, expected 11: absent" in captured.out
+    assert "observed absent" not in captured.out

@@ -147,6 +147,7 @@ class ScientificResult:
     unavailable: tuple[str, ...] = ()
     error: str | None = None
     structure: StructureObservation | None = None
+    executed_parameters: tuple["IncarObservation", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,7 @@ class IncarObservation:
     path: str
     present: bool
     stage_index: int | None
+    source_type: str = "retained_incar"
     evidence_type: str = EXECUTED_INPUT
     values: Mapping[str, Any] = field(default_factory=dict)
     error: str | None = None
@@ -170,6 +172,7 @@ class InputExpectationObservation:
     expected_value: Any
     observed_value: Any
     status: str
+    source_values: Mapping[str, Any] = field(default_factory=dict)
     evidence_type: str = AGENT_COMPARISON
     reason: str | None = None
 
@@ -327,14 +330,10 @@ def inspect_remote_run(
         cluster.ssh_host,
         producer["stage_dirs"],
         producer["result_dir"],
+        producer["workflow_stages"],
         allowed_roots=cluster.allowed_remote_roots,
         runner=remote_runner,
         timeout=timeout,
-    )
-    input_expectations = compare_requested_options_to_executed_inputs(
-        producer["workflow_stages"],
-        executed_inputs,
-        modifier_policies,
     )
 
     attempt_state, attempt_payload = _read_attempt_state(
@@ -363,6 +362,12 @@ def inspect_remote_run(
         runner=remote_runner,
         parser=scientific_parser or parse_vasp_output_files,
         timeout=timeout,
+    )
+    executed_inputs = executed_inputs + scientific.executed_parameters
+    input_expectations = compare_requested_options_to_executed_inputs(
+        producer["workflow_stages"],
+        executed_inputs,
+        modifier_policies,
     )
     comparison = compare_with_producer_result(attempt_payload, scientific)
 
@@ -509,12 +514,18 @@ def parse_vasp_output_files(
         or _workflow_has_stage(workflow_spec, "band_structure")
     )
     vasprun = None
+    executed_parameters: tuple[IncarObservation, ...] = ()
     if "vasprun" in local_paths:
         try:
             vasprun = _load_vasprun(
                 Vasprun,
                 local_paths["vasprun"],
                 parse_eigenvalues=parse_eigenvalues,
+            )
+            executed_parameters = vasp_reported_parameter_observations(
+                vasprun,
+                source_path=display_paths.get("vasprun"),
+                stage_index=_workflow_final_stage_index(workflow_spec),
             )
         except Exception as exc:
             unavailable.append(f"vasprun.xml could not be parsed: {exc}")
@@ -617,7 +628,53 @@ def parse_vasp_output_files(
         bands=bands,
         unavailable=tuple(unavailable),
         structure=structure_observation,
+        executed_parameters=executed_parameters,
     )
+
+
+def vasp_reported_parameter_observations(
+    vasprun: Any,
+    *,
+    source_path: str | None,
+    stage_index: int | None,
+) -> tuple[IncarObservation, ...]:
+    """Expose VASP-reported executed parameters parsed by pymatgen."""
+
+    path = source_path or "vasprun.xml"
+    observations: list[IncarObservation] = []
+    for attribute, source_type in (
+        ("incar", "vasprun_xml.incar"),
+        ("parameters", "vasprun_xml.parameters"),
+    ):
+        values = _vasp_parameter_values(getattr(vasprun, attribute, None))
+        if values:
+            observations.append(
+                IncarObservation(
+                    label=source_type,
+                    path=path,
+                    present=True,
+                    stage_index=stage_index,
+                    source_type=source_type,
+                    values=values,
+                )
+            )
+    return tuple(observations)
+
+
+def _vasp_parameter_values(parameters: Any) -> Mapping[str, Any]:
+    if parameters is None:
+        return {}
+    try:
+        items = dict(parameters).items()
+    except Exception:
+        try:
+            items = parameters.items()
+        except Exception:
+            return {}
+    return {
+        str(key).upper(): _json_safe_value(value)
+        for key, value in items
+    }
 
 
 def structure_observation_from_structure(
@@ -899,6 +956,7 @@ def _observe_executed_inputs(
     ssh_host: str,
     stage_dirs: Mapping[str, PurePosixPath],
     result_dir: PurePosixPath,
+    workflow_stages: Sequence[WorkflowStage],
     *,
     allowed_roots: Iterable[PurePosixPath | str],
     runner: RemoteRunner,
@@ -906,6 +964,7 @@ def _observe_executed_inputs(
 ) -> tuple[IncarObservation, ...]:
     observations: list[IncarObservation] = []
     seen_paths: set[str] = set()
+    stage_count = len(workflow_stages)
 
     for index, (label, directory) in enumerate(stage_dirs.items(), start=1):
         observation = _observe_incar(
@@ -920,11 +979,17 @@ def _observe_executed_inputs(
         observations.append(observation)
         seen_paths.add(observation.path)
 
+    result_stage_index = None
+    if not stage_dirs and stage_count == 1:
+        result_stage_index = 1
+    elif stage_dirs and stage_count:
+        result_stage_index = stage_count
+
     result_observation = _observe_incar(
         ssh_host,
         label="result_dir",
         directory=result_dir,
-        stage_index=None,
+        stage_index=result_stage_index,
         allowed_roots=allowed_roots,
         runner=runner,
         timeout=timeout,
@@ -1026,14 +1091,14 @@ def compare_requested_options_to_executed_inputs(
     if not policies:
         return ()
 
-    inputs_by_index = {
-        observation.stage_index: observation
-        for observation in executed_inputs
-        if observation.stage_index is not None
-    }
+    inputs_by_index: dict[int, list[IncarObservation]] = {}
+    for observation in executed_inputs:
+        if observation.stage_index is not None:
+            inputs_by_index.setdefault(observation.stage_index, []).append(observation)
+
     observations: list[InputExpectationObservation] = []
     for stage in stages:
-        executed = inputs_by_index.get(stage.index)
+        executed = tuple(inputs_by_index.get(stage.index, ()))
         for policy in policies:
             if policy["modifier"] not in stage.modifiers:
                 continue
@@ -1048,25 +1113,14 @@ def compare_requested_options_to_executed_inputs(
             if not isinstance(effect, Mapping):
                 continue
             for input_key, expected_value in effect.items():
-                observed_value = None
-                status = "unavailable"
-                reason = "executed INCAR is unavailable"
-                if executed is not None and executed.present and not executed.error:
-                    observed_value = executed.values.get(str(input_key).upper())
-                    if observed_value is None:
-                        status = "mismatch"
-                        reason = "expected INCAR key is absent"
-                    elif _values_match(expected_value, observed_value):
-                        status = "match"
-                        reason = None
-                    else:
-                        status = "mismatch"
-                        reason = "observed INCAR value differs from producer-requested option effect"
-                elif executed is not None and executed.error:
-                    reason = executed.error
+                status, observed_value, source_values, reason = _evaluate_executed_parameter(
+                    executed,
+                    str(input_key).upper(),
+                    expected_value,
+                )
                 observations.append(
                     InputExpectationObservation(
-                        stage_label=executed.label if executed is not None else stage.label or f"stage_{stage.index}",
+                        stage_label=_stage_evidence_label(stage, executed),
                         stage_index=stage.index,
                         option_path=f"{policy['option_key']}.{policy['method_key']}",
                         requested_value=requested_value,
@@ -1074,10 +1128,107 @@ def compare_requested_options_to_executed_inputs(
                         expected_value=expected_value,
                         observed_value=observed_value,
                         status=status,
+                        source_values=source_values,
                         reason=reason,
                     )
                 )
     return tuple(observations)
+
+
+def _evaluate_executed_parameter(
+    executed: Sequence[IncarObservation],
+    input_key: str,
+    expected_value: Any,
+) -> tuple[str, Any, Mapping[str, Any], str | None]:
+    readable = tuple(
+        observation
+        for observation in executed
+        if observation.present and observation.error is None
+    )
+    if not readable:
+        reason = "no readable executed-input evidence was bound to this stage"
+        errors = [
+            f"{observation.label}: {observation.error}"
+            for observation in executed
+            if observation.error
+        ]
+        if errors:
+            reason = "; ".join(errors)
+        return "unavailable", None, {}, reason
+
+    source_values = {
+        _executed_source_label(observation): observation.values.get(input_key, None)
+        for observation in readable
+    }
+    present_values = [
+        value
+        for value in source_values.values()
+        if value is not None
+    ]
+    if not present_values:
+        return (
+            "absent",
+            None,
+            source_values,
+            f"{input_key} was absent from readable executed-input evidence",
+        )
+
+    if len(present_values) != len(source_values):
+        return (
+            "discrepancy",
+            _consensus_value(present_values),
+            source_values,
+            "executed-input sources disagree about parameter presence",
+        )
+
+    if not all(_values_match(present_values[0], value) for value in present_values[1:]):
+        return (
+            "discrepancy",
+            _consensus_value(present_values),
+            source_values,
+            "executed-input sources disagree about parameter value",
+        )
+
+    observed_value = present_values[0]
+    if not _values_match(expected_value, observed_value):
+        return (
+            "discrepancy",
+            observed_value,
+            source_values,
+            "executed value differs from producer-requested option effect",
+        )
+
+    return "supported", observed_value, source_values, None
+
+
+def _stage_evidence_label(
+    stage: WorkflowStage,
+    executed: Sequence[IncarObservation],
+) -> str:
+    retained = [observation.label for observation in executed if observation.source_type == "retained_incar"]
+    if retained:
+        return retained[0]
+    return stage.label or f"stage_{stage.index}"
+
+
+def _executed_source_label(observation: IncarObservation) -> str:
+    return f"{observation.source_type}:{observation.label}"
+
+
+def _workflow_final_stage_index(workflow_spec: Mapping[str, Any]) -> int | None:
+    stages = workflow_spec.get("stages")
+    if not isinstance(stages, list) or not stages:
+        return None
+    return len(stages)
+
+
+def _consensus_value(values: Sequence[Any]) -> Any:
+    if not values:
+        return None
+    first = values[0]
+    if all(_values_match(first, value) for value in values[1:]):
+        return first
+    return tuple(values)
 
 
 def _find_job_id(

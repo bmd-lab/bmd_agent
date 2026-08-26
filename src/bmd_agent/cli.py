@@ -403,15 +403,17 @@ def print_run_inspection(inspection: RunInspection) -> None:
     print("Executed VASP inputs (executed_input):")
     if inspection.executed_inputs:
         for observation in inspection.executed_inputs:
-            print(f"  {observation.label}: {_incar_summary(observation)}")
+            print(f"  {observation.label}: {_executed_input_summary(observation)}")
     else:
-        print("  unavailable: no INCAR observations were gathered")
+        print("  unavailable: no executed-input observations were gathered")
     if inspection.input_expectations:
         print("  requested/executed checks (agent_comparison):")
         for expectation in inspection.input_expectations:
             print(f"    {expectation.stage_label}: {expectation.option_path}={expectation.requested_value} -> "
-                  f"{expectation.input_key} expected {expectation.expected_value}, "
-                  f"observed {_display_missing(expectation.observed_value)}: {expectation.status}")
+                  f"{expectation.input_key} {_expectation_observed_text(expectation)}, "
+                  f"expected {expectation.expected_value}: {expectation.status}")
+            for source, value in sorted(expectation.source_values.items()):
+                print(f"      {source}: {_display_absent(value)}")
             if expectation.reason:
                 print(f"      reason: {expectation.reason}")
     print()
@@ -477,8 +479,10 @@ def print_run_comparison(
         for expectation in inspection.input_expectations:
             any_checks = True
             print(f"  {label} {expectation.stage_label}: "
-                  f"{expectation.input_key} observed {_display_missing(expectation.observed_value)}, "
+                  f"{expectation.input_key} {_expectation_observed_text(expectation)}, "
                   f"expected {expectation.expected_value}: {expectation.status}")
+            for source, value in sorted(expectation.source_values.items()):
+                print(f"    {source}: {_display_absent(value)}")
             if expectation.reason:
                 print(f"    reason: {expectation.reason}")
     if not any_checks:
@@ -710,21 +714,32 @@ def _flatten_options(options: Mapping[str, Any], prefix: str = "") -> list[tuple
     return flattened
 
 
-def _incar_summary(observation: object) -> str:
+def _executed_input_summary(observation: object) -> str:
     path = getattr(observation, "path")
+    source_type = getattr(observation, "source_type")
     if not getattr(observation, "present"):
-        return f"absent ({path})"
+        return f"unavailable ({source_type}, {path})"
     error = getattr(observation, "error")
     if error:
-        return f"present but unparsed ({path}): {error}"
+        return f"present but unparsed ({source_type}, {path}): {error}"
     values = getattr(observation, "values")
     ivdw = values.get("IVDW") if isinstance(values, Mapping) else None
     if ivdw is None:
-        return f"present ({path}); IVDW absent"
-    return f"present ({path}); IVDW={ivdw}"
+        return f"present ({source_type}, {path}); IVDW absent"
+    return f"present ({source_type}, {path}); IVDW={ivdw}"
 
 
-def _display_missing(value: object) -> object:
+def _expectation_observed_text(expectation: object) -> str:
+    status = getattr(expectation, "status")
+    value = getattr(expectation, "observed_value")
+    if status == "unavailable":
+        return "unavailable"
+    if status == "absent":
+        return "absent"
+    return f"observed {_display_absent(value)}"
+
+
+def _display_absent(value: object) -> object:
     return "absent" if value is None else value
 
 
