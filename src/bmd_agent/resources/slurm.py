@@ -10,7 +10,7 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 _PARTITION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _JOB_ID_RE = re.compile(r"^\d+(?:_\d+)?(?:\.(?:batch|extern))?$")
 _SQUEUE_FORMAT = "%i|%u|%j|%t|%M|%R"
-_SACCT_FORMAT = "JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode"
+_SACCT_FORMAT = "JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
 
 
 @dataclass
@@ -33,6 +33,7 @@ class SlurmAccountingRecord:
     end: str
     partition: str
     exit_code: str
+    timelimit: str | None = None
 
 
 def get_queue(
@@ -178,6 +179,7 @@ def parse_sacct_output(job_id: str, output: str) -> SlurmAccountingRecord | None
             end=parts[5].strip(),
             partition=parts[6].strip(),
             exit_code=parts[7].strip(),
+            timelimit=parts[8].strip() if len(parts) > 8 and parts[8].strip() else None,
         )
 
         if parts[0].strip() == normalized_job_id:

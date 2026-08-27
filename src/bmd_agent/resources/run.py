@@ -22,6 +22,7 @@ from bmd_agent.resources.vasp import (
     build_remote_file_path,
     remote_directory_exists,
     remote_file_exists,
+    remote_file_size,
     retrieve_remote_file,
 )
 
@@ -42,6 +43,8 @@ PYMATGEN_DERIVED = "pymatgen_derived"
 PRODUCER_REQUESTED = "producer_requested"
 EXECUTED_INPUT = "executed_input"
 AGENT_COMPARISON = "agent_comparison"
+TERMINATION_OBSERVATION = "termination_observation"
+TRAJECTORY_OBSERVATION = "trajectory_observation"
 
 _ARTIFACT_FILENAMES = {
     "contcar": "CONTCAR",
@@ -51,6 +54,13 @@ _ARTIFACT_FILENAMES = {
     "doscar": "DOSCAR",
 }
 _SCIENTIFIC_READ_KEYS = ("contcar", "vasprun", "kpoints")
+_DIAGNOSE_ARTIFACT_FILENAMES = {
+    "oszicar": "OSZICAR",
+    "vasprun": "vasprun.xml",
+}
+_DIAGNOSE_VASPRUN_MAX_BYTES = 50_000_000
+_DIAGNOSE_RECENT_WINDOW = 5
+_DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG")
 _PACKAGE_RE = re.compile(r"^\[runner\]\s+(\w+)\s+version:\s*(.+)$")
 _PYTHON_RE = re.compile(r"^\[runner\]\s+python:\s*(.+)$")
 _ENV_RE = re.compile(r"\b(PMG_VASP_PSP_DIR)=([^\s]+)")
@@ -249,11 +259,110 @@ class RunComparison:
 
 
 @dataclass(frozen=True)
+class TerminationObservation:
+    evidence_type: str = TERMINATION_OBSERVATION
+    scheduler_state: str | None = None
+    scheduler_exit_code: str | None = None
+    scheduler_elapsed: str | None = None
+    scheduler_timelimit: str | None = None
+    scheduler_reports_timeout: bool | None = None
+    vasp_completed_normally: bool | None = None
+    custodian_events: tuple[str, ...] = ()
+    unavailable: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ElectronicIterationObservation:
+    iteration: int | None
+    algorithm: str | None = None
+    energy: float | None = None
+    dE: float | None = None
+    deps: float | None = None
+    rms: float | None = None
+    rms_c: float | None = None
+
+
+@dataclass(frozen=True)
+class IonicStepObservation:
+    step_index: int
+    electronic_iterations: int | None = None
+    free_energy: float | None = None
+    energy_zero: float | None = None
+    dE: float | None = None
+    max_force: float | None = None
+
+
+@dataclass(frozen=True)
+class StageTrajectoryObservation:
+    stage_index: int | None
+    stage_label: str
+    stage_type: str | None
+    theory: str | None
+    directory: str
+    evidence_type: str = TRAJECTORY_OBSERVATION
+    oszicar_path: str | None = None
+    oszicar_present: bool = False
+    oszicar_error: str | None = None
+    vasprun_path: str | None = None
+    vasprun_present: bool = False
+    vasprun_error: str | None = None
+    vasprun_skipped_reason: str | None = None
+    criteria: Mapping[str, Any] = field(default_factory=dict)
+    criteria_source_values: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    criteria_discrepancies: tuple[str, ...] = ()
+    ionic_steps_observed: int | None = None
+    electronic_iterations_by_ionic_step: tuple[int, ...] = ()
+    final_electronic_iteration_count: int | None = None
+    recent_electronic_iterations: tuple[ElectronicIterationObservation, ...] = ()
+    recent_ionic_steps: tuple[IonicStepObservation, ...] = ()
+    vasprun_ionic_steps: int | None = None
+    converged_electronic: bool | None = None
+    converged_ionic: bool | None = None
+    unavailable: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RunDiagnosis:
+    inspection: RunInspection
+    termination: TerminationObservation
+    trajectories: tuple[StageTrajectoryObservation, ...]
+
+
+@dataclass(frozen=True)
 class _ComparableQuantity:
     key: str
     label: str
     unit: str | None
     value: Callable[[RunInspection], float | None]
+
+
+@dataclass(frozen=True)
+class _BoundStageDirectory:
+    label: str
+    directory: PurePosixPath
+    stage_index: int | None
+
+
+@dataclass(frozen=True)
+class _OszicarTrajectory:
+    ionic_steps_observed: int | None
+    electronic_iterations_by_ionic_step: tuple[int, ...]
+    final_electronic_iteration_count: int | None
+    recent_electronic_iterations: tuple[ElectronicIterationObservation, ...]
+    recent_ionic_steps: tuple[IonicStepObservation, ...]
+
+
+@dataclass(frozen=True)
+class _VasprunTrajectory:
+    present: bool
+    path: str | None = None
+    skipped_reason: str | None = None
+    error: str | None = None
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+    ionic_steps: int | None = None
+    converged_electronic: bool | None = None
+    converged_ionic: bool | None = None
+    recent_max_forces: Mapping[int, float] = field(default_factory=dict)
 
 
 def inspect_remote_run(
@@ -263,6 +372,7 @@ def inspect_remote_run(
     remote_runner: RemoteRunner = subprocess.run,
     slurm_runner: SlurmRunner = subprocess.run,
     scientific_parser: ScientificParser | None = None,
+    derive_scientific: bool = True,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
     timeout: float = 20,
 ) -> RunInspection:
@@ -355,14 +465,20 @@ def inspect_remote_run(
         runner=remote_runner,
         timeout=timeout,
     )
-    scientific = _derive_scientific_result(
-        cluster.ssh_host,
-        final_artifacts,
-        submission["flow_spec"]["workflow_spec"],
-        runner=remote_runner,
-        parser=scientific_parser or parse_vasp_output_files,
-        timeout=timeout,
-    )
+    if derive_scientific:
+        scientific = _derive_scientific_result(
+            cluster.ssh_host,
+            final_artifacts,
+            submission["flow_spec"]["workflow_spec"],
+            runner=remote_runner,
+            parser=scientific_parser or parse_vasp_output_files,
+            timeout=timeout,
+        )
+    else:
+        scientific = ScientificResult(
+            source_paths=(),
+            unavailable=("scientific artifact parsing skipped by diagnose-run v1",),
+        )
     executed_inputs = executed_inputs + scientific.executed_parameters
     input_expectations = compare_requested_options_to_executed_inputs(
         producer["workflow_stages"],
@@ -425,6 +541,42 @@ def compare_remote_runs(
         for flow_root in flow_roots
     )
     return build_run_comparison(inspections, modifier_policies=policy_tuple)
+
+
+def diagnose_remote_run(
+    cluster: SlurmClusterResource,
+    flow_root: str,
+    *,
+    remote_runner: RemoteRunner = subprocess.run,
+    slurm_runner: SlurmRunner = subprocess.run,
+    modifier_policies: Iterable[Mapping[str, Any]] = (),
+    timeout: float = 20,
+    max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
+) -> RunDiagnosis:
+    """Describe termination and convergence trajectory evidence for one run."""
+
+    inspection = inspect_remote_run(
+        cluster,
+        flow_root,
+        remote_runner=remote_runner,
+        slurm_runner=slurm_runner,
+        derive_scientific=False,
+        modifier_policies=modifier_policies,
+        timeout=timeout,
+    )
+    trajectories = _observe_stage_trajectories(
+        cluster.ssh_host,
+        inspection,
+        allowed_roots=cluster.allowed_remote_roots,
+        runner=remote_runner,
+        timeout=timeout,
+        max_vasprun_bytes=max_vasprun_bytes,
+    )
+    return RunDiagnosis(
+        inspection=inspection,
+        termination=_termination_observation(inspection),
+        trajectories=trajectories,
+    )
 
 
 def build_run_comparison(
@@ -659,6 +811,384 @@ def vasp_reported_parameter_observations(
                 )
             )
     return tuple(observations)
+
+
+def _termination_observation(inspection: RunInspection) -> TerminationObservation:
+    unavailable: list[str] = []
+    scheduler = inspection.scheduler
+    if scheduler is None:
+        unavailable.append(inspection.scheduler_error or "scheduler accounting was unavailable")
+        scheduler_timeout = None
+    else:
+        scheduler_timeout = scheduler.state.upper() == "TIMEOUT"
+        if scheduler.timelimit is None:
+            unavailable.append("scheduler timelimit was unavailable")
+
+    unavailable.append("VASP normal-completion marker is unavailable in diagnose-run v1")
+    unavailable.append("No producer-declared custodian event artifact is inspected in diagnose-run v1")
+
+    return TerminationObservation(
+        scheduler_state=scheduler.state if scheduler else None,
+        scheduler_exit_code=scheduler.exit_code if scheduler else None,
+        scheduler_elapsed=scheduler.elapsed if scheduler else None,
+        scheduler_timelimit=scheduler.timelimit if scheduler else None,
+        scheduler_reports_timeout=scheduler_timeout,
+        vasp_completed_normally=None,
+        custodian_events=(),
+        unavailable=tuple(unavailable),
+    )
+
+
+def _observe_stage_trajectories(
+    ssh_host: str,
+    inspection: RunInspection,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+    max_vasprun_bytes: int,
+) -> tuple[StageTrajectoryObservation, ...]:
+    stage_dirs = {
+        observation.label: PurePosixPath(observation.path)
+        for observation in inspection.stage_directories
+    }
+    bindings = _bound_stage_directories(
+        stage_dirs,
+        PurePosixPath(inspection.result_directory.path),
+        inspection.workflow_stages,
+    )
+    stages = {stage.index: stage for stage in inspection.workflow_stages}
+    return tuple(
+        _observe_stage_trajectory(
+            ssh_host,
+            binding,
+            stages.get(binding.stage_index) if binding.stage_index is not None else None,
+            inspection.executed_inputs,
+            allowed_roots=allowed_roots,
+            runner=runner,
+            timeout=timeout,
+            max_vasprun_bytes=max_vasprun_bytes,
+        )
+        for binding in bindings
+    )
+
+
+def _observe_stage_trajectory(
+    ssh_host: str,
+    binding: _BoundStageDirectory,
+    stage: WorkflowStage | None,
+    executed_inputs: Sequence[IncarObservation],
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+    max_vasprun_bytes: int,
+) -> StageTrajectoryObservation:
+    unavailable: list[str] = []
+    oszicar_path = build_remote_file_path(
+        binding.directory,
+        _DIAGNOSE_ARTIFACT_FILENAMES["oszicar"],
+        allowed_roots=allowed_roots,
+    )
+    oszicar_present = remote_file_exists(ssh_host, oszicar_path, runner=runner, timeout=timeout)
+    oszicar_error = None
+    oszicar_trajectory = _OszicarTrajectory(None, (), None, (), ())
+    if oszicar_present:
+        try:
+            oszicar_trajectory = parse_oszicar_trajectory(
+                retrieve_remote_file(ssh_host, oszicar_path, runner=runner, timeout=timeout)
+            )
+        except Exception as exc:
+            oszicar_error = str(exc)
+            unavailable.append(f"OSZICAR could not be parsed: {exc}")
+    else:
+        unavailable.append("OSZICAR is unavailable")
+
+    vasprun = _observe_vasprun_trajectory(
+        ssh_host,
+        binding.directory,
+        allowed_roots=allowed_roots,
+        runner=runner,
+        timeout=timeout,
+        max_vasprun_bytes=max_vasprun_bytes,
+    )
+    if vasprun.skipped_reason:
+        unavailable.append(vasprun.skipped_reason)
+    if vasprun.error:
+        unavailable.append(f"vasprun.xml could not be parsed: {vasprun.error}")
+    if not vasprun.present:
+        unavailable.append("vasprun.xml is unavailable")
+
+    recent_ionic_steps = _merge_recent_max_forces(
+        oszicar_trajectory.recent_ionic_steps,
+        vasprun.recent_max_forces,
+    )
+    criteria, criteria_sources, criteria_discrepancies = _trajectory_criteria(
+        binding.stage_index,
+        executed_inputs,
+        vasprun.parameters,
+    )
+
+    return StageTrajectoryObservation(
+        stage_index=binding.stage_index,
+        stage_label=binding.label,
+        stage_type=stage.stage_type if stage else None,
+        theory=stage.theory if stage else None,
+        directory=str(binding.directory),
+        oszicar_path=str(oszicar_path),
+        oszicar_present=oszicar_present,
+        oszicar_error=oszicar_error,
+        vasprun_path=vasprun.path,
+        vasprun_present=vasprun.present,
+        vasprun_error=vasprun.error,
+        vasprun_skipped_reason=vasprun.skipped_reason,
+        criteria=criteria,
+        criteria_source_values=criteria_sources,
+        criteria_discrepancies=criteria_discrepancies,
+        ionic_steps_observed=oszicar_trajectory.ionic_steps_observed,
+        electronic_iterations_by_ionic_step=oszicar_trajectory.electronic_iterations_by_ionic_step,
+        final_electronic_iteration_count=oszicar_trajectory.final_electronic_iteration_count,
+        recent_electronic_iterations=oszicar_trajectory.recent_electronic_iterations,
+        recent_ionic_steps=recent_ionic_steps,
+        vasprun_ionic_steps=vasprun.ionic_steps,
+        converged_electronic=vasprun.converged_electronic,
+        converged_ionic=vasprun.converged_ionic,
+        unavailable=tuple(unavailable),
+    )
+
+
+def parse_oszicar_trajectory(contents: bytes | str) -> _OszicarTrajectory:
+    """Parse compact electronic/ionic trajectory evidence from OSZICAR."""
+
+    text = contents.decode("utf-8", "replace") if isinstance(contents, bytes) else contents
+    try:
+        from pymatgen.io.vasp.outputs import Oszicar
+    except Exception as exc:
+        raise RunInspectionError(str(exc)) from exc
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        handle.write(text)
+        temporary_path = handle.name
+    try:
+        oszicar = Oszicar(temporary_path)
+    finally:
+        Path(temporary_path).unlink(missing_ok=True)
+
+    electronic_steps = tuple(getattr(oszicar, "electronic_steps", ()) or ())
+    ionic_steps = tuple(getattr(oszicar, "ionic_steps", ()) or ())
+    algorithm_steps = _oszicar_algorithms(text)
+    final_electronic_steps = tuple(electronic_steps[-1]) if electronic_steps else ()
+    recent_electronic = _recent_electronic_iterations(
+        final_electronic_steps,
+        algorithm_steps[-1] if algorithm_steps else (),
+    )
+    recent_ionic = _recent_ionic_steps(ionic_steps, electronic_steps)
+
+    return _OszicarTrajectory(
+        ionic_steps_observed=len(ionic_steps),
+        electronic_iterations_by_ionic_step=tuple(len(step) for step in electronic_steps),
+        final_electronic_iteration_count=len(final_electronic_steps) if final_electronic_steps else None,
+        recent_electronic_iterations=recent_electronic,
+        recent_ionic_steps=recent_ionic,
+    )
+
+
+def _oszicar_algorithms(text: str) -> tuple[tuple[str | None, ...], ...]:
+    groups: list[list[str | None]] = []
+    current: list[str | None] = []
+    pattern = re.compile(r"^\s*(?P<algorithm>[A-Za-z]+)\s*:\s*(?P<body>.*)$")
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        tokens = match.group("body").split()
+        if tokens and tokens[0] == "1" and current:
+            groups.append(current)
+            current = []
+        current.append(match.group("algorithm").upper())
+    if current:
+        groups.append(current)
+    return tuple(tuple(group) for group in groups)
+
+
+def _recent_electronic_iterations(
+    electronic_steps: Sequence[Mapping[str, Any]],
+    algorithms: Sequence[str | None],
+) -> tuple[ElectronicIterationObservation, ...]:
+    offset = max(0, len(electronic_steps) - _DIAGNOSE_RECENT_WINDOW)
+    observations: list[ElectronicIterationObservation] = []
+    for local_index, step in enumerate(electronic_steps[offset:], start=offset):
+        observations.append(
+            ElectronicIterationObservation(
+                iteration=_int_or_none(step.get("N")),
+                algorithm=algorithms[local_index] if local_index < len(algorithms) else None,
+                energy=_round_float(_float_or_none(step.get("E"))),
+                dE=_round_float(_float_or_none(step.get("dE"))),
+                deps=_round_float(_float_or_none(step.get("deps"))),
+                rms=_round_float(_float_or_none(step.get("rms"))),
+                rms_c=_round_float(_float_or_none(step.get("rms(c)"))),
+            )
+        )
+    return tuple(observations)
+
+
+def _recent_ionic_steps(
+    ionic_steps: Sequence[Mapping[str, Any]],
+    electronic_steps: Sequence[Sequence[Mapping[str, Any]]],
+) -> tuple[IonicStepObservation, ...]:
+    offset = max(0, len(ionic_steps) - _DIAGNOSE_RECENT_WINDOW)
+    observations: list[IonicStepObservation] = []
+    for index, step in enumerate(ionic_steps[offset:], start=offset + 1):
+        electronic_index = index - 1
+        observations.append(
+            IonicStepObservation(
+                step_index=index,
+                electronic_iterations=(
+                    len(electronic_steps[electronic_index])
+                    if electronic_index < len(electronic_steps)
+                    else None
+                ),
+                free_energy=_round_float(_float_or_none(step.get("F"))),
+                energy_zero=_round_float(_float_or_none(step.get("E0"))),
+                dE=_round_float(_float_or_none(step.get("dE"))),
+            )
+        )
+    return tuple(observations)
+
+
+def _observe_vasprun_trajectory(
+    ssh_host: str,
+    directory: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+    max_vasprun_bytes: int,
+) -> _VasprunTrajectory:
+    path = build_remote_file_path(
+        directory,
+        _DIAGNOSE_ARTIFACT_FILENAMES["vasprun"],
+        allowed_roots=allowed_roots,
+    )
+    if not remote_file_exists(ssh_host, path, runner=runner, timeout=timeout):
+        return _VasprunTrajectory(present=False, path=str(path))
+    try:
+        size = remote_file_size(ssh_host, path, runner=runner, timeout=timeout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as exc:
+        return _VasprunTrajectory(present=True, path=str(path), error=str(exc))
+    if size > max_vasprun_bytes:
+        return _VasprunTrajectory(
+            present=True,
+            path=str(path),
+            skipped_reason=f"vasprun.xml skipped because size {size} bytes exceeds limit {max_vasprun_bytes}",
+        )
+
+    try:
+        from pymatgen.io.vasp.outputs import Vasprun
+    except Exception as exc:
+        return _VasprunTrajectory(present=True, path=str(path), error=str(exc))
+
+    try:
+        contents = retrieve_remote_file(ssh_host, path, runner=runner, timeout=timeout)
+        with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
+            handle.write(contents)
+            temporary_path = Path(handle.name)
+        try:
+            vasprun = _load_vasprun(Vasprun, temporary_path, parse_eigenvalues=False)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    except Exception as exc:
+        return _VasprunTrajectory(present=True, path=str(path), error=str(exc))
+
+    ionic_steps = tuple(getattr(vasprun, "ionic_steps", ()) or ())
+    return _VasprunTrajectory(
+        present=True,
+        path=str(path),
+        parameters=_vasp_parameter_values(getattr(vasprun, "parameters", None)),
+        ionic_steps=len(ionic_steps),
+        converged_electronic=_bool_or_none(getattr(vasprun, "converged_electronic", None)),
+        converged_ionic=_bool_or_none(getattr(vasprun, "converged_ionic", None)),
+        recent_max_forces=_recent_max_forces(ionic_steps),
+    )
+
+
+def _recent_max_forces(ionic_steps: Sequence[Mapping[str, Any]]) -> Mapping[int, float]:
+    offset = max(0, len(ionic_steps) - _DIAGNOSE_RECENT_WINDOW)
+    values: dict[int, float] = {}
+    for step_index, step in enumerate(ionic_steps[offset:], start=offset + 1):
+        max_force = _max_force(step.get("forces"))
+        if max_force is not None:
+            values[step_index] = _round_float(max_force) or max_force
+    return values
+
+
+def _max_force(forces: Any) -> float | None:
+    rows = _matrix_rows(forces)
+    maxima: list[float] = []
+    for row in rows:
+        components = [_float_or_none(component) for component in _matrix_rows(row)]
+        if not components or any(component is None for component in components):
+            continue
+        maxima.append(sum(component * component for component in components if component is not None) ** 0.5)
+    return max(maxima) if maxima else None
+
+
+def _merge_recent_max_forces(
+    ionic_steps: Sequence[IonicStepObservation],
+    max_forces: Mapping[int, float],
+) -> tuple[IonicStepObservation, ...]:
+    if not max_forces:
+        return tuple(ionic_steps)
+    merged: list[IonicStepObservation] = []
+    seen: set[int] = set()
+    for step in ionic_steps:
+        seen.add(step.step_index)
+        merged.append(
+            IonicStepObservation(
+                step_index=step.step_index,
+                electronic_iterations=step.electronic_iterations,
+                free_energy=step.free_energy,
+                energy_zero=step.energy_zero,
+                dE=step.dE,
+                max_force=max_forces.get(step.step_index, step.max_force),
+            )
+        )
+    for step_index, max_force in max_forces.items():
+        if step_index not in seen:
+            merged.append(IonicStepObservation(step_index=step_index, max_force=max_force))
+    return tuple(sorted(merged, key=lambda item: item.step_index))
+
+
+def _trajectory_criteria(
+    stage_index: int | None,
+    executed_inputs: Sequence[IncarObservation],
+    vasprun_parameters: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Mapping[str, Any]], tuple[str, ...]]:
+    sources: list[tuple[str, Mapping[str, Any]]] = []
+    for observation in executed_inputs:
+        if observation.stage_index != stage_index or not observation.present or observation.error:
+            continue
+        sources.append((_executed_source_label(observation), observation.values))
+    if vasprun_parameters:
+        sources.append(("diagnose_vasprun.parameters", vasprun_parameters))
+
+    criteria: dict[str, Any] = {}
+    source_values: dict[str, Mapping[str, Any]] = {}
+    discrepancies: list[str] = []
+    for key in _DIAGNOSE_CRITERIA_KEYS:
+        values = {
+            source: values[key]
+            for source, values in sources
+            if key in values
+        }
+        if not values:
+            continue
+        source_values[key] = values
+        observed = list(values.values())
+        criteria[key] = observed[0]
+        if not all(_values_match(observed[0], value) for value in observed[1:]):
+            discrepancies.append(key)
+    return criteria, source_values, tuple(discrepancies)
 
 
 def _vasp_parameter_values(parameters: Any) -> Mapping[str, Any]:
@@ -977,20 +1507,37 @@ def _observe_executed_inputs(
 ) -> tuple[IncarObservation, ...]:
     observations: list[IncarObservation] = []
     seen_paths: set[str] = set()
-    stage_count = len(workflow_stages)
 
-    for index, (label, directory) in enumerate(stage_dirs.items(), start=1):
+    for binding in _bound_stage_directories(stage_dirs, result_dir, workflow_stages):
         observation = _observe_incar(
             ssh_host,
-            label=label,
-            directory=directory,
-            stage_index=index,
+            label=binding.label,
+            directory=binding.directory,
+            stage_index=binding.stage_index,
             allowed_roots=allowed_roots,
             runner=runner,
             timeout=timeout,
         )
+        if observation.path in seen_paths:
+            continue
         observations.append(observation)
         seen_paths.add(observation.path)
+
+    return tuple(observations)
+
+
+def _bound_stage_directories(
+    stage_dirs: Mapping[str, PurePosixPath],
+    result_dir: PurePosixPath,
+    workflow_stages: Sequence[WorkflowStage],
+) -> tuple[_BoundStageDirectory, ...]:
+    bindings: list[_BoundStageDirectory] = []
+    seen_directories: set[str] = set()
+    stage_count = len(workflow_stages)
+
+    for index, (label, directory) in enumerate(stage_dirs.items(), start=1):
+        bindings.append(_BoundStageDirectory(label, directory, index))
+        seen_directories.add(str(directory))
 
     result_stage_index = None
     if not stage_dirs and stage_count == 1:
@@ -998,19 +1545,10 @@ def _observe_executed_inputs(
     elif stage_dirs and stage_count:
         result_stage_index = stage_count
 
-    result_observation = _observe_incar(
-        ssh_host,
-        label="result_dir",
-        directory=result_dir,
-        stage_index=result_stage_index,
-        allowed_roots=allowed_roots,
-        runner=runner,
-        timeout=timeout,
-    )
-    if result_observation.path not in seen_paths:
-        observations.append(result_observation)
+    if str(result_dir) not in seen_directories:
+        bindings.append(_BoundStageDirectory("result_dir", result_dir, result_stage_index))
 
-    return tuple(observations)
+    return tuple(bindings)
 
 
 def _observe_incar(
@@ -1762,6 +2300,13 @@ def _json_safe_value(value: Any) -> Any:
 def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 

@@ -76,7 +76,7 @@ def test_build_sacct_command_is_fixed_and_read_only() -> None:
 
     assert command == (
         "sacct -X -P -n -j 20893681 "
-        "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode"
+        "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
     )
     assert "sbatch" not in command
     assert "scancel" not in command
@@ -85,9 +85,9 @@ def test_build_sacct_command_is_fixed_and_read_only() -> None:
 def test_parse_sacct_output_prefers_primary_job_row() -> None:
     output = (
         "20893681.batch|batch|COMPLETED|02:48:37|2026-08-21T12:14:10|"
-        "2026-08-21T15:02:47|leeburton-pool|0:0\n"
+        "2026-08-21T15:02:47|leeburton-pool|0:0|72:00:00\n"
         "20893681|run|COMPLETED|02:48:37|2026-08-21T12:14:10|"
-        "2026-08-21T15:02:47|leeburton-pool|0:0\n"
+        "2026-08-21T15:02:47|leeburton-pool|0:0|72:00:00\n"
     )
 
     record = parse_sacct_output("20893681.batch", output)
@@ -98,6 +98,7 @@ def test_parse_sacct_output_prefers_primary_job_row() -> None:
     assert record.elapsed == "02:48:37"
     assert record.partition == "leeburton-pool"
     assert record.exit_code == "0:0"
+    assert record.timelimit == "72:00:00"
 
 
 def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
@@ -114,7 +115,7 @@ def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
             0,
             stdout=(
                 "20893681|run|COMPLETED|02:48:37|2026-08-21T12:14:10|"
-                "2026-08-21T15:02:47|leeburton-pool|0:0\n"
+                "2026-08-21T15:02:47|leeburton-pool|0:0|72:00:00\n"
             ),
             stderr="",
         )
@@ -129,7 +130,7 @@ def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
             "powerslurm-bmdguest",
             (
                 "sacct -X -P -n -j 20893681 "
-                "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode"
+                "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
             ),
         ]
     ]

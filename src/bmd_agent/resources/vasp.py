@@ -91,6 +91,26 @@ def remote_file_exists(
     )
 
 
+def remote_file_size(
+    ssh_host: str,
+    remote_path: PurePosixPath,
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> int:
+    """Return the byte size of one already-authorized remote file."""
+
+    remote_command = "stat -c %s -- " + shlex.quote(str(remote_path))
+    result = runner(
+        ["ssh", ssh_host, remote_command],
+        capture_output=True,
+        check=True,
+        timeout=timeout,
+    )
+
+    return int(result.stdout.decode("utf-8", "replace").strip())
+
+
 def remote_directory_exists(
     ssh_host: str,
     remote_path: PurePosixPath,

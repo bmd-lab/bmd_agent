@@ -11,6 +11,7 @@ from bmd_agent.resources.vasp import (
     read_remote_structure,
     remote_directory_exists,
     remote_file_exists,
+    remote_file_size,
     retrieve_remote_file,
 )
 
@@ -144,6 +145,32 @@ def test_remote_exists_helpers_use_read_only_test_commands() -> None:
             "powerslurm-bmdguest",
             "test -d /home/example/calculations/run",
         ],
+    ]
+
+
+def test_remote_file_size_uses_read_only_stat_command() -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(command)
+        assert kwargs["capture_output"] is True
+        assert kwargs["check"] is True
+        assert kwargs["timeout"] == 20
+        return subprocess.CompletedProcess(command, 0, stdout=b"123\n", stderr=b"")
+
+    size = remote_file_size(
+        "powerslurm-bmdguest",
+        PurePosixPath("/home/example/calculations/project with spaces/vasprun.xml"),
+        runner=runner,
+    )
+
+    assert size == 123
+    assert calls == [
+        [
+            "ssh",
+            "powerslurm-bmdguest",
+            "stat -c %s -- '/home/example/calculations/project with spaces/vasprun.xml'",
+        ]
     ]
 
 
