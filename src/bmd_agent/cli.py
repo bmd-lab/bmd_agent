@@ -685,7 +685,10 @@ def _print_vasprun_trajectory_source(trajectory: object) -> None:
     if getattr(trajectory, "vasprun_skipped_reason", None):
         print(f"      skipped: {getattr(trajectory, 'vasprun_skipped_reason')}")
     if getattr(trajectory, "vasprun_error", None):
-        print(f"      error: {getattr(trajectory, 'vasprun_error')}")
+        print(
+            "      vasprun trajectory enrichment unavailable: "
+            f"{getattr(trajectory, 'vasprun_error')}"
+        )
 
 
 def _print_trajectory_criteria(trajectory: object) -> None:
@@ -721,39 +724,79 @@ def _format_trajectory_criterion(key: str, value: object) -> str:
 
 def _print_electronic_trajectory(trajectory: object) -> None:
     print("    electronic trajectory:")
-    _print_optional_nested_value(
-        "ionic steps observed",
+    completed_ionic_steps = getattr(
+        trajectory,
+        "completed_ionic_steps",
         getattr(trajectory, "ionic_steps_observed", None),
     )
-    counts = getattr(trajectory, "electronic_iterations_by_ionic_step", ())
-    if counts:
-        print(f"      electronic iterations by ionic step: {_format_count_sequence(counts)}")
-    _print_optional_nested_value(
-        "final electronic iterations",
-        getattr(trajectory, "final_electronic_iteration_count", None),
+    print(f"      completed ionic steps: {_diagnosis_value(completed_ionic_steps)}")
+
+    counts = getattr(
+        trajectory,
+        "electronic_iterations_by_completed_ionic_step",
+        getattr(trajectory, "electronic_iterations_by_ionic_step", ()),
     )
-    recent = getattr(trajectory, "recent_electronic_iterations", ())
+    if counts:
+        print(
+            "      electronic iterations for completed ionic steps: "
+            f"{_format_count_sequence(counts)}"
+        )
+    else:
+        print("      electronic iterations for completed ionic steps: none")
+
+    incomplete_count = getattr(trajectory, "incomplete_electronic_iteration_count", None)
+    if incomplete_count is not None:
+        print(
+            "      incomplete electronic cycle: "
+            f"{incomplete_count} iterations observed{_nelm_suffix(trajectory)}"
+        )
+        recent = getattr(trajectory, "recent_incomplete_electronic_iterations", ())
+        recent_label = "recent incomplete-cycle iterations"
+    else:
+        final_count = getattr(trajectory, "final_electronic_iteration_count", None)
+        if final_count is None:
+            print("      final electronic cycle: unavailable")
+        else:
+            print(
+                "      final electronic cycle: "
+                f"{final_count} iterations observed{_nelm_suffix(trajectory)}"
+            )
+        recent = getattr(trajectory, "recent_electronic_iterations", ())
+        recent_label = "recent final-cycle iterations"
+
     if recent:
-        print("      recent final-cycle iterations:")
+        print(f"      {recent_label}:")
         for iteration in recent:
             print(f"        {_format_electronic_iteration(iteration)}")
     else:
-        print("      recent final-cycle iterations: unavailable")
+        print(f"      {recent_label}: unavailable")
 
 
 def _print_ionic_trajectory(trajectory: object) -> None:
     print("    ionic trajectory:")
-    _print_optional_nested_value(
-        "vasprun ionic steps",
-        getattr(trajectory, "vasprun_ionic_steps", None),
+    completed_ionic_steps = getattr(
+        trajectory,
+        "completed_ionic_steps",
+        getattr(trajectory, "ionic_steps_observed", None),
     )
+    print(f"      completed ionic steps: {_diagnosis_value(completed_ionic_steps)}")
+    vasprun_steps = getattr(trajectory, "vasprun_ionic_steps", None)
+    if vasprun_steps is not None:
+        print(f"      vasprun ionic steps: {vasprun_steps}")
     recent = getattr(trajectory, "recent_ionic_steps", ())
     if recent:
-        print("      recent ionic steps:")
+        print("      recent completed ionic steps:")
         for step in recent:
             print(f"        {_format_ionic_step(step)}")
     else:
-        print("      recent ionic steps: unavailable")
+        print("      recent completed ionic steps: unavailable")
+
+
+def _nelm_suffix(trajectory: object) -> str:
+    criteria = getattr(trajectory, "criteria", {})
+    if isinstance(criteria, Mapping) and "NELM" in criteria:
+        return f" / NELM {criteria['NELM']}"
+    return ""
 
 
 def _format_electronic_iteration(iteration: object) -> str:

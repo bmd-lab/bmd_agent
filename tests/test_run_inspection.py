@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import sys
 import types
+import warnings
 
 import pytest
 
@@ -68,6 +69,18 @@ DAV:   2   -1.100000000000E+01   -1.00000E+00   -2.00000E-01   12   1.000E-01   
 DAV:   3   -1.110000000000E+01   -1.00000E-01   -2.00000E-02   12   9.000E-02   1.000E-02
    1 F= -.11100000E+02 E0= -.11050000E+02  d E =-.111000E+02
 """
+
+
+def oszicar_incomplete_cycle(iterations: int = 25) -> bytes:
+    lines = [
+        "       N       E                     dE             d eps       ncg     rms          rms(c)"
+    ]
+    for index in range(1, iterations + 1):
+        lines.append(
+            f"DAV: {index:3d}   {-10 - index / 100:.12E}   -1.00000E-02   "
+            "-1.00000E-03   10   1.000E-01   2.000E-02"
+        )
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 class RemoteFixture:
@@ -569,13 +582,29 @@ def test_parse_oszicar_trajectory_preserves_electronic_and_ionic_evidence() -> N
     trajectory = parse_oszicar_trajectory(OSZICAR_TWO_STEP)
 
     assert trajectory.ionic_steps_observed == 2
+    assert trajectory.completed_ionic_steps == 2
     assert trajectory.electronic_iterations_by_ionic_step == (2, 2)
+    assert trajectory.electronic_iterations_by_completed_ionic_step == (2, 2)
+    assert trajectory.incomplete_electronic_iteration_count is None
     assert trajectory.final_electronic_iteration_count == 2
     assert trajectory.recent_electronic_iterations[-1].algorithm == "RMM"
     assert trajectory.recent_electronic_iterations[-1].iteration == 2
     assert trajectory.recent_electronic_iterations[-1].energy == -12.1
     assert trajectory.recent_ionic_steps[-1].step_index == 2
     assert trajectory.recent_ionic_steps[-1].free_energy == -12.1
+
+
+def test_parse_oszicar_distinguishes_incomplete_first_electronic_cycle() -> None:
+    trajectory = parse_oszicar_trajectory(oszicar_incomplete_cycle(25))
+
+    assert trajectory.ionic_steps_observed == 0
+    assert trajectory.completed_ionic_steps == 0
+    assert trajectory.electronic_iterations_by_ionic_step == (25,)
+    assert trajectory.electronic_iterations_by_completed_ionic_step == ()
+    assert trajectory.incomplete_electronic_iteration_count == 25
+    assert trajectory.final_electronic_iteration_count == 25
+    assert trajectory.recent_incomplete_electronic_iterations[-1].iteration == 25
+    assert trajectory.recent_ionic_steps == ()
 
 
 def test_diagnose_run_uses_producer_stage_dirs_for_oszicar_evidence() -> None:
@@ -612,11 +641,14 @@ def test_diagnose_run_uses_producer_stage_dirs_for_oszicar_evidence() -> None:
     assert first_stage.criteria["NSW"] == 1
     assert first_stage.criteria["EDIFFG"] == -0.02
     assert first_stage.final_electronic_iteration_count == 3
+    assert first_stage.completed_ionic_steps == 1
+    assert first_stage.incomplete_electronic_iteration_count is None
     assert first_stage.vasprun_present is False
 
     final_stage = diagnosis.trajectories[-1]
     assert final_stage.stage_index == 4
     assert final_stage.ionic_steps_observed == 2
+    assert final_stage.completed_ionic_steps == 2
     assert final_stage.electronic_iterations_by_ionic_step == (2, 2)
 
 
@@ -641,6 +673,7 @@ def test_diagnose_single_stage_uses_result_dir_binding(custom: bool) -> None:
     assert trajectory.stage_index == 1
     assert trajectory.criteria["NSW"] == 2
     assert trajectory.ionic_steps_observed == 2
+    assert trajectory.completed_ionic_steps == 2
 
 
 def test_diagnose_vasprun_size_cap_skips_large_transfer() -> None:
@@ -703,6 +736,55 @@ def test_diagnose_vasprun_enriches_force_and_convergence_evidence(
     assert trajectory.recent_ionic_steps[-1].max_force == 0.5
     assert trajectory.criteria["NELM"] == 60
     assert trajectory.criteria_discrepancies == ()
+
+
+def test_diagnose_malformed_vasprun_keeps_oszicar_evidence_and_quiet_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def malformed_loader(*args: object, **kwargs: object) -> object:
+        warnings.warn(
+            "XML is malformed. Parsing has stopped but partial data is available.",
+            UserWarning,
+        )
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(run_resource, "_load_vasprun", malformed_loader)
+
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 200\nEDIFF = 1E-6\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = oszicar_incomplete_cycle(25)
+    files[f"{FLOW_ROOT}/vasprun.xml"] = b"<modeling><calculation>"
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.oszicar_present is True
+    assert trajectory.completed_ionic_steps == 0
+    assert trajectory.electronic_iterations_by_completed_ionic_step == ()
+    assert trajectory.incomplete_electronic_iteration_count == 25
+    assert trajectory.recent_incomplete_electronic_iterations[-1].iteration == 25
+    assert trajectory.vasprun_present is True
+    assert trajectory.vasprun_error == "file could not be parsed completely"
+    assert "list index out of range" not in " ".join(trajectory.unavailable)
+    assert "XML is malformed" not in " ".join(trajectory.unavailable)
+
+    cli.print_run_diagnosis(diagnosis)
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "completed ionic steps: 0" in captured.out
+    assert "electronic iterations for completed ionic steps: none" in captured.out
+    assert "incomplete electronic cycle: 25 iterations observed / NELM 200" in captured.out
+    assert "vasprun trajectory enrichment unavailable: file could not be parsed completely" in captured.out
+    assert "list index out of range" not in captured.out
+    assert "XML is malformed" not in captured.out
 
 
 def test_diagnose_scheduler_timeout_is_evidence_not_prediction() -> None:

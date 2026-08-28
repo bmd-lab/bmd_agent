@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tempfile
+import warnings
 from typing import Any
 
 from bmd_agent.config import SlurmClusterResource
@@ -61,6 +62,8 @@ _DIAGNOSE_ARTIFACT_FILENAMES = {
 _DIAGNOSE_VASPRUN_MAX_BYTES = 50_000_000
 _DIAGNOSE_RECENT_WINDOW = 5
 _DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG")
+_INCOMPLETE_VASPRUN_TRAJECTORY_REASON = "file could not be parsed completely"
+_UNREADABLE_VASPRUN_TRAJECTORY_REASON = "file could not be read"
 _PACKAGE_RE = re.compile(r"^\[runner\]\s+(\w+)\s+version:\s*(.+)$")
 _PYTHON_RE = re.compile(r"^\[runner\]\s+python:\s*(.+)$")
 _ENV_RE = re.compile(r"\b(PMG_VASP_PSP_DIR)=([^\s]+)")
@@ -314,6 +317,10 @@ class StageTrajectoryObservation:
     electronic_iterations_by_ionic_step: tuple[int, ...] = ()
     final_electronic_iteration_count: int | None = None
     recent_electronic_iterations: tuple[ElectronicIterationObservation, ...] = ()
+    completed_ionic_steps: int | None = None
+    electronic_iterations_by_completed_ionic_step: tuple[int, ...] = ()
+    incomplete_electronic_iteration_count: int | None = None
+    recent_incomplete_electronic_iterations: tuple[ElectronicIterationObservation, ...] = ()
     recent_ionic_steps: tuple[IonicStepObservation, ...] = ()
     vasprun_ionic_steps: int | None = None
     converged_electronic: bool | None = None
@@ -350,6 +357,10 @@ class _OszicarTrajectory:
     final_electronic_iteration_count: int | None
     recent_electronic_iterations: tuple[ElectronicIterationObservation, ...]
     recent_ionic_steps: tuple[IonicStepObservation, ...]
+    completed_ionic_steps: int | None = None
+    electronic_iterations_by_completed_ionic_step: tuple[int, ...] = ()
+    incomplete_electronic_iteration_count: int | None = None
+    recent_incomplete_electronic_iterations: tuple[ElectronicIterationObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -915,7 +926,7 @@ def _observe_stage_trajectory(
     if vasprun.skipped_reason:
         unavailable.append(vasprun.skipped_reason)
     if vasprun.error:
-        unavailable.append(f"vasprun.xml could not be parsed: {vasprun.error}")
+        unavailable.append(f"vasprun trajectory enrichment unavailable: {vasprun.error}")
     if not vasprun.present:
         unavailable.append("vasprun.xml is unavailable")
 
@@ -949,6 +960,16 @@ def _observe_stage_trajectory(
         electronic_iterations_by_ionic_step=oszicar_trajectory.electronic_iterations_by_ionic_step,
         final_electronic_iteration_count=oszicar_trajectory.final_electronic_iteration_count,
         recent_electronic_iterations=oszicar_trajectory.recent_electronic_iterations,
+        completed_ionic_steps=oszicar_trajectory.completed_ionic_steps,
+        electronic_iterations_by_completed_ionic_step=(
+            oszicar_trajectory.electronic_iterations_by_completed_ionic_step
+        ),
+        incomplete_electronic_iteration_count=(
+            oszicar_trajectory.incomplete_electronic_iteration_count
+        ),
+        recent_incomplete_electronic_iterations=(
+            oszicar_trajectory.recent_incomplete_electronic_iterations
+        ),
         recent_ionic_steps=recent_ionic_steps,
         vasprun_ionic_steps=vasprun.ionic_steps,
         converged_electronic=vasprun.converged_electronic,
@@ -977,10 +998,19 @@ def parse_oszicar_trajectory(contents: bytes | str) -> _OszicarTrajectory:
     electronic_steps = tuple(getattr(oszicar, "electronic_steps", ()) or ())
     ionic_steps = tuple(getattr(oszicar, "ionic_steps", ()) or ())
     algorithm_steps = _oszicar_algorithms(text)
+    completed_ionic_steps = len(ionic_steps)
+    completed_electronic_steps = electronic_steps[:completed_ionic_steps]
+    incomplete_electronic_steps = electronic_steps[completed_ionic_steps:]
+    incomplete_algorithm_steps = algorithm_steps[completed_ionic_steps:]
     final_electronic_steps = tuple(electronic_steps[-1]) if electronic_steps else ()
     recent_electronic = _recent_electronic_iterations(
         final_electronic_steps,
         algorithm_steps[-1] if algorithm_steps else (),
+    )
+    incomplete_cycle = tuple(incomplete_electronic_steps[-1]) if incomplete_electronic_steps else ()
+    recent_incomplete = _recent_electronic_iterations(
+        incomplete_cycle,
+        incomplete_algorithm_steps[-1] if incomplete_algorithm_steps else (),
     )
     recent_ionic = _recent_ionic_steps(ionic_steps, electronic_steps)
 
@@ -990,6 +1020,14 @@ def parse_oszicar_trajectory(contents: bytes | str) -> _OszicarTrajectory:
         final_electronic_iteration_count=len(final_electronic_steps) if final_electronic_steps else None,
         recent_electronic_iterations=recent_electronic,
         recent_ionic_steps=recent_ionic,
+        completed_ionic_steps=completed_ionic_steps,
+        electronic_iterations_by_completed_ionic_step=tuple(
+            len(step) for step in completed_electronic_steps
+        ),
+        incomplete_electronic_iteration_count=(
+            len(incomplete_cycle) if incomplete_cycle else None
+        ),
+        recent_incomplete_electronic_iterations=recent_incomplete,
     )
 
 
@@ -1090,25 +1128,58 @@ def _observe_vasprun_trajectory(
 
     try:
         contents = retrieve_remote_file(ssh_host, path, runner=runner, timeout=timeout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return _VasprunTrajectory(
+            present=True,
+            path=str(path),
+            error=_UNREADABLE_VASPRUN_TRAJECTORY_REASON,
+        )
+
+    try:
         with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
             handle.write(contents)
             temporary_path = Path(handle.name)
         try:
-            vasprun = _load_vasprun(Vasprun, temporary_path, parse_eigenvalues=False)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", UserWarning)
+                vasprun = _load_vasprun(Vasprun, temporary_path, parse_eigenvalues=False)
+                if _has_malformed_xml_warning(caught):
+                    return _VasprunTrajectory(
+                        present=True,
+                        path=str(path),
+                        error=_INCOMPLETE_VASPRUN_TRAJECTORY_REASON,
+                    )
+                ionic_steps = tuple(getattr(vasprun, "ionic_steps", ()) or ())
+                parameters = _vasp_parameter_values(getattr(vasprun, "parameters", None))
+                converged_electronic = _bool_or_none(
+                    getattr(vasprun, "converged_electronic", None)
+                )
+                converged_ionic = _bool_or_none(getattr(vasprun, "converged_ionic", None))
+                recent_max_forces = _recent_max_forces(ionic_steps)
         finally:
             temporary_path.unlink(missing_ok=True)
-    except Exception as exc:
-        return _VasprunTrajectory(present=True, path=str(path), error=str(exc))
+    except Exception:
+        return _VasprunTrajectory(
+            present=True,
+            path=str(path),
+            error=_INCOMPLETE_VASPRUN_TRAJECTORY_REASON,
+        )
 
-    ionic_steps = tuple(getattr(vasprun, "ionic_steps", ()) or ())
     return _VasprunTrajectory(
         present=True,
         path=str(path),
-        parameters=_vasp_parameter_values(getattr(vasprun, "parameters", None)),
+        parameters=parameters,
         ionic_steps=len(ionic_steps),
-        converged_electronic=_bool_or_none(getattr(vasprun, "converged_electronic", None)),
-        converged_ionic=_bool_or_none(getattr(vasprun, "converged_ionic", None)),
-        recent_max_forces=_recent_max_forces(ionic_steps),
+        converged_electronic=converged_electronic,
+        converged_ionic=converged_ionic,
+        recent_max_forces=recent_max_forces,
+    )
+
+
+def _has_malformed_xml_warning(caught_warnings: Sequence[warnings.WarningMessage]) -> bool:
+    return any(
+        "xml is malformed" in str(item.message).lower()
+        for item in caught_warnings
     )
 
 
