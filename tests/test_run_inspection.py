@@ -5,10 +5,12 @@ import shlex
 import subprocess
 import sys
 import types
+import warnings
 
 import pytest
 
 from bmd_agent import cli
+import bmd_agent.resources.run as run_resource
 from bmd_agent.config import ResourceRegistry, SlurmClusterResource
 from bmd_agent.resources.run import (
     AGENT_COMPARISON,
@@ -23,16 +25,22 @@ from bmd_agent.resources.run import (
     InputExpectationObservation,
     LogRuntimeObservation,
     PathObservation,
+    RunDiagnosis,
     RunInspection,
     RunInspectionError,
     ScientificResult,
+    StageTrajectoryObservation,
+    TerminationObservation,
     StructureObservation,
+    TRAJECTORY_OBSERVATION,
     WorkflowStage,
     build_run_comparison,
     compare_remote_runs,
     compare_requested_options_to_executed_inputs,
+    diagnose_remote_run,
     inspect_remote_run,
     parse_incar_contents,
+    parse_oszicar_trajectory,
     parse_vasp_output_files,
     run_label_from_provenance,
     vasp_reported_parameter_observations,
@@ -44,6 +52,35 @@ from bmd_agent.resources.vasp import RemotePathError
 FLOW_ROOT = "/bmd-db/guest/flows/validation-run"
 LOG_ROOT = "/bmd-db/guest/logs"
 RESULT_DIR = f"{FLOW_ROOT}/producer-delta"
+OSZICAR_TWO_STEP = b"""\
+       N       E                     dE             d eps       ncg     rms          rms(c)
+DAV:   1   -1.000000000000E+01   -1.00000E+01   -1.00000E+01   10   1.000E+00   2.000E-01
+DAV:   2   -1.100000000000E+01   -1.00000E+00   -2.00000E-01   12   1.000E-01   2.000E-02
+   1 F= -.11000000E+02 E0= -.10950000E+02  d E =-.110000E+02
+       N       E                     dE             d eps       ncg     rms          rms(c)
+RMM:   1   -1.200000000000E+01   -1.00000E+00   -1.00000E-01   10   5.000E-02   1.000E-02
+RMM:   2   -1.210000000000E+01   -1.00000E-01   -1.00000E-02   12   4.000E-02   8.000E-03
+   2 F= -.12100000E+02 E0= -.12050000E+02  d E =-.110000E+01
+"""
+OSZICAR_NELM_LIMIT = b"""\
+       N       E                     dE             d eps       ncg     rms          rms(c)
+DAV:   1   -1.000000000000E+01   -1.00000E+01   -1.00000E+01   10   1.000E+00   2.000E-01
+DAV:   2   -1.100000000000E+01   -1.00000E+00   -2.00000E-01   12   1.000E-01   2.000E-02
+DAV:   3   -1.110000000000E+01   -1.00000E-01   -2.00000E-02   12   9.000E-02   1.000E-02
+   1 F= -.11100000E+02 E0= -.11050000E+02  d E =-.111000E+02
+"""
+
+
+def oszicar_incomplete_cycle(iterations: int = 25) -> bytes:
+    lines = [
+        "       N       E                     dE             d eps       ncg     rms          rms(c)"
+    ]
+    for index in range(1, iterations + 1):
+        lines.append(
+            f"DAV: {index:3d}   {-10 - index / 100:.12E}   -1.00000E-02   "
+            "-1.00000E-03   10   1.000E-01   2.000E-02"
+        )
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 class RemoteFixture:
@@ -83,6 +120,18 @@ class RemoteFixture:
                 command,
                 0 if parts[2] in self.directories else 1,
                 stdout=b"",
+                stderr=b"",
+            )
+
+        if parts[:4] == ["stat", "-c", "%s", "--"]:
+            assert kwargs["check"] is True
+            path = parts[4]
+            if path not in self.files:
+                raise subprocess.CalledProcessError(1, command, stderr=b"missing")
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=f"{len(self.files[path])}\n".encode("utf-8"),
                 stderr=b"",
             )
 
@@ -337,7 +386,7 @@ def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedPr
         "powerslurm-bmdguest",
         (
             "sacct -X -P -n -j 20893681 "
-            "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode"
+            "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
         ),
     ]
     assert kwargs["capture_output"] is True
@@ -348,7 +397,7 @@ def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedPr
         0,
         stdout=(
             "20893681|validation|COMPLETED|02:48:37|2026-08-21T12:14:10|"
-            "2026-08-21T15:02:47|leeburton-pool|0:0\n"
+            "2026-08-21T15:02:47|leeburton-pool|0:0|72:00:00\n"
         ),
         stderr="",
     )
@@ -527,6 +576,258 @@ def test_legacy_submission_without_provenance_remains_inspectable(
     captured = capsys.readouterr()
     assert "git commit:  unavailable" in captured.out
     assert "git state:   unavailable" in captured.out
+
+
+def test_parse_oszicar_trajectory_preserves_electronic_and_ionic_evidence() -> None:
+    trajectory = parse_oszicar_trajectory(OSZICAR_TWO_STEP)
+
+    assert trajectory.ionic_steps_observed == 2
+    assert trajectory.completed_ionic_steps == 2
+    assert trajectory.electronic_iterations_by_ionic_step == (2, 2)
+    assert trajectory.electronic_iterations_by_completed_ionic_step == (2, 2)
+    assert trajectory.incomplete_electronic_iteration_count is None
+    assert trajectory.final_electronic_iteration_count == 2
+    assert trajectory.recent_electronic_iterations[-1].algorithm == "RMM"
+    assert trajectory.recent_electronic_iterations[-1].iteration == 2
+    assert trajectory.recent_electronic_iterations[-1].energy == -12.1
+    assert trajectory.recent_ionic_steps[-1].step_index == 2
+    assert trajectory.recent_ionic_steps[-1].free_energy == -12.1
+
+
+def test_parse_oszicar_distinguishes_incomplete_first_electronic_cycle() -> None:
+    trajectory = parse_oszicar_trajectory(oszicar_incomplete_cycle(25))
+
+    assert trajectory.ionic_steps_observed == 0
+    assert trajectory.completed_ionic_steps == 0
+    assert trajectory.electronic_iterations_by_ionic_step == (25,)
+    assert trajectory.electronic_iterations_by_completed_ionic_step == ()
+    assert trajectory.incomplete_electronic_iteration_count == 25
+    assert trajectory.final_electronic_iteration_count == 25
+    assert trajectory.recent_incomplete_electronic_iterations[-1].iteration == 25
+    assert trajectory.recent_ionic_steps == ()
+
+
+def test_diagnose_run_uses_producer_stage_dirs_for_oszicar_evidence() -> None:
+    files = default_files(include_vasprun=False)
+    files[f"{FLOW_ROOT}/producer-alpha/INCAR"] = b"NELM = 3\nEDIFF = 1E-6\nNSW = 1\nEDIFFG = -0.02\n"
+    files[f"{FLOW_ROOT}/producer-alpha/OSZICAR"] = OSZICAR_NELM_LIMIT
+    files[f"{RESULT_DIR}/OSZICAR"] = OSZICAR_TWO_STEP
+    remote = RemoteFixture(files=files, directories=default_directories())
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=slurm_runner,
+    )
+
+    assert diagnosis.termination.scheduler_state == "COMPLETED"
+    assert diagnosis.termination.scheduler_timelimit == "72:00:00"
+    assert diagnosis.termination.scheduler_reports_timeout is False
+    assert [trajectory.stage_label for trajectory in diagnosis.trajectories] == [
+        "producer-alpha",
+        "producer-beta",
+        "producer-gamma",
+        "producer-delta",
+    ]
+    assert "result_dir" not in [trajectory.stage_label for trajectory in diagnosis.trajectories]
+
+    first_stage = diagnosis.trajectories[0]
+    assert first_stage.evidence_type == TRAJECTORY_OBSERVATION
+    assert first_stage.stage_index == 1
+    assert first_stage.oszicar_present is True
+    assert first_stage.criteria["NELM"] == 3
+    assert first_stage.criteria["EDIFF"] == 1e-06
+    assert first_stage.criteria["NSW"] == 1
+    assert first_stage.criteria["EDIFFG"] == -0.02
+    assert first_stage.final_electronic_iteration_count == 3
+    assert first_stage.completed_ionic_steps == 1
+    assert first_stage.incomplete_electronic_iteration_count is None
+    assert first_stage.vasprun_present is False
+
+    final_stage = diagnosis.trajectories[-1]
+    assert final_stage.stage_index == 4
+    assert final_stage.ionic_steps_observed == 2
+    assert final_stage.completed_ionic_steps == 2
+    assert final_stage.electronic_iterations_by_ionic_step == (2, 2)
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_diagnose_single_stage_uses_result_dir_binding(custom: bool) -> None:
+    files = single_stage_files(custom=custom)
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nNSW = 2\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    assert len(diagnosis.trajectories) == 1
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.stage_label == "result_dir"
+    assert trajectory.stage_index == 1
+    assert trajectory.criteria["NSW"] == 2
+    assert trajectory.ionic_steps_observed == 2
+    assert trajectory.completed_ionic_steps == 2
+
+
+def test_diagnose_vasprun_size_cap_skips_large_transfer() -> None:
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files[f"{FLOW_ROOT}/vasprun.xml"] = b"x" * 20
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+        max_vasprun_bytes=5,
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.vasprun_present is True
+    assert trajectory.vasprun_error is None
+    assert trajectory.vasprun_skipped_reason is not None
+    assert "exceeds limit 5" in trajectory.vasprun_skipped_reason
+    assert all(
+        "cat -- /bmd-db/guest/flows/validation-run/vasprun.xml" not in command
+        for command in (" ".join(item) for item in remote.commands)
+    )
+
+
+def test_diagnose_vasprun_enriches_force_and_convergence_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTrajectoryVasprun:
+        parameters = {"NELM": 60, "EDIFF": 1e-06, "NSW": 2, "EDIFFG": -0.01}
+        converged_electronic = True
+        converged_ionic = False
+        ionic_steps = (
+            {"forces": ((3.0, 4.0, 0.0), (0.0, 0.0, 1.0))},
+            {"forces": ((0.0, 0.3, 0.4),)},
+        )
+
+    monkeypatch.setattr(run_resource, "_load_vasprun", lambda *args, **kwargs: FakeTrajectoryVasprun())
+
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nEDIFF = 1E-6\nNSW = 2\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files[f"{FLOW_ROOT}/vasprun.xml"] = b"<modeling/>"
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.vasprun_present is True
+    assert trajectory.vasprun_ionic_steps == 2
+    assert trajectory.converged_electronic is True
+    assert trajectory.converged_ionic is False
+    assert trajectory.recent_ionic_steps[-1].max_force == 0.5
+    assert trajectory.criteria["NELM"] == 60
+    assert trajectory.criteria_discrepancies == ()
+
+
+def test_diagnose_malformed_vasprun_keeps_oszicar_evidence_and_quiet_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def malformed_loader(*args: object, **kwargs: object) -> object:
+        warnings.warn(
+            "XML is malformed. Parsing has stopped but partial data is available.",
+            UserWarning,
+        )
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(run_resource, "_load_vasprun", malformed_loader)
+
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 200\nEDIFF = 1E-6\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = oszicar_incomplete_cycle(25)
+    files[f"{FLOW_ROOT}/vasprun.xml"] = b"<modeling><calculation>"
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.oszicar_present is True
+    assert trajectory.completed_ionic_steps == 0
+    assert trajectory.electronic_iterations_by_completed_ionic_step == ()
+    assert trajectory.incomplete_electronic_iteration_count == 25
+    assert trajectory.recent_incomplete_electronic_iterations[-1].iteration == 25
+    assert trajectory.vasprun_present is True
+    assert trajectory.vasprun_error == "file could not be parsed completely"
+    assert "list index out of range" not in " ".join(trajectory.unavailable)
+    assert "XML is malformed" not in " ".join(trajectory.unavailable)
+
+    cli.print_run_diagnosis(diagnosis)
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "completed ionic steps: 0" in captured.out
+    assert "electronic iterations for completed ionic steps: none" in captured.out
+    assert "incomplete electronic cycle: 25 iterations observed / NELM 200" in captured.out
+    assert "vasprun trajectory enrichment unavailable: file could not be parsed completely" in captured.out
+    assert "list index out of range" not in captured.out
+    assert "XML is malformed" not in captured.out
+
+
+def test_diagnose_scheduler_timeout_is_evidence_not_prediction() -> None:
+    files = default_files(include_vasprun=False)
+    remote = RemoteFixture(files=files, directories=default_directories())
+
+    def timeout_slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "20893681|validation|TIMEOUT|72:00:00|2026-08-21T12:14:10|"
+                "2026-08-24T12:14:10|leeburton-pool|0:0|72:00:00\n"
+            ),
+            stderr="",
+        )
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=timeout_slurm_runner,
+    )
+
+    assert diagnosis.termination.scheduler_state == "TIMEOUT"
+    assert diagnosis.termination.scheduler_reports_timeout is True
+
+
+def test_diagnose_rejects_producer_paths_outside_allowed_roots() -> None:
+    files = {
+        f"{FLOW_ROOT}/submission.json": json.dumps(
+            submission_payload(outside_path=True)
+        ).encode("utf-8")
+    }
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    with pytest.raises(RemotePathError, match="paths.stage_dirs.producer-beta"):
+        diagnose_remote_run(
+            cluster(),
+            FLOW_ROOT,
+            remote_runner=remote,
+            slurm_runner=slurm_runner,
+        )
 
 
 def test_producer_supplied_paths_outside_allowed_roots_are_rejected() -> None:
@@ -1338,6 +1639,79 @@ def test_cli_inspect_run_summary_is_evidence_oriented(
     assert "Logs (log_observation)" in captured.out
     assert "Evidence paths (artifact_observation)" in captured.out
     assert "Independent parsing (pymatgen_derived)" in captured.out
+
+
+def test_cli_diagnose_run_summary_is_descriptive_not_predictive(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    inspection = cli_run_inspection(
+        workflow_stages=(WorkflowStage(1, "relax", "pbe", (), None),),
+        executed_inputs=(),
+    )
+    diagnosis = RunDiagnosis(
+        inspection=inspection,
+        termination=TerminationObservation(
+            scheduler_state="TIMEOUT",
+            scheduler_exit_code="0:0",
+            scheduler_elapsed="72:00:00",
+            scheduler_timelimit="72:00:00",
+            scheduler_reports_timeout=True,
+            unavailable=("VASP normal-completion marker is unavailable in diagnose-run v1",),
+        ),
+        trajectories=(
+            StageTrajectoryObservation(
+                stage_index=1,
+                stage_label="result_dir",
+                stage_type="relax",
+                theory="pbe",
+                directory=FLOW_ROOT,
+                oszicar_path=f"{FLOW_ROOT}/OSZICAR",
+                oszicar_present=True,
+                vasprun_path=f"{FLOW_ROOT}/vasprun.xml",
+                vasprun_present=True,
+                criteria={"NELM": 60, "EDIFFG": -0.01},
+                ionic_steps_observed=2,
+                electronic_iterations_by_ionic_step=(4, 60),
+                final_electronic_iteration_count=60,
+                recent_electronic_iterations=(
+                    run_resource.ElectronicIterationObservation(
+                        iteration=60,
+                        algorithm="RMM",
+                        energy=-12.1,
+                        dE=-0.001,
+                        deps=-0.0001,
+                        rms=0.02,
+                        rms_c=0.01,
+                    ),
+                ),
+                recent_ionic_steps=(
+                    run_resource.IonicStepObservation(
+                        step_index=2,
+                        electronic_iterations=60,
+                        free_energy=-12.1,
+                        energy_zero=-12.05,
+                        dE=-0.1,
+                        max_force=0.5,
+                    ),
+                ),
+                vasprun_ionic_steps=2,
+                converged_electronic=False,
+                converged_ionic=False,
+            ),
+        ),
+    )
+
+    cli.print_run_diagnosis(diagnosis)
+
+    captured = capsys.readouterr()
+    assert "Termination evidence (termination_observation)" in captured.out
+    assert "scheduler reports timeout: True" in captured.out
+    assert "Trajectory evidence (trajectory_observation)" in captured.out
+    assert "EDIFFG: -0.01 eV/A force criterion" in captured.out
+    assert "RMM N=60 E=-12.1 dE=-0.001 deps=-0.0001 rms=0.02 rms(c)=0.01" in captured.out
+    assert "step 2 electronic_iterations=60 F=-12.1 E0=-12.05 dE=-0.1 max_force=0.5" in captured.out
+    forbidden = ("likely to benefit", "more walltime alone", "stalled", "oscillating", "diverging")
+    assert all(term not in captured.out.lower() for term in forbidden)
 
 
 def test_cli_executed_input_wording_distinguishes_unavailable_and_absent(

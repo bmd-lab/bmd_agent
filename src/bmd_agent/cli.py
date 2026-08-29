@@ -19,10 +19,12 @@ from bmd_agent.resources.compute import (
 from bmd_agent.resources.git import GitInspection, inspect_repository
 from bmd_agent.resources.run import (
     PRODUCER_REQUESTED,
+    RunDiagnosis,
     RunInspection,
     RunComparison,
     RunInspectionError,
     compare_remote_runs,
+    diagnose_remote_run,
     inspect_remote_run,
 )
 from bmd_agent.resources.slurm import get_queue
@@ -354,6 +356,51 @@ def show_compare_runs(flow_roots: list[str], registry: ResourceRegistry | None =
     return 0
 
 
+def show_diagnose_run(flow_root: str, registry: ResourceRegistry | None = None) -> int:
+    """Display descriptive convergence and termination evidence for one run."""
+
+    registry = registry or load_resources()
+    cluster = powerslurm_cluster(registry)
+    modifier_policies, _ = modifier_policies_from_compute(registry)
+
+    print("BMD Compute Run Diagnosis")
+    print("=========================")
+    print()
+
+    try:
+        diagnosis = diagnose_remote_run(
+            cluster,
+            flow_root,
+            modifier_policies=modifier_policies,
+        )
+
+    except RemotePathError as exc:
+        print(f"Refusing remote read: {exc}")
+        return 2
+
+    except subprocess.TimeoutExpired:
+        print("Run diagnosis timed out.")
+        return 1
+
+    except subprocess.CalledProcessError as exc:
+        print("Unable to diagnose run through PowerSLURM.")
+        if exc.stderr:
+            stderr = (
+                exc.stderr.decode(errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else str(exc.stderr)
+            )
+            print(stderr.strip())
+        return 1
+
+    except RunInspectionError as exc:
+        print(f"Unable to diagnose run: {exc}")
+        return 1
+
+    print_run_diagnosis(diagnosis)
+    return 0
+
+
 def print_run_inspection(inspection: RunInspection) -> None:
     """Print a concise evidence-oriented run inspection summary."""
 
@@ -477,6 +524,70 @@ def print_run_inspection(inspection: RunInspection) -> None:
         print(f"  mismatches: {', '.join(inspection.comparison.mismatches)}")
 
 
+def print_run_diagnosis(diagnosis: RunDiagnosis) -> None:
+    """Print descriptive termination and trajectory evidence."""
+
+    inspection = diagnosis.inspection
+    print("Producer provenance (producer_provenance):")
+    print(f"  flow root:   {inspection.flow_root}")
+    print(f"  git commit:  {_display_commit(inspection.producer_git.get('git_commit'))}")
+    print(f"  git state:   {inspection.producer_git.get('state', 'unavailable')}")
+    print()
+
+    print(f"Requested workflow ({PRODUCER_REQUESTED}):")
+    for stage in inspection.workflow_stages:
+        modifiers = f" [{', '.join(stage.modifiers)}]" if stage.modifiers else ""
+        print(
+            f"  {stage.index}. {_display_theory(stage.theory):<6} "
+            f"{_display_stage(stage.stage_type)}{modifiers}"
+        )
+        options = _format_options(stage.options)
+        if options:
+            print(f"     options: {options}")
+    print()
+
+    termination = diagnosis.termination
+    print(f"Termination evidence ({termination.evidence_type}):")
+    _print_optional_value("scheduler state", termination.scheduler_state)
+    _print_optional_value("scheduler exit", termination.scheduler_exit_code)
+    _print_optional_value("elapsed", termination.scheduler_elapsed)
+    _print_optional_value("time limit", termination.scheduler_timelimit)
+    _print_optional_value("scheduler reports timeout", termination.scheduler_reports_timeout)
+    _print_optional_value("VASP normal completion", termination.vasp_completed_normally)
+    if termination.custodian_events:
+        print("  custodian events:")
+        for event in termination.custodian_events:
+            print(f"    {event}")
+    for item in termination.unavailable:
+        print(f"  unavailable: {item}")
+    print()
+
+    print("Trajectory evidence (trajectory_observation):")
+    if not diagnosis.trajectories:
+        print("  unavailable: no producer-bound VASP stage directories were available")
+        return
+
+    for trajectory in diagnosis.trajectories:
+        print(f"  {_trajectory_heading(trajectory)}:")
+        print(f"    directory: {trajectory.directory}")
+        print(
+            f"    OSZICAR: "
+            f"{'present' if trajectory.oszicar_present else 'unavailable'} "
+            f"({trajectory.oszicar_path})"
+        )
+        if trajectory.oszicar_error:
+            print(f"      error: {trajectory.oszicar_error}")
+        _print_vasprun_trajectory_source(trajectory)
+        _print_trajectory_criteria(trajectory)
+        _print_electronic_trajectory(trajectory)
+        _print_ionic_trajectory(trajectory)
+        print("    convergence flags:")
+        print(f"      electronic: {_diagnosis_value(trajectory.converged_electronic)}")
+        print(f"      ionic: {_diagnosis_value(trajectory.converged_ionic)}")
+        for item in trajectory.unavailable:
+            print(f"    unavailable: {item}")
+
+
 def print_run_comparison(
     comparison: RunComparison,
     *,
@@ -551,6 +662,196 @@ def print_run_comparison(
         print(f"Modifier policy warning: {policy_warning}")
 
 
+def _trajectory_heading(trajectory: object) -> str:
+    stage_index = getattr(trajectory, "stage_index", None)
+    if stage_index is None:
+        prefix = "unindexed stage"
+    else:
+        prefix = f"stage {stage_index}"
+    theory = getattr(trajectory, "theory", None)
+    stage_type = getattr(trajectory, "stage_type", None)
+    if theory and stage_type:
+        prefix = f"{prefix}: {_display_theory(theory)} {_display_stage(stage_type)}"
+    label = getattr(trajectory, "stage_label", None)
+    return f"{prefix} ({label})" if label else prefix
+
+
+def _print_vasprun_trajectory_source(trajectory: object) -> None:
+    path = getattr(trajectory, "vasprun_path", None)
+    if getattr(trajectory, "vasprun_present", False):
+        print(f"    vasprun.xml: present ({path})")
+    else:
+        print(f"    vasprun.xml: unavailable ({path})")
+    if getattr(trajectory, "vasprun_skipped_reason", None):
+        print(f"      skipped: {getattr(trajectory, 'vasprun_skipped_reason')}")
+    if getattr(trajectory, "vasprun_error", None):
+        print(
+            "      vasprun trajectory enrichment unavailable: "
+            f"{getattr(trajectory, 'vasprun_error')}"
+        )
+
+
+def _print_trajectory_criteria(trajectory: object) -> None:
+    criteria = getattr(trajectory, "criteria", {})
+    print("    criteria:")
+    if not criteria:
+        print("      unavailable")
+    for key in ("NELM", "EDIFF", "NSW", "EDIFFG"):
+        if key in criteria:
+            print(f"      {key}: {_format_trajectory_criterion(key, criteria[key])}")
+    discrepancies = getattr(trajectory, "criteria_discrepancies", ())
+    if discrepancies:
+        print(f"      discrepancies: {', '.join(discrepancies)}")
+        source_values = getattr(trajectory, "criteria_source_values", {})
+        for key in discrepancies:
+            values = source_values.get(key, {})
+            for source, value in sorted(values.items()):
+                print(f"        {key} {source}: {_format_executed_value(key, value)}")
+
+
+def _format_trajectory_criterion(key: str, value: object) -> str:
+    if key != "EDIFFG":
+        return _format_executed_value(key, value)
+    numeric = _float_or_none(value)
+    if numeric is None:
+        return _format_executed_value(key, value)
+    if numeric < 0:
+        return f"{value} eV/A force criterion"
+    if numeric > 0:
+        return f"{value} eV energy-change criterion"
+    return "0 (no generic convergence interpretation inferred)"
+
+
+def _print_electronic_trajectory(trajectory: object) -> None:
+    print("    electronic trajectory:")
+    completed_ionic_steps = getattr(
+        trajectory,
+        "completed_ionic_steps",
+        getattr(trajectory, "ionic_steps_observed", None),
+    )
+    print(f"      completed ionic steps: {_diagnosis_value(completed_ionic_steps)}")
+
+    counts = getattr(
+        trajectory,
+        "electronic_iterations_by_completed_ionic_step",
+        getattr(trajectory, "electronic_iterations_by_ionic_step", ()),
+    )
+    if counts:
+        print(
+            "      electronic iterations for completed ionic steps: "
+            f"{_format_count_sequence(counts)}"
+        )
+    else:
+        print("      electronic iterations for completed ionic steps: none")
+
+    incomplete_count = getattr(trajectory, "incomplete_electronic_iteration_count", None)
+    if incomplete_count is not None:
+        print(
+            "      incomplete electronic cycle: "
+            f"{incomplete_count} iterations observed{_nelm_suffix(trajectory)}"
+        )
+        recent = getattr(trajectory, "recent_incomplete_electronic_iterations", ())
+        recent_label = "recent incomplete-cycle iterations"
+    else:
+        final_count = getattr(trajectory, "final_electronic_iteration_count", None)
+        if final_count is None:
+            print("      final electronic cycle: unavailable")
+        else:
+            print(
+                "      final electronic cycle: "
+                f"{final_count} iterations observed{_nelm_suffix(trajectory)}"
+            )
+        recent = getattr(trajectory, "recent_electronic_iterations", ())
+        recent_label = "recent final-cycle iterations"
+
+    if recent:
+        print(f"      {recent_label}:")
+        for iteration in recent:
+            print(f"        {_format_electronic_iteration(iteration)}")
+    else:
+        print(f"      {recent_label}: unavailable")
+
+
+def _print_ionic_trajectory(trajectory: object) -> None:
+    print("    ionic trajectory:")
+    completed_ionic_steps = getattr(
+        trajectory,
+        "completed_ionic_steps",
+        getattr(trajectory, "ionic_steps_observed", None),
+    )
+    print(f"      completed ionic steps: {_diagnosis_value(completed_ionic_steps)}")
+    vasprun_steps = getattr(trajectory, "vasprun_ionic_steps", None)
+    if vasprun_steps is not None:
+        print(f"      vasprun ionic steps: {vasprun_steps}")
+    recent = getattr(trajectory, "recent_ionic_steps", ())
+    if recent:
+        print("      recent completed ionic steps:")
+        for step in recent:
+            print(f"        {_format_ionic_step(step)}")
+    else:
+        print("      recent completed ionic steps: unavailable")
+
+
+def _nelm_suffix(trajectory: object) -> str:
+    criteria = getattr(trajectory, "criteria", {})
+    if isinstance(criteria, Mapping) and "NELM" in criteria:
+        return f" / NELM {criteria['NELM']}"
+    return ""
+
+
+def _format_electronic_iteration(iteration: object) -> str:
+    parts = [
+        f"N={_diagnosis_value(getattr(iteration, 'iteration', None))}",
+    ]
+    algorithm = getattr(iteration, "algorithm", None)
+    if algorithm:
+        parts.insert(0, str(algorithm))
+    for label, attribute in (
+        ("E", "energy"),
+        ("dE", "dE"),
+        ("deps", "deps"),
+        ("rms", "rms"),
+        ("rms(c)", "rms_c"),
+    ):
+        value = getattr(iteration, attribute, None)
+        if value is not None:
+            parts.append(f"{label}={value}")
+    return " ".join(parts)
+
+
+def _format_ionic_step(step: object) -> str:
+    parts = [f"step {getattr(step, 'step_index')}"]
+    for label, attribute in (
+        ("electronic_iterations", "electronic_iterations"),
+        ("F", "free_energy"),
+        ("E0", "energy_zero"),
+        ("dE", "dE"),
+        ("max_force", "max_force"),
+    ):
+        value = getattr(step, attribute, None)
+        if value is not None:
+            parts.append(f"{label}={value}")
+    return " ".join(parts)
+
+
+def _format_count_sequence(values: tuple[int, ...]) -> str:
+    if len(values) <= 8:
+        return "[" + ", ".join(str(value) for value in values) + "]"
+    recent = ", ".join(str(value) for value in values[-5:])
+    return f"{len(values)} values, last five [{recent}]"
+
+
+def _diagnosis_value(value: object) -> str:
+    return "unavailable" if value is None else str(value)
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def bmd_compute_repository(registry: ResourceRegistry) -> GitRepositoryResource:
     """Return the configured BMD Compute repository resource."""
 
@@ -614,6 +915,13 @@ def main(argv: list[str] | None = None) -> int:
         if command == "compare-runs":
             return show_compare_runs(argv[1:])
 
+        if command == "diagnose-run":
+            if len(argv) < 2:
+                print("Usage: bmd-agent diagnose-run <remote-flow-root>")
+                return 2
+
+            return show_diagnose_run(argv[1])
+
     except ConfigurationError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -627,6 +935,7 @@ def main(argv: list[str] | None = None) -> int:
     print("  structure <remote-directory>")
     print("  inspect-run <remote-flow-root>")
     print("  compare-runs <flow-a> <flow-b> [<flow-c> ...]")
+    print("  diagnose-run <remote-flow-root>")
     return 2
 
 

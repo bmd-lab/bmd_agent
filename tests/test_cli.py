@@ -34,6 +34,14 @@ def test_cli_compare_runs_requires_two_roots(capsys: pytest.CaptureFixture[str])
     assert "Usage: bmd-agent compare-runs <flow-a> <flow-b>" in captured.out
 
 
+def test_cli_diagnose_run_requires_root(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = cli.main(["diagnose-run"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "Usage: bmd-agent diagnose-run <remote-flow-root>" in captured.out
+
+
 def test_cli_compare_runs_summary(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
