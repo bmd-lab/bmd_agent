@@ -385,8 +385,10 @@ def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedPr
         "ssh",
         "powerslurm-bmdguest",
         (
-            "sacct -X -P -n -j 20893681 "
-            "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
+            "sacct -P -n -j 20893681 "
+            "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20,"
+            "NodeList%80,NNodes,NCPUS,AllocCPUS,TotalCPU,CPUTimeRAW,"
+            "AllocTRES%120,ReqTRES%120,MaxRSS"
         ),
     ]
     assert kwargs["capture_output"] is True
@@ -397,7 +399,13 @@ def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedPr
         0,
         stdout=(
             "20893681|validation|COMPLETED|02:48:37|2026-08-21T12:14:10|"
-            "2026-08-21T15:02:47|leeburton-pool|0:0|72:00:00\n"
+            "2026-08-21T15:02:47|leeburton-pool|0:0|72:00:00|node-a|1|24|24|"
+            "2-15:00:00|607020|billing=24,cpu=24,mem=128G,node=1|"
+            "billing=24,cpu=24,mem=128G,node=1|\n"
+            "20893681.0|vasp|COMPLETED|02:47:00|2026-08-21T12:15:00|"
+            "2026-08-21T15:02:00|leeburton-pool|0:0|72:00:00|node-a|1|24|24|"
+            "2-14:50:00|601200|billing=24,cpu=24,mem=128G,node=1|"
+            "billing=24,cpu=24,mem=128G,node=1|4G\n"
         ),
         stderr="",
     )
@@ -454,6 +462,16 @@ def test_inspect_run_uses_submission_stage_dirs_and_preserves_sources() -> None:
     assert inspection.producer_git["git_commit"] == "abcdef0123456789"
     assert inspection.scheduler is not None
     assert inspection.scheduler.state == "COMPLETED"
+    assert inspection.scheduler.node_list == "node-a"
+    assert inspection.scheduler.node_count == 1
+    assert inspection.scheduler.allocated_cpus == 24
+    assert inspection.scheduler.total_cpu == "2-15:00:00"
+    assert inspection.scheduler.cpu_time_raw == 607020
+    assert inspection.scheduler.alloc_tres == "billing=24,cpu=24,mem=128G,node=1"
+    assert inspection.scheduler.req_tres == "billing=24,cpu=24,mem=128G,node=1"
+    assert inspection.scheduler.max_rss == "4G"
+    assert inspection.scheduler.max_rss_source == "20893681.0"
+    assert inspection.scheduler.cpu_efficiency == pytest.approx(226800 / (10117 * 24))
     assert inspection.runtime.evidence_type == LOG_OBSERVATION
     assert inspection.runtime.packages["pymatgen"] == "2026.8.13"
     assert inspection.runtime.environment["PMG_VASP_PSP_DIR"] == "/bmd-db/potcars"
@@ -1442,6 +1460,11 @@ def cli_run_inspection(
     workflow_stages: tuple[WorkflowStage, ...],
     executed_inputs: tuple[IncarObservation, ...],
     input_expectations: tuple[InputExpectationObservation, ...] = (),
+    scheduler: SlurmAccountingRecord | None = None,
+    scheduler_error: str | None = None,
+    cluster_request: dict[str, object] | None = None,
+    resources_request: dict[str, object] | None = None,
+    environment_policy: dict[str, object] | None = None,
 ) -> RunInspection:
     return RunInspection(
         flow_root=FLOW_ROOT,
@@ -1452,13 +1475,13 @@ def cli_run_inspection(
         log_paths=(),
         final_artifacts=(),
         producer_git={},
-        cluster_request={},
-        resources_request={},
-        environment_policy={},
+        cluster_request=cluster_request or {},
+        resources_request=resources_request or {},
+        environment_policy=environment_policy or {},
         attempt_state=AttemptStateObservation(path=None, present=False),
-        job_id=None,
-        scheduler=None,
-        scheduler_error=None,
+        job_id=scheduler.job_id if scheduler else None,
+        scheduler=scheduler,
+        scheduler_error=scheduler_error,
         runtime=LogRuntimeObservation(LOG_OBSERVATION, (), None, {}, {}, {}),
         scientific=ScientificResult(source_paths=()),
         comparison=ComparisonObservation("unavailable", "producer_provenance"),
@@ -1644,9 +1667,35 @@ def test_cli_inspect_run_summary_is_evidence_oriented(
 def test_cli_diagnose_run_summary_is_descriptive_not_predictive(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    scheduler = SlurmAccountingRecord(
+        job_id="21101222",
+        name="validation",
+        state="TIMEOUT",
+        elapsed="01:00:20",
+        start="2026-08-27T22:25:18",
+        end="2026-08-27T23:25:38",
+        partition="leeburton-pool",
+        exit_code="0:0",
+        timelimit="01:00:00",
+        node_list="node-b",
+        node_count=1,
+        allocated_cpus=24,
+        total_cpu="20:00:00",
+        total_cpu_seconds=72000,
+        cpu_time_raw=86976,
+        alloc_tres="billing=24,cpu=24,mem=128G,node=1",
+        req_tres="billing=24,cpu=24,mem=128G,node=1",
+        max_rss="4G",
+        max_rss_source="21101222.0",
+        cpu_efficiency=72000 / (3620 * 24),
+    )
     inspection = cli_run_inspection(
         workflow_stages=(WorkflowStage(1, "relax", "pbe", (), None),),
         executed_inputs=(),
+        scheduler=scheduler,
+        cluster_request={"partition": "leeburton-pool"},
+        resources_request={"nodes": 1, "ntasks": 24, "walltime": "01:00:00"},
+        environment_policy={"VASP_CMD": "mpirun -n $SLURM_NTASKS vasp_std"},
     )
     diagnosis = RunDiagnosis(
         inspection=inspection,
@@ -1704,6 +1753,17 @@ def test_cli_diagnose_run_summary_is_descriptive_not_predictive(
     cli.print_run_diagnosis(diagnosis)
 
     captured = capsys.readouterr()
+    assert "Requested execution (producer_provenance)" in captured.out
+    assert "walltime: 01:00:00" in captured.out
+    assert "Scheduler execution (scheduler_observation)" in captured.out
+    assert "node list: node-b" in captured.out
+    assert "allocated CPUs: 24" in captured.out
+    assert "total CPU: 20:00:00" in captured.out
+    assert "CPUTimeRAW: 86976" in captured.out
+    assert "CPU efficiency: 82.9% (scheduler-derived utilization, not scientific efficiency)" in captured.out
+    assert "MaxRSS: 4G (21101222.0)" in captured.out
+    assert "AllocTRES: billing=24,cpu=24,mem=128G,node=1" in captured.out
+    assert "ReqTRES: billing=24,cpu=24,mem=128G,node=1" in captured.out
     assert "Termination evidence (termination_observation)" in captured.out
     assert "scheduler reports timeout: True" in captured.out
     assert "Trajectory evidence (trajectory_observation)" in captured.out

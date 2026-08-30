@@ -439,17 +439,7 @@ def print_run_inspection(inspection: RunInspection) -> None:
     print()
 
     print("Scheduler (scheduler_observation):")
-    if inspection.scheduler is None:
-        print(f"  unavailable: {inspection.scheduler_error or 'no accounting record found'}")
-    else:
-        record = inspection.scheduler
-        print(f"  job id:    {record.job_id}")
-        print(f"  state:     {record.state}")
-        print(f"  exit:      {record.exit_code}")
-        print(f"  elapsed:   {record.elapsed}")
-        print(f"  start:     {record.start}")
-        print(f"  end:       {record.end}")
-        print(f"  partition: {record.partition}")
+    _print_scheduler_execution(inspection.scheduler, inspection.scheduler_error)
     print()
 
     print("Logs (log_observation):")
@@ -544,6 +534,25 @@ def print_run_diagnosis(diagnosis: RunDiagnosis) -> None:
         options = _format_options(stage.options)
         if options:
             print(f"     options: {options}")
+    print()
+
+    print("Requested execution (producer_provenance):")
+    _print_mapping_values(
+        inspection.cluster_request,
+        ("partition", "account"),
+    )
+    _print_mapping_values(
+        inspection.resources_request,
+        ("nodes", "ntasks", "mem_gb", "walltime"),
+    )
+    _print_mapping_values(
+        inspection.environment_policy,
+        ("VASP_CMD", "JOBFLOW_CONFIG_FILE", "PMG_VASP_PSP_DIR"),
+    )
+    print()
+
+    print("Scheduler execution (scheduler_observation):")
+    _print_scheduler_execution(inspection.scheduler, inspection.scheduler_error)
     print()
 
     termination = diagnosis.termination
@@ -1003,6 +1012,86 @@ def _print_mapping_values(mapping: object, keys: tuple[str, ...]) -> None:
         value = mapping.get(key)
         if value is not None:
             print(f"  {key}: {value}")
+
+
+def _print_scheduler_execution(record: object | None, error: str | None) -> None:
+    if record is None:
+        print(f"  unavailable: {error or 'no accounting record found'}")
+        return
+
+    print(f"  job id:          {getattr(record, 'job_id')}")
+    print(f"  state:           {getattr(record, 'state')}")
+    print(f"  exit:            {getattr(record, 'exit_code')}")
+    print(f"  elapsed:         {getattr(record, 'elapsed')}")
+    _print_scheduler_optional("time limit", getattr(record, "timelimit", None))
+    print(f"  start:           {getattr(record, 'start')}")
+    print(f"  end:             {getattr(record, 'end')}")
+    print(f"  partition:       {getattr(record, 'partition')}")
+    _print_scheduler_optional("node list", getattr(record, "node_list", None))
+    _print_scheduler_optional("node count", getattr(record, "node_count", None))
+    _print_scheduler_optional("allocated CPUs", getattr(record, "allocated_cpus", None))
+    _print_scheduler_optional("total CPU", getattr(record, "total_cpu", None))
+    _print_scheduler_optional("CPUTimeRAW", getattr(record, "cpu_time_raw", None))
+    efficiency = getattr(record, "cpu_efficiency", None)
+    if efficiency is not None:
+        print(
+            "  CPU efficiency: "
+            f"{_format_cpu_efficiency(efficiency)} "
+            "(scheduler-derived utilization, not scientific efficiency)"
+        )
+    max_rss = getattr(record, "max_rss", None)
+    if max_rss is not None:
+        source = getattr(record, "max_rss_source", None)
+        suffix = f" ({source})" if source else ""
+        print(f"  MaxRSS: {max_rss}{suffix}")
+    _print_scheduler_optional("AllocTRES", getattr(record, "alloc_tres", None))
+    _print_scheduler_optional("ReqTRES", getattr(record, "req_tres", None))
+    _print_scheduler_steps(getattr(record, "steps", ()))
+
+
+def _print_scheduler_optional(label: str, value: object) -> None:
+    if value is not None:
+        print(f"  {label}: {value}")
+
+
+def _format_cpu_efficiency(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def _print_scheduler_steps(steps: object) -> None:
+    if not isinstance(steps, tuple) or not steps:
+        return
+    relevant = [
+        step
+        for step in steps
+        if any(
+            getattr(step, attribute, None) is not None
+            for attribute in (
+                "node_list",
+                "node_count",
+                "allocated_cpus",
+                "total_cpu",
+                "cpu_time_raw",
+                "max_rss",
+            )
+        )
+    ]
+    if not relevant:
+        return
+    print("  accounting steps:")
+    for step in relevant:
+        fields = [f"elapsed={getattr(step, 'elapsed')}"]
+        for label, attribute in (
+            ("nodes", "node_list"),
+            ("allocated CPUs", "allocated_cpus"),
+            ("total CPU", "total_cpu"),
+            ("CPUTimeRAW", "cpu_time_raw"),
+            ("MaxRSS", "max_rss"),
+        ):
+            value = getattr(step, attribute, None)
+            if value is not None:
+                fields.append(f"{label}={value}")
+        print(f"    {getattr(step, 'job_id')}: {', '.join(fields)}")
 
 
 def _present_text(observation: object) -> str:
