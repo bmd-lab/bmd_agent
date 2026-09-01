@@ -6,7 +6,9 @@ import pytest
 from bmd_agent.resources.vasp import (
     RemotePathError,
     authorize_remote_path,
+    build_remote_outcar_force_command,
     build_remote_file_path,
+    extract_remote_outcar_force_blocks,
     parse_poscar,
     read_remote_structure,
     remote_directory_exists,
@@ -172,6 +174,47 @@ def test_remote_file_size_uses_read_only_stat_command() -> None:
             "stat -c %s -- '/home/example/calculations/project with spaces/vasprun.xml'",
         ]
     ]
+
+
+def test_remote_outcar_force_extractor_uses_fixed_read_only_python_command() -> None:
+    command = build_remote_outcar_force_command(
+        PurePosixPath("/home/example/calculations/project with spaces/OUTCAR"),
+        expected_site_count=24,
+    )
+
+    parts = command.split(" ")
+    assert parts[0:2] == ["python3", "-c"]
+    assert "--" in parts
+    assert "find " not in command
+    assert "ls " not in command
+    assert "cat " not in command
+    assert "POTCAR" not in command
+    assert "'/home/example/calculations/project with spaces/OUTCAR'" in command
+    assert command.endswith(" 24")
+
+
+def test_extract_remote_outcar_force_blocks_returns_compact_stdout() -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(command)
+        assert kwargs["capture_output"] is True
+        assert kwargs["check"] is True
+        assert kwargs["timeout"] == 20
+        return subprocess.CompletedProcess(command, 0, stdout=b'{"schema":"bmd-agent-outcar-force-v1","blocks":[]}', stderr=b"")
+
+    payload = extract_remote_outcar_force_blocks(
+        "powerslurm-bmdguest",
+        PurePosixPath("/home/example/calculations/run/OUTCAR"),
+        expected_site_count=2,
+        runner=runner,
+    )
+
+    assert payload == '{"schema":"bmd-agent-outcar-force-v1","blocks":[]}'
+    assert len(calls) == 1
+    assert calls[0][0:2] == ["ssh", "powerslurm-bmdguest"]
+    assert calls[0][2].startswith("python3 -c ")
+    assert " /home/example/calculations/run/OUTCAR 2" in calls[0][2]
 
 
 def test_read_remote_structure_combines_authorized_retrieval_and_parsing() -> None:

@@ -848,7 +848,7 @@ def _print_trajectory_criteria(trajectory: object) -> None:
     print("    criteria:")
     if not criteria:
         print("      unavailable")
-    for key in ("NELM", "EDIFF", "NSW", "EDIFFG"):
+    for key in ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF"):
         if key in criteria:
             print(f"      {key}: {_format_trajectory_criterion(key, criteria[key])}")
     discrepancies = getattr(trajectory, "criteria_discrepancies", ())
@@ -935,6 +935,7 @@ def _print_ionic_trajectory(trajectory: object) -> None:
     vasprun_steps = getattr(trajectory, "vasprun_ionic_steps", None)
     if vasprun_steps is not None:
         print(f"      vasprun ionic steps: {vasprun_steps}")
+    _print_outcar_force_source(trajectory)
     recent = getattr(trajectory, "recent_ionic_steps", ())
     if recent:
         print("      recent completed ionic steps:")
@@ -942,6 +943,31 @@ def _print_ionic_trajectory(trajectory: object) -> None:
             print(f"        {_format_ionic_step(step)}")
     else:
         print("      recent completed ionic steps: unavailable")
+
+
+def _print_outcar_force_source(trajectory: object) -> None:
+    path = getattr(trajectory, "outcar_path", None)
+    if path is None:
+        return
+    if getattr(trajectory, "outcar_present", False):
+        print(f"      OUTCAR atomic forces: present ({path})")
+        complete_blocks = getattr(trajectory, "outcar_complete_force_blocks", None)
+        if complete_blocks is not None:
+            print(f"      OUTCAR complete force blocks: {complete_blocks}")
+    else:
+        print(f"      OUTCAR atomic forces: unavailable ({path})")
+    expected = getattr(trajectory, "outcar_expected_site_count", None)
+    if expected is not None:
+        print(f"      OUTCAR expected site count: {expected}")
+    if getattr(trajectory, "outcar_error", None):
+        print(
+            "      OUTCAR force trajectory unavailable: "
+            f"{getattr(trajectory, 'outcar_error')}"
+        )
+    alignment_status = getattr(trajectory, "outcar_force_alignment_status", None)
+    alignment_reason = getattr(trajectory, "outcar_force_alignment_reason", None)
+    if alignment_status and alignment_reason:
+        print(f"      OUTCAR force alignment: {alignment_status} ({alignment_reason})")
 
 
 def _nelm_suffix(trajectory: object) -> str:
@@ -983,6 +1009,8 @@ def _format_ionic_step(step: object) -> str:
         value = getattr(step, attribute, None)
         if value is not None:
             parts.append(f"{label}={value}")
+    if getattr(step, "max_force", None) is not None and getattr(step, "max_force_source", None):
+        parts.append(f"max_force_source={getattr(step, 'max_force_source')}")
     return " ".join(parts)
 
 

@@ -9,6 +9,112 @@ from pymatgen.io.vasp import Poscar
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
 
+_OUTCAR_FORCE_EXTRACTOR_SCRIPT = r"""
+import json
+import math
+import re
+import sys
+
+HEADER = re.compile(r"^\s*POSITION\s+TOTAL-FORCE\s+\(eV/Angst\)\s*$")
+SEPARATOR = re.compile(r"^\s*-{3,}\s*$")
+
+args = sys.argv[1:]
+if args and args[0] == "--":
+    args = args[1:]
+path = args[0]
+expected = int(args[1]) if len(args) > 1 else None
+blocks = []
+state = None
+index = 0
+rows = 0
+max_force = 0.0
+malformed = False
+
+
+def finish(status):
+    global state, rows, max_force, malformed
+    complete = status == "complete" and rows > 0 and not malformed
+    final_status = status
+    value = max_force if complete else None
+    if complete and expected is not None and rows != expected:
+        complete = False
+        final_status = "row_count_mismatch"
+        value = None
+    if malformed:
+        complete = False
+        final_status = "malformed"
+        value = None
+    blocks.append(
+        {
+            "block_index": index,
+            "row_count": rows,
+            "status": final_status,
+            "complete": complete,
+            "max_force_eV_per_A": value,
+        }
+    )
+    state = None
+    rows = 0
+    max_force = 0.0
+    malformed = False
+
+
+with open(path, encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        if HEADER.match(line):
+            if state is not None:
+                finish("incomplete")
+            index += 1
+            state = "await_separator"
+            rows = 0
+            max_force = 0.0
+            malformed = False
+            continue
+
+        if state is None:
+            continue
+
+        if SEPARATOR.match(line):
+            if state == "await_separator":
+                state = "rows"
+            else:
+                finish("complete")
+            continue
+
+        if not line.strip():
+            continue
+
+        if state == "await_separator":
+            state = "rows"
+            malformed = True
+
+        parts = line.split()
+        if len(parts) < 6:
+            malformed = True
+            continue
+        try:
+            fx, fy, fz = (float(value) for value in parts[3:6])
+        except Exception:
+            malformed = True
+            continue
+        rows += 1
+        max_force = max(max_force, math.sqrt(fx * fx + fy * fy + fz * fz))
+
+if state is not None:
+    finish("incomplete")
+
+print(
+    json.dumps(
+        {
+            "schema": "bmd-agent-outcar-force-v1",
+            "expected_site_count": expected,
+            "blocks": blocks,
+        },
+        separators=(",", ":"),
+    )
+)
+""".strip()
+
 
 class RemotePathError(ValueError):
     """Raised when a requested remote path is outside configured policy."""
@@ -109,6 +215,52 @@ def remote_file_size(
     )
 
     return int(result.stdout.decode("utf-8", "replace").strip())
+
+
+def extract_remote_outcar_force_blocks(
+    ssh_host: str,
+    remote_path: PurePosixPath,
+    *,
+    expected_site_count: int | None = None,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> str:
+    """Return compact OUTCAR force-block evidence without transferring the OUTCAR."""
+
+    remote_command = build_remote_outcar_force_command(
+        remote_path,
+        expected_site_count=expected_site_count,
+    )
+    result = runner(
+        ["ssh", ssh_host, remote_command],
+        capture_output=True,
+        check=True,
+        timeout=timeout,
+    )
+
+    return result.stdout.decode("utf-8", "replace")
+
+
+def build_remote_outcar_force_command(
+    remote_path: PurePosixPath,
+    *,
+    expected_site_count: int | None = None,
+) -> str:
+    """Build the fixed read-only remote OUTCAR force extractor command."""
+
+    command = [
+        "python3",
+        "-c",
+        shlex.quote(_OUTCAR_FORCE_EXTRACTOR_SCRIPT),
+        "--",
+        shlex.quote(str(remote_path)),
+    ]
+    if expected_site_count is not None:
+        if expected_site_count <= 0:
+            raise ValueError("expected site count must be positive")
+        command.append(str(expected_site_count))
+
+    return " ".join(command)
 
 
 def remote_directory_exists(

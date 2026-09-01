@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import math
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -21,6 +22,8 @@ from bmd_agent.resources.vasp import (
     RemotePathError,
     authorize_remote_path,
     build_remote_file_path,
+    extract_remote_outcar_force_blocks,
+    parse_poscar,
     remote_directory_exists,
     remote_file_exists,
     remote_file_size,
@@ -63,6 +66,7 @@ _ARTIFACT_FILENAMES = {
 _SCIENTIFIC_READ_KEYS = ("contcar", "vasprun", "kpoints")
 _DIAGNOSE_ARTIFACT_FILENAMES = {
     "oszicar": "OSZICAR",
+    "outcar": "OUTCAR",
     "vasprun": "vasprun.xml",
 }
 _DIRECT_VASP_ARTIFACT_FILENAMES = {
@@ -79,9 +83,11 @@ _DIRECT_VASP_RUNTIME_OUTPUTS = ("oszicar", "outcar", "vasprun", "contcar")
 _DIRECT_VASP_SCIENTIFIC_READ_KEYS = ("contcar", "vasprun")
 _DIAGNOSE_VASPRUN_MAX_BYTES = 50_000_000
 _DIAGNOSE_RECENT_WINDOW = 5
-_DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG")
+_DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF")
+_OUTCAR_FORCE_EXTRACTION_SCHEMA = "bmd-agent-outcar-force-v1"
 _INCOMPLETE_VASPRUN_TRAJECTORY_REASON = "file could not be parsed completely"
 _UNREADABLE_VASPRUN_TRAJECTORY_REASON = "file could not be read"
+_UNREADABLE_OUTCAR_FORCE_REASON = "file could not be read"
 _PACKAGE_RE = re.compile(r"^\[runner\]\s+(\w+)\s+version:\s*(.+)$")
 _PYTHON_RE = re.compile(r"^\[runner\]\s+python:\s*(.+)$")
 _ENV_RE = re.compile(r"\b(PMG_VASP_PSP_DIR)=([^\s]+)")
@@ -91,6 +97,10 @@ _STARTING_JOB_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\)",
     re.IGNORECASE,
 )
+_OUTCAR_FORCE_HEADER_RE = re.compile(
+    r"^\s*POSITION\s+TOTAL-FORCE\s+\(eV/Angst\)\s*$"
+)
+_OUTCAR_FORCE_SEPARATOR_RE = re.compile(r"^\s*-{3,}\s*$")
 
 
 class RunInspectionError(RuntimeError):
@@ -319,6 +329,18 @@ class IonicStepObservation:
     energy_zero: float | None = None
     dE: float | None = None
     max_force: float | None = None
+    max_force_source: str | None = None
+
+
+@dataclass(frozen=True)
+class OutcarForceBlockObservation:
+    block_index: int
+    row_count: int
+    status: str
+    complete: bool
+    source_path: str
+    max_force_eV_per_A: float | None = None
+    evidence_type: str = TRAJECTORY_OBSERVATION
 
 
 @dataclass(frozen=True)
@@ -336,6 +358,14 @@ class StageTrajectoryObservation:
     vasprun_present: bool = False
     vasprun_error: str | None = None
     vasprun_skipped_reason: str | None = None
+    outcar_path: str | None = None
+    outcar_present: bool = False
+    outcar_error: str | None = None
+    outcar_expected_site_count: int | None = None
+    outcar_force_blocks: tuple[OutcarForceBlockObservation, ...] = ()
+    outcar_complete_force_blocks: int | None = None
+    outcar_force_alignment_status: str | None = None
+    outcar_force_alignment_reason: str | None = None
     criteria: Mapping[str, Any] = field(default_factory=dict)
     criteria_source_values: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     criteria_discrepancies: tuple[str, ...] = ()
@@ -443,6 +473,15 @@ class _VasprunTrajectory:
     converged_electronic: bool | None = None
     converged_ionic: bool | None = None
     max_forces: Mapping[int, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _OutcarForceTrajectory:
+    present: bool
+    path: str | None = None
+    error: str | None = None
+    expected_site_count: int | None = None
+    blocks: tuple[OutcarForceBlockObservation, ...] = ()
 
 
 def inspect_remote_run(
@@ -980,6 +1019,7 @@ def _assess_ionic_progress(
     features = _assessment_features(trajectory)
     explicit = trajectory.converged_ionic
     completed_steps = trajectory.completed_ionic_steps
+    force_only_cell_limited = False
 
     if explicit is True:
         basis.append("trajectory_observation: vasprun converged_ionic=True")
@@ -1005,11 +1045,22 @@ def _assess_ionic_progress(
     if force_criterion is not None and final_force is None:
         limitations.append("maximum force evidence unavailable")
     elif force_criterion is not None and final_force is not None:
+        force_label = _max_force_evidence_label(final_step)
         if final_force <= force_criterion:
-            basis.append("trajectory_observation: final maximum force reached EDIFFG")
+            basis.append(f"trajectory_observation: final {force_label} reached EDIFFG")
+            if (
+                explicit is not True
+                and getattr(final_step, "max_force_source", None) == "OUTCAR"
+                and _is_variable_cell_relaxation(trajectory)
+            ):
+                force_only_cell_limited = True
+                limitations.append(
+                    "ISIF indicates cell degrees of freedom; OUTCAR atomic forces "
+                    "alone do not establish full ionic/cell convergence"
+                )
         else:
             counter.append(
-                "trajectory_observation: final maximum force has not reached EDIFFG"
+                f"trajectory_observation: final {force_label} has not reached EDIFFG"
             )
 
     if basis and counter:
@@ -1019,6 +1070,16 @@ def _assess_ionic_progress(
             "ionic",
             INSUFFICIENT_EVIDENCE,
             sufficiency="contradictory",
+            basis=basis,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+    if force_only_cell_limited:
+        return _assessment(
+            trajectory,
+            "ionic",
+            INSUFFICIENT_EVIDENCE,
             basis=basis,
             counter_evidence=counter,
             limitations=limitations,
@@ -1140,6 +1201,26 @@ def _assess_stage_progress(
             INSUFFICIENT_EVIDENCE,
             basis=basis,
             counter_evidence=tuple(electronic.counter_evidence) + tuple(ionic.counter_evidence),
+            limitations=limitations,
+            features=features,
+        )
+
+    if ionic.label == NO_CLEAR_EVIDENCE_OF_PROGRESS:
+        if electronic.label in (CONVERGED, EVIDENCE_OF_PROGRESS):
+            basis.extend(electronic.basis)
+        counter.extend(electronic.counter_evidence)
+        counter.extend(ionic.counter_evidence)
+        limitations.extend(electronic.limitations)
+        limitations.extend(ionic.limitations)
+        limitations.append(
+            "ionic progress evidence does not support force-based stage progress in v1"
+        )
+        return _assessment(
+            trajectory,
+            "stage",
+            NO_CLEAR_EVIDENCE_OF_PROGRESS,
+            basis=basis,
+            counter_evidence=counter,
             limitations=limitations,
             features=features,
         )
@@ -1317,6 +1398,20 @@ def _final_ionic_step(trajectory: StageTrajectoryObservation) -> IonicStepObserv
     if trajectory.recent_ionic_steps:
         return trajectory.recent_ionic_steps[-1]
     return None
+
+
+def _max_force_evidence_label(step: IonicStepObservation | None) -> str:
+    source = getattr(step, "max_force_source", None)
+    if source == "OUTCAR":
+        return "OUTCAR atomic maximum force"
+    if source:
+        return f"{source} maximum force"
+    return "maximum force"
+
+
+def _is_variable_cell_relaxation(trajectory: StageTrajectoryObservation) -> bool:
+    isif = _int_or_none(trajectory.criteria.get("ISIF"))
+    return isif is not None and isif >= 3
 
 
 def _positive_float(value: Any) -> float | None:
@@ -1892,11 +1987,34 @@ def _observe_stage_trajectory(
     if not vasprun.present:
         unavailable.append("vasprun.xml is unavailable")
 
+    outcar = _observe_outcar_force_trajectory(
+        ssh_host,
+        binding.directory,
+        allowed_roots=allowed_roots,
+        runner=runner,
+        timeout=timeout,
+    )
+    if outcar.error:
+        unavailable.append(f"OUTCAR force trajectory unavailable: {outcar.error}")
+    if not outcar.present:
+        unavailable.append("OUTCAR is unavailable")
+
     ionic_steps = _merge_max_forces(
         oszicar_trajectory.ionic_steps,
         vasprun.max_forces,
+        source="vasprun.xml",
+    )
+    outcar_max_forces, alignment_status, alignment_reason = _aligned_outcar_max_forces(
+        oszicar_trajectory.completed_ionic_steps,
+        outcar,
+    )
+    ionic_steps = _merge_max_forces(
+        ionic_steps,
+        outcar_max_forces,
+        source="OUTCAR",
     )
     recent_ionic_steps = tuple(ionic_steps[-_DIAGNOSE_RECENT_WINDOW:])
+    unavailable.extend(_outcar_force_limitations(outcar, alignment_status, alignment_reason))
     criteria, criteria_sources, criteria_discrepancies = _trajectory_criteria(
         binding.stage_index,
         executed_inputs,
@@ -1916,6 +2034,18 @@ def _observe_stage_trajectory(
         vasprun_present=vasprun.present,
         vasprun_error=vasprun.error,
         vasprun_skipped_reason=vasprun.skipped_reason,
+        outcar_path=outcar.path,
+        outcar_present=outcar.present,
+        outcar_error=outcar.error,
+        outcar_expected_site_count=outcar.expected_site_count,
+        outcar_force_blocks=outcar.blocks,
+        outcar_complete_force_blocks=(
+            sum(1 for block in outcar.blocks if block.complete)
+            if outcar.present and outcar.error is None
+            else None
+        ),
+        outcar_force_alignment_status=alignment_status,
+        outcar_force_alignment_reason=alignment_reason,
         criteria=criteria,
         criteria_source_values=criteria_sources,
         criteria_discrepancies=criteria_discrepancies,
@@ -2090,6 +2220,295 @@ def _ionic_step_observations(
     return tuple(observations)
 
 
+def parse_outcar_force_blocks(
+    contents: bytes | str,
+    *,
+    source_path: str,
+    expected_site_count: int | None = None,
+) -> tuple[OutcarForceBlockObservation, ...]:
+    """Parse standard OUTCAR atomic force tables into compact block evidence."""
+
+    if expected_site_count is not None and expected_site_count <= 0:
+        raise ValueError("expected site count must be positive")
+
+    text = contents.decode("utf-8", "replace") if isinstance(contents, bytes) else contents
+    blocks: list[OutcarForceBlockObservation] = []
+    state: str | None = None
+    block_index = 0
+    row_count = 0
+    max_force = 0.0
+    malformed = False
+
+    def finish(status: str) -> None:
+        nonlocal state, row_count, max_force, malformed
+        complete = status == "complete" and row_count > 0 and not malformed
+        final_status = status
+        value = _round_float(max_force) if complete else None
+        if complete and expected_site_count is not None and row_count != expected_site_count:
+            complete = False
+            final_status = "row_count_mismatch"
+            value = None
+        if malformed:
+            complete = False
+            final_status = "malformed"
+            value = None
+        blocks.append(
+            OutcarForceBlockObservation(
+                block_index=block_index,
+                row_count=row_count,
+                status=final_status,
+                complete=complete,
+                source_path=source_path,
+                max_force_eV_per_A=value,
+            )
+        )
+        state = None
+        row_count = 0
+        max_force = 0.0
+        malformed = False
+
+    for line in text.splitlines():
+        if _OUTCAR_FORCE_HEADER_RE.match(line):
+            if state is not None:
+                finish("incomplete")
+            block_index += 1
+            state = "await_separator"
+            row_count = 0
+            max_force = 0.0
+            malformed = False
+            continue
+
+        if state is None:
+            continue
+
+        if _OUTCAR_FORCE_SEPARATOR_RE.match(line):
+            if state == "await_separator":
+                state = "rows"
+            else:
+                finish("complete")
+            continue
+
+        if not line.strip():
+            continue
+
+        if state == "await_separator":
+            state = "rows"
+            malformed = True
+
+        parts = line.split()
+        if len(parts) < 6:
+            malformed = True
+            continue
+        try:
+            fx, fy, fz = (float(value) for value in parts[3:6])
+        except ValueError:
+            malformed = True
+            continue
+        row_count += 1
+        max_force = max(max_force, math.sqrt(fx * fx + fy * fy + fz * fz))
+
+    if state is not None:
+        finish("incomplete")
+
+    return tuple(blocks)
+
+
+def parse_outcar_force_extraction(
+    payload: bytes | str,
+    *,
+    source_path: str,
+) -> tuple[OutcarForceBlockObservation, ...]:
+    """Validate compact JSON emitted by the fixed remote OUTCAR extractor."""
+
+    text = payload.decode("utf-8", "replace") if isinstance(payload, bytes) else payload
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RunInspectionError("OUTCAR force extraction returned malformed JSON") from exc
+    if not isinstance(data, Mapping):
+        raise RunInspectionError("OUTCAR force extraction returned a non-object payload")
+    if data.get("schema") != _OUTCAR_FORCE_EXTRACTION_SCHEMA:
+        raise RunInspectionError("OUTCAR force extraction returned an unsupported schema")
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        raise RunInspectionError("OUTCAR force extraction returned invalid blocks")
+
+    observations: list[OutcarForceBlockObservation] = []
+    for item in blocks:
+        if not isinstance(item, Mapping):
+            raise RunInspectionError("OUTCAR force extraction returned invalid block records")
+        block_index = _int_or_none(item.get("block_index"))
+        row_count = _int_or_none(item.get("row_count"))
+        status = item.get("status")
+        complete = item.get("complete")
+        if block_index is None or block_index <= 0:
+            raise RunInspectionError("OUTCAR force block has invalid block_index")
+        if row_count is None or row_count < 0:
+            raise RunInspectionError("OUTCAR force block has invalid row_count")
+        if not isinstance(status, str) or not status:
+            raise RunInspectionError("OUTCAR force block has invalid status")
+        if not isinstance(complete, bool):
+            raise RunInspectionError("OUTCAR force block has invalid complete flag")
+        value = _float_or_none(item.get("max_force_eV_per_A"))
+        if complete and value is None:
+            raise RunInspectionError("complete OUTCAR force block lacks max force")
+        observations.append(
+            OutcarForceBlockObservation(
+                block_index=block_index,
+                row_count=row_count,
+                status=status,
+                complete=complete,
+                source_path=source_path,
+                max_force_eV_per_A=_round_float(value),
+            )
+        )
+    return tuple(observations)
+
+
+def _observe_outcar_force_trajectory(
+    ssh_host: str,
+    directory: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> _OutcarForceTrajectory:
+    path = build_remote_file_path(
+        directory,
+        _DIAGNOSE_ARTIFACT_FILENAMES["outcar"],
+        allowed_roots=allowed_roots,
+    )
+    if not remote_file_exists(ssh_host, path, runner=runner, timeout=timeout):
+        return _OutcarForceTrajectory(present=False, path=str(path))
+
+    expected_site_count = _expected_stage_site_count(
+        ssh_host,
+        directory,
+        allowed_roots=allowed_roots,
+        runner=runner,
+        timeout=timeout,
+    )
+    try:
+        payload = extract_remote_outcar_force_blocks(
+            ssh_host,
+            path,
+            expected_site_count=expected_site_count,
+            runner=runner,
+            timeout=timeout,
+        )
+        blocks = parse_outcar_force_extraction(payload, source_path=str(path))
+    except (
+        RunInspectionError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        ValueError,
+    ) as exc:
+        reason = _UNREADABLE_OUTCAR_FORCE_REASON if isinstance(
+            exc,
+            (subprocess.CalledProcessError, subprocess.TimeoutExpired),
+        ) else str(exc)
+        return _OutcarForceTrajectory(
+            present=True,
+            path=str(path),
+            error=reason,
+            expected_site_count=expected_site_count,
+        )
+
+    return _OutcarForceTrajectory(
+        present=True,
+        path=str(path),
+        expected_site_count=expected_site_count,
+        blocks=blocks,
+    )
+
+
+def _expected_stage_site_count(
+    ssh_host: str,
+    directory: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> int | None:
+    path = build_remote_file_path(
+        directory,
+        "POSCAR",
+        allowed_roots=allowed_roots,
+    )
+    if not remote_file_exists(ssh_host, path, runner=runner, timeout=timeout):
+        return None
+    try:
+        poscar = parse_poscar(
+            retrieve_remote_file(ssh_host, path, runner=runner, timeout=timeout),
+            source=str(path),
+        )
+    except Exception:
+        return None
+    return poscar.sites if poscar.sites > 0 else None
+
+
+def _aligned_outcar_max_forces(
+    completed_ionic_steps: int | None,
+    outcar: _OutcarForceTrajectory,
+) -> tuple[Mapping[int, float], str | None, str | None]:
+    if not outcar.present:
+        return {}, None, None
+    if outcar.error:
+        return {}, None, None
+
+    complete_blocks = tuple(block for block in outcar.blocks if block.complete)
+    if not complete_blocks:
+        if outcar.blocks:
+            return {}, "unavailable", "OUTCAR contained no complete validated force blocks"
+        return {}, "unavailable", "OUTCAR contained no standard force blocks"
+
+    if completed_ionic_steps is None:
+        return {}, "unavailable", "OSZICAR completed ionic step count unavailable"
+
+    expected_indices = tuple(range(1, completed_ionic_steps + 1))
+    observed_indices = tuple(block.block_index for block in complete_blocks)
+    if observed_indices != expected_indices:
+        return (
+            {},
+            "discrepancy",
+            (
+                "OSZICAR completed ionic steps "
+                f"{completed_ionic_steps} did not align with OUTCAR complete force "
+                f"blocks {list(observed_indices)}"
+            ),
+        )
+
+    max_forces = {
+        block.block_index: block.max_force_eV_per_A
+        for block in complete_blocks
+        if block.max_force_eV_per_A is not None
+    }
+    return (
+        max_forces,
+        "aligned",
+        f"{len(complete_blocks)} OUTCAR force block(s) aligned with OSZICAR completed ionic steps",
+    )
+
+
+def _outcar_force_limitations(
+    outcar: _OutcarForceTrajectory,
+    alignment_status: str | None,
+    alignment_reason: str | None,
+) -> tuple[str, ...]:
+    limitations: list[str] = []
+    for block in outcar.blocks:
+        if block.complete:
+            continue
+        limitations.append(
+            "OUTCAR force block "
+            f"{block.block_index} {block.status} with {block.row_count} row(s); "
+            "excluded from completed-step max-force evidence"
+        )
+    if alignment_status in {"unavailable", "discrepancy"} and alignment_reason:
+        limitations.append(f"OUTCAR force-block alignment {alignment_status}: {alignment_reason}")
+    return tuple(limitations)
+
+
 def _observe_vasprun_trajectory(
     ssh_host: str,
     directory: PurePosixPath,
@@ -2202,6 +2621,8 @@ def _max_force(forces: Any) -> float | None:
 def _merge_max_forces(
     ionic_steps: Sequence[IonicStepObservation],
     max_forces: Mapping[int, float],
+    *,
+    source: str | None = None,
 ) -> tuple[IonicStepObservation, ...]:
     if not max_forces:
         return tuple(ionic_steps)
@@ -2209,6 +2630,13 @@ def _merge_max_forces(
     seen: set[int] = set()
     for step in ionic_steps:
         seen.add(step.step_index)
+        incoming = max_forces.get(step.step_index)
+        if step.max_force is None and incoming is not None:
+            max_force = incoming
+            max_force_source = source
+        else:
+            max_force = step.max_force
+            max_force_source = step.max_force_source
         merged.append(
             IonicStepObservation(
                 step_index=step.step_index,
@@ -2216,12 +2644,19 @@ def _merge_max_forces(
                 free_energy=step.free_energy,
                 energy_zero=step.energy_zero,
                 dE=step.dE,
-                max_force=max_forces.get(step.step_index, step.max_force),
+                max_force=max_force,
+                max_force_source=max_force_source,
             )
         )
     for step_index, max_force in max_forces.items():
         if step_index not in seen:
-            merged.append(IonicStepObservation(step_index=step_index, max_force=max_force))
+            merged.append(
+                IonicStepObservation(
+                    step_index=step_index,
+                    max_force=max_force,
+                    max_force_source=source,
+                )
+            )
     return tuple(sorted(merged, key=lambda item: item.step_index))
 
 
