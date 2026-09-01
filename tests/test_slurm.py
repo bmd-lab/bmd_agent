@@ -17,6 +17,12 @@ SQUEUE_OUTPUT = """\
 123|alice|relax_NaCl|R|00:12|None
 124|bob|static_Si|PD|00:00|Priority
 """
+SACCT_FORMAT = (
+    "--format=JobIDRaw,JobName%30,User%20,Account%30,State,ExitCode,Elapsed,"
+    "ElapsedRaw,Start,End,Partition%20,Timelimit%20,NodeList%80,NNodes,"
+    "AllocCPUS,NTasks,ReqMem,ReqTRES%120,AllocTRES%120,TotalCPU,CPUTimeRAW,"
+    "WorkDir%160"
+)
 
 
 def test_parse_squeue_output() -> None:
@@ -76,10 +82,11 @@ def test_build_sacct_command_is_fixed_and_read_only() -> None:
 
     assert command == (
         "sacct -X -P -n -j 20893681 "
-        "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
+        f"{SACCT_FORMAT}"
     )
     assert "sbatch" not in command
     assert "scancel" not in command
+    assert "scontrol" not in command
 
 
 def test_parse_sacct_output_prefers_primary_job_row() -> None:
@@ -99,6 +106,54 @@ def test_parse_sacct_output_prefers_primary_job_row() -> None:
     assert record.partition == "leeburton-pool"
     assert record.exit_code == "0:0"
     assert record.timelimit == "72:00:00"
+
+
+def test_parse_sacct_output_preserves_workdir_and_resource_fields() -> None:
+    output = (
+        "20893681|vasp|guest|power-leeburton-users_v2|TIMEOUT|0:0|06:00:20|21620|"
+        "2026-08-30T00:00:00|2026-08-30T06:00:20|leeburton-pool|06:00:00|"
+        "compute-0-269|1|24|24|128G|billing=24,cpu=24,mem=128G,node=1|"
+        "billing=24,cpu=24,mem=128G,node=1|120:00:00|518880|"
+        "/bmd-db/guest/flows/direct-vasp\n"
+    )
+
+    record = parse_sacct_output("20893681", output)
+
+    assert record is not None
+    assert record.job_id == "20893681"
+    assert record.name == "vasp"
+    assert record.user == "guest"
+    assert record.account == "power-leeburton-users_v2"
+    assert record.state == "TIMEOUT"
+    assert record.exit_code == "0:0"
+    assert record.elapsed == "06:00:20"
+    assert record.elapsed_raw == 21620
+    assert record.timelimit == "06:00:00"
+    assert record.node_list == "compute-0-269"
+    assert record.node_count == 1
+    assert record.allocated_cpus == 24
+    assert record.task_count == 24
+    assert record.req_mem == "128G"
+    assert record.req_tres == "billing=24,cpu=24,mem=128G,node=1"
+    assert record.alloc_tres == "billing=24,cpu=24,mem=128G,node=1"
+    assert record.total_cpu == "120:00:00"
+    assert record.cpu_time_raw == 518880
+    assert record.work_dir == "/bmd-db/guest/flows/direct-vasp"
+
+
+def test_parse_sacct_output_allows_missing_optional_job_fields() -> None:
+    output = (
+        "20893681|vasp|||COMPLETED|0:0|00:10:00||2026-08-30T00:00:00|"
+        "2026-08-30T00:10:00|leeburton-pool|||||||||||"
+    )
+
+    record = parse_sacct_output("20893681", output)
+
+    assert record is not None
+    assert record.state == "COMPLETED"
+    assert record.work_dir is None
+    assert record.allocated_cpus is None
+    assert record.elapsed_raw is None
 
 
 def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
@@ -130,7 +185,7 @@ def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
             "powerslurm-bmdguest",
             (
                 "sacct -X -P -n -j 20893681 "
-                "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
+                f"{SACCT_FORMAT}"
             ),
         ]
     ]

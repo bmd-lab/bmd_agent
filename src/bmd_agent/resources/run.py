@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -65,6 +65,18 @@ _DIAGNOSE_ARTIFACT_FILENAMES = {
     "oszicar": "OSZICAR",
     "vasprun": "vasprun.xml",
 }
+_DIRECT_VASP_ARTIFACT_FILENAMES = {
+    "incar": "INCAR",
+    "poscar": "POSCAR",
+    "kpoints": "KPOINTS",
+    "oszicar": "OSZICAR",
+    "outcar": "OUTCAR",
+    "vasprun": "vasprun.xml",
+    "contcar": "CONTCAR",
+}
+_DIRECT_VASP_REQUIRED_INPUTS = ("incar", "poscar", "kpoints")
+_DIRECT_VASP_RUNTIME_OUTPUTS = ("oszicar", "outcar", "vasprun", "contcar")
+_DIRECT_VASP_SCIENTIFIC_READ_KEYS = ("contcar", "vasprun")
 _DIAGNOSE_VASPRUN_MAX_BYTES = 50_000_000
 _DIAGNOSE_RECENT_WINDOW = 5
 _DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG")
@@ -367,6 +379,30 @@ class RunDiagnosis:
 
 
 @dataclass(frozen=True)
+class DirectVaspInspection:
+    directory: str
+    artifacts: tuple[PathObservation, ...]
+    executed_inputs: tuple[IncarObservation, ...]
+    scientific: ScientificResult
+    trajectory: StageTrajectoryObservation
+    assessments: tuple[ConvergenceProgressAssessment, ...]
+    producer_reason: str = "no BMD Compute producer record found"
+
+
+@dataclass(frozen=True)
+class JobInspection:
+    job_id: str
+    scheduler: SlurmAccountingRecord | None
+    scheduler_error: str | None
+    scheduler_work_dir: str | None
+    calculation_directory: str | None
+    calculation_type: str
+    calculation_reason: str | None
+    bmd_compute: RunDiagnosis | None = None
+    direct_vasp: DirectVaspInspection | None = None
+
+
+@dataclass(frozen=True)
 class _ComparableQuantity:
     key: str
     label: str
@@ -621,6 +657,181 @@ def diagnose_remote_run(
         termination=_termination_observation(inspection),
         trajectories=trajectories,
         assessments=assess_convergence_progress(trajectories),
+    )
+
+
+def inspect_slurm_job(
+    cluster: SlurmClusterResource,
+    job_id: str,
+    *,
+    remote_runner: RemoteRunner = subprocess.run,
+    slurm_runner: SlurmRunner = subprocess.run,
+    scientific_parser: ScientificParser | None = None,
+    modifier_policies: Iterable[Mapping[str, Any]] = (),
+    timeout: float = 20,
+    max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
+) -> JobInspection:
+    """Inspect one scheduler job and supported calculation evidence read-only."""
+
+    normalized_job_id = normalize_job_id(job_id)
+    scheduler, scheduler_error = _inspect_scheduler(
+        cluster.ssh_host,
+        normalized_job_id,
+        runner=slurm_runner,
+        timeout=timeout,
+    )
+    if scheduler is None:
+        return JobInspection(
+            job_id=normalized_job_id,
+            scheduler=None,
+            scheduler_error=scheduler_error or "scheduler accounting was unavailable",
+            scheduler_work_dir=None,
+            calculation_directory=None,
+            calculation_type="unknown",
+            calculation_reason="scheduler accounting was unavailable",
+        )
+
+    work_dir = getattr(scheduler, "work_dir", None)
+    if not work_dir:
+        return JobInspection(
+            job_id=normalized_job_id,
+            scheduler=scheduler,
+            scheduler_error=scheduler_error,
+            scheduler_work_dir=None,
+            calculation_directory=None,
+            calculation_type="unknown",
+            calculation_reason="scheduler WorkDir was unavailable",
+        )
+
+    try:
+        directory = authorize_remote_path(
+            work_dir,
+            allowed_roots=cluster.allowed_remote_roots,
+        )
+    except RemotePathError as exc:
+        return JobInspection(
+            job_id=normalized_job_id,
+            scheduler=scheduler,
+            scheduler_error=scheduler_error,
+            scheduler_work_dir=work_dir,
+            calculation_directory=None,
+            calculation_type="unknown",
+            calculation_reason=f"scheduler WorkDir is not authorized: {exc}",
+        )
+
+    if not remote_directory_exists(
+        cluster.ssh_host,
+        directory,
+        runner=remote_runner,
+        timeout=timeout,
+    ):
+        return JobInspection(
+            job_id=normalized_job_id,
+            scheduler=scheduler,
+            scheduler_error=scheduler_error,
+            scheduler_work_dir=work_dir,
+            calculation_directory=None,
+            calculation_type="unknown",
+            calculation_reason="scheduler WorkDir is authorized but is not a readable directory",
+        )
+
+    submission_path = build_remote_file_path(
+        directory,
+        SUBMISSION_FILENAME,
+        allowed_roots=cluster.allowed_remote_roots,
+    )
+    if remote_file_exists(
+        cluster.ssh_host,
+        submission_path,
+        runner=remote_runner,
+        timeout=timeout,
+    ):
+        try:
+            diagnosis = diagnose_remote_run(
+                cluster,
+                str(directory),
+                remote_runner=remote_runner,
+                slurm_runner=slurm_runner,
+                modifier_policies=modifier_policies,
+                timeout=timeout,
+                max_vasprun_bytes=max_vasprun_bytes,
+            )
+        except (RunInspectionError, RemotePathError, subprocess.SubprocessError) as exc:
+            producer_reason = (
+                "submission.json was present but no valid BMD Compute producer "
+                f"record could be inspected: {exc}"
+            )
+            direct, reason = _inspect_direct_vasp_directory(
+                cluster.ssh_host,
+                directory,
+                allowed_roots=cluster.allowed_remote_roots,
+                remote_runner=remote_runner,
+                scientific_parser=scientific_parser or parse_vasp_output_files,
+                timeout=timeout,
+                max_vasprun_bytes=max_vasprun_bytes,
+                producer_reason=producer_reason,
+            )
+            if direct is None:
+                return JobInspection(
+                    job_id=normalized_job_id,
+                    scheduler=scheduler,
+                    scheduler_error=scheduler_error,
+                    scheduler_work_dir=work_dir,
+                    calculation_directory=None,
+                    calculation_type="unknown",
+                    calculation_reason=f"{producer_reason}; {reason}",
+                )
+            return JobInspection(
+                job_id=normalized_job_id,
+                scheduler=scheduler,
+                scheduler_error=scheduler_error,
+                scheduler_work_dir=work_dir,
+                calculation_directory=str(directory),
+                calculation_type="direct VASP",
+                calculation_reason=None,
+                direct_vasp=direct,
+            )
+        return JobInspection(
+            job_id=normalized_job_id,
+            scheduler=scheduler,
+            scheduler_error=scheduler_error,
+            scheduler_work_dir=work_dir,
+            calculation_directory=str(directory),
+            calculation_type="BMD Compute",
+            calculation_reason=None,
+            bmd_compute=diagnosis,
+        )
+
+    direct, reason = _inspect_direct_vasp_directory(
+        cluster.ssh_host,
+        directory,
+        allowed_roots=cluster.allowed_remote_roots,
+        remote_runner=remote_runner,
+        scientific_parser=scientific_parser or parse_vasp_output_files,
+        timeout=timeout,
+        max_vasprun_bytes=max_vasprun_bytes,
+        producer_reason="no BMD Compute producer record found",
+    )
+    if direct is None:
+        return JobInspection(
+            job_id=normalized_job_id,
+            scheduler=scheduler,
+            scheduler_error=scheduler_error,
+            scheduler_work_dir=work_dir,
+            calculation_directory=None,
+            calculation_type="unknown",
+            calculation_reason=reason,
+        )
+
+    return JobInspection(
+        job_id=normalized_job_id,
+        scheduler=scheduler,
+        scheduler_error=scheduler_error,
+        scheduler_work_dir=work_dir,
+        calculation_directory=str(directory),
+        calculation_type="direct VASP",
+        calculation_reason=None,
+        direct_vasp=direct,
     )
 
 
@@ -1358,6 +1569,192 @@ def _termination_observation(inspection: RunInspection) -> TerminationObservatio
         custodian_events=(),
         unavailable=tuple(unavailable),
     )
+
+
+def _inspect_direct_vasp_directory(
+    ssh_host: str,
+    directory: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    remote_runner: RemoteRunner,
+    scientific_parser: ScientificParser,
+    timeout: float,
+    max_vasprun_bytes: int,
+    producer_reason: str,
+) -> tuple[DirectVaspInspection | None, str | None]:
+    artifacts = _observe_direct_vasp_artifacts(
+        ssh_host,
+        directory,
+        runner=remote_runner,
+        timeout=timeout,
+    )
+    reason = _direct_vasp_marker_failure(artifacts)
+    if reason is not None:
+        return None, reason
+
+    stage = WorkflowStage(
+        index=1,
+        stage_type="direct_vasp",
+        theory="unknown",
+        modifiers=(),
+        label=None,
+    )
+    retained_inputs = (
+        _observe_incar(
+            ssh_host,
+            label="work_dir",
+            directory=directory,
+            stage_index=1,
+            allowed_roots=allowed_roots,
+            runner=remote_runner,
+            timeout=timeout,
+        ),
+    )
+    scientific = _derive_direct_vasp_scientific_result(
+        ssh_host,
+        artifacts,
+        runner=remote_runner,
+        parser=scientific_parser,
+        timeout=timeout,
+        max_vasprun_bytes=max_vasprun_bytes,
+    )
+    executed_inputs = retained_inputs + scientific.executed_parameters
+    trajectory = _observe_stage_trajectory(
+        ssh_host,
+        _BoundStageDirectory("work_dir", directory, 1),
+        stage,
+        executed_inputs,
+        allowed_roots=allowed_roots,
+        runner=remote_runner,
+        timeout=timeout,
+        max_vasprun_bytes=max_vasprun_bytes,
+    )
+    assessments = assess_convergence_progress((trajectory,))
+    return (
+        DirectVaspInspection(
+            directory=str(directory),
+            artifacts=artifacts,
+            executed_inputs=executed_inputs,
+            scientific=scientific,
+            trajectory=trajectory,
+            assessments=assessments,
+            producer_reason=producer_reason,
+        ),
+        None,
+    )
+
+
+def _observe_direct_vasp_artifacts(
+    ssh_host: str,
+    directory: PurePosixPath,
+    *,
+    runner: RemoteRunner,
+    timeout: float,
+) -> tuple[PathObservation, ...]:
+    return tuple(
+        _observe_remote_path(
+            ssh_host,
+            label=label,
+            path=build_remote_file_path(
+                directory,
+                filename,
+                allowed_roots=(directory,),
+            ),
+            kind="file",
+            runner=runner,
+            timeout=timeout,
+        )
+        for label, filename in _DIRECT_VASP_ARTIFACT_FILENAMES.items()
+    )
+
+
+def _direct_vasp_marker_failure(artifacts: Sequence[PathObservation]) -> str | None:
+    present = {
+        observation.label
+        for observation in artifacts
+        if observation.present
+    }
+    missing_inputs = [
+        _DIRECT_VASP_ARTIFACT_FILENAMES[label]
+        for label in _DIRECT_VASP_REQUIRED_INPUTS
+        if label not in present
+    ]
+    if missing_inputs:
+        return (
+            "direct VASP marker set was incomplete; missing required input "
+            f"artifact(s): {', '.join(missing_inputs)}"
+        )
+
+    if not any(label in present for label in _DIRECT_VASP_RUNTIME_OUTPUTS):
+        required = ", ".join(
+            _DIRECT_VASP_ARTIFACT_FILENAMES[label]
+            for label in _DIRECT_VASP_RUNTIME_OUTPUTS
+        )
+        return (
+            "direct VASP marker set was incomplete; expected at least one "
+            f"runtime/output artifact: {required}"
+        )
+
+    return None
+
+
+def _derive_direct_vasp_scientific_result(
+    ssh_host: str,
+    artifacts: Sequence[PathObservation],
+    *,
+    runner: RemoteRunner,
+    parser: ScientificParser,
+    timeout: float,
+    max_vasprun_bytes: int,
+) -> ScientificResult:
+    selected: list[PathObservation] = []
+    unavailable: list[str] = []
+    for observation in artifacts:
+        if observation.label not in _DIRECT_VASP_SCIENTIFIC_READ_KEYS:
+            continue
+        if observation.label == "vasprun" and observation.present:
+            try:
+                size = remote_file_size(
+                    ssh_host,
+                    PurePosixPath(observation.path),
+                    runner=runner,
+                    timeout=timeout,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+                unavailable.append("vasprun.xml size could not be checked")
+                continue
+            if size > max_vasprun_bytes:
+                unavailable.append(
+                    f"vasprun.xml skipped because size {size} bytes exceeds limit {max_vasprun_bytes}"
+                )
+                continue
+        selected.append(observation)
+
+    scientific = _derive_scientific_result(
+        ssh_host,
+        selected,
+        _direct_vasp_workflow_spec(),
+        runner=runner,
+        parser=parser,
+        timeout=timeout,
+    )
+    if unavailable:
+        return replace(scientific, unavailable=scientific.unavailable + tuple(unavailable))
+    return scientific
+
+
+def _direct_vasp_workflow_spec() -> Mapping[str, Any]:
+    return {
+        "stages": [
+            {
+                "stage_type": "direct_vasp",
+                "theory": "unknown",
+                "modifiers": [],
+                "label": None,
+                "options": {},
+            }
+        ]
+    }
 
 
 def _observe_stage_trajectories(
