@@ -1126,6 +1126,24 @@ def _assess_stage_progress(
         basis.append("electronic and ionic scopes are converged")
         return _assessment(trajectory, "stage", CONVERGED, basis=basis, features=features)
 
+    if ionic.label == INSUFFICIENT_EVIDENCE:
+        if electronic.label in (CONVERGED, EVIDENCE_OF_PROGRESS):
+            basis.extend(electronic.basis)
+        limitations.extend(electronic.limitations)
+        limitations.extend(ionic.limitations)
+        limitations.append(
+            "ionic progress evidence is insufficient for force-based stage progress assessment"
+        )
+        return _assessment(
+            trajectory,
+            "stage",
+            INSUFFICIENT_EVIDENCE,
+            basis=basis,
+            counter_evidence=tuple(electronic.counter_evidence) + tuple(ionic.counter_evidence),
+            limitations=limitations,
+            features=features,
+        )
+
     if electronic.label in (CONVERGED, EVIDENCE_OF_PROGRESS) or ionic.label == EVIDENCE_OF_PROGRESS:
         if electronic.label in (CONVERGED, EVIDENCE_OF_PROGRESS):
             basis.extend(electronic.basis)
@@ -1730,14 +1748,35 @@ def _derive_direct_vasp_scientific_result(
                 continue
         selected.append(observation)
 
-    scientific = _derive_scientific_result(
-        ssh_host,
-        selected,
-        _direct_vasp_workflow_spec(),
-        runner=runner,
-        parser=parser,
-        timeout=timeout,
-    )
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", UserWarning)
+            scientific = _derive_scientific_result(
+                ssh_host,
+                selected,
+                _direct_vasp_workflow_spec(),
+                runner=runner,
+                parser=parser,
+                timeout=timeout,
+            )
+    except Exception as exc:
+        if _has_malformed_xml_warning(caught):
+            scientific = ScientificResult(
+                source_paths=tuple(
+                    observation.path for observation in selected if observation.present
+                ),
+                unavailable=("vasprun.xml could not be parsed completely",),
+            )
+        else:
+            scientific = ScientificResult(
+                source_paths=tuple(
+                    observation.path for observation in selected if observation.present
+                ),
+                error=str(exc),
+            )
+    else:
+        if _has_malformed_xml_warning(caught):
+            scientific = _scientific_with_malformed_vasprun_unavailable(scientific)
     if unavailable:
         return replace(scientific, unavailable=scientific.unavailable + tuple(unavailable))
     return scientific
@@ -1755,6 +1794,22 @@ def _direct_vasp_workflow_spec() -> Mapping[str, Any]:
             }
         ]
     }
+
+
+def _scientific_with_malformed_vasprun_unavailable(
+    scientific: ScientificResult,
+) -> ScientificResult:
+    unavailable = tuple(
+        item
+        for item in scientific.unavailable
+        if "vasprun.xml could not be parsed:" not in item
+        and "list index out of range" not in item
+        and "xml is malformed" not in item.lower()
+    )
+    reason = "vasprun.xml could not be parsed completely"
+    if reason not in unavailable:
+        unavailable = unavailable + (reason,)
+    return replace(scientific, unavailable=unavailable)
 
 
 def _observe_stage_trajectories(

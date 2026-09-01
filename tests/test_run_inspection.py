@@ -812,6 +812,38 @@ def test_direct_vasp_truncated_vasprun_keeps_oszicar_trajectory(
     assert stage.label == INSUFFICIENT_EVIDENCE
 
 
+def test_direct_vasp_scientific_parsing_captures_malformed_vasprun_warning(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    with fake_pymatgen_modules(FakeMalformedVasprun), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        inspection = inspect_slurm_job(
+            cluster(),
+            "20893681",
+            remote_runner=remote,
+            slurm_runner=job_slurm_runner(state="TIMEOUT"),
+            scientific_parser=parse_vasp_output_files,
+        )
+
+    assert caught == []
+    assert inspection.direct_vasp is not None
+    scientific = inspection.direct_vasp.scientific
+    assert "vasprun.xml could not be parsed completely" in scientific.unavailable
+    assert "list index out of range" not in " ".join(scientific.unavailable)
+    assert "XML is malformed" not in " ".join(scientific.unavailable)
+    assert scientific.error is None
+
+    cli.print_job_inspection(inspection)
+
+    captured = capsys.readouterr()
+    assert "vasprun.xml could not be parsed completely" in captured.out
+    assert "file could not be parsed completely" in captured.out
+    assert "list index out of range" not in captured.out
+    assert "XML is malformed" not in captured.out
+
+
 def test_completed_direct_vasp_relaxation_reports_converged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -926,6 +958,8 @@ def test_cli_prints_direct_vasp_job_summary_without_prediction(
     assert "Executed VASP inputs (executed_input)" in captured.out
     assert "ENCUT=520" in captured.out
     assert "Trajectory evidence (trajectory_observation)" in captured.out
+    assert "stage 1: Direct VASP calculation (work_dir)" in captured.out
+    assert "UNKNOWN Direct Vasp" not in captured.out
     assert "Convergence-progress assessment (convergence_progress_assessment)" in captured.out
     assert "more walltime" not in captured.out.lower()
 
@@ -1393,6 +1427,35 @@ def test_convergence_progress_assessment_timeout_first_scf_is_insufficient(
     assert all(assessment.label != NO_CLEAR_EVIDENCE_OF_PROGRESS for assessment in assessments)
 
 
+def test_force_based_relaxation_stage_does_not_promote_electronic_convergence_alone() -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 200, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01},
+        completed_ionic_steps=50,
+        electronic_iterations=(8,) * 50,
+        electronic_cycles=tuple(
+            electronic_cycle(index, 8, dE=1e-7)
+            for index in range(1, 51)
+        ),
+        ionic_steps=(
+            IonicStepObservation(50, 8, -100.0, -99.9, -0.1, None),
+        ),
+        converged_electronic=True,
+        converged_ionic=None,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert assessment_by_scope(assessments, "electronic").label == CONVERGED
+    ionic = assessment_by_scope(assessments, "ionic")
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert "maximum force evidence unavailable" in ionic.limitations
+    stage = assessment_by_scope(assessments, "stage")
+    assert stage.label == INSUFFICIENT_EVIDENCE
+    assert "converged_electronic=True" in " ".join(stage.basis)
+    assert "ionic progress evidence is insufficient" in " ".join(stage.limitations)
+
+
 def test_convergence_progress_assessment_missing_oszicar_is_insufficient() -> None:
     trajectory = trajectory_observation(
         stage_type="static",
@@ -1726,6 +1789,15 @@ class FakeFailingBandVasprun(FakeBandVasprun):
     def get_band_structure(self, **kwargs: object) -> FakeBandStructure:
         self.band_calls.append(kwargs)
         raise ValueError("e_fermi is None.")
+
+
+class FakeMalformedVasprun(FakeBandVasprun):
+    def __init__(self, path: str, **kwargs: object) -> None:
+        warnings.warn(
+            "XML is malformed. Parsing has stopped but partial data is available.",
+            UserWarning,
+        )
+        raise IndexError("list index out of range")
 
 
 @contextmanager

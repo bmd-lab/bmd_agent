@@ -749,7 +749,9 @@ def _trajectory_heading(trajectory: object) -> str:
         prefix = f"stage {stage_index}"
     theory = getattr(trajectory, "theory", None)
     stage_type = getattr(trajectory, "stage_type", None)
-    if theory and stage_type:
+    if stage_type == "direct_vasp":
+        prefix = f"{prefix}: Direct VASP calculation"
+    elif theory and stage_type:
         prefix = f"{prefix}: {_display_theory(theory)} {_display_stage(stage_type)}"
     label = getattr(trajectory, "stage_label", None)
     return f"{prefix} ({label})" if label else prefix
