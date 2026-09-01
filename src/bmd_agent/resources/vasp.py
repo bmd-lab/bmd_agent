@@ -9,28 +9,36 @@ from pymatgen.io.vasp import Poscar
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
 
+_OUTCAR_FORCE_EXTRACTOR_AWK_EMIT = (
+    'complete=(emit_status=="complete"&&rows>0&&malformed==0);'
+    'final_status=emit_status;value="";'
+    'if(complete&&expected!=""&&rows!=expected+0){complete=0;final_status="row_count_mismatch"}'
+    'if(malformed){complete=0;final_status="malformed"}'
+    'if(complete){value=max_force}'
+    'printf("block\\t%d\\t%d\\t%s\\t%d\\t%s\\n",block_no,rows,final_status,complete,value);'
+    'state=0;rows=0;max_force=0;malformed=0'
+)
+
 _OUTCAR_FORCE_EXTRACTOR_AWK = (
     'BEGIN{print "schema\\tbmd-agent-outcar-force-v1";'
     'print "expected_site_count\\t" expected;'
     'num="^[-+]?(([0-9]+([.][0-9]*)?)|([.][0-9]+))([Ee][-+]?[0-9]+)?$"}'
-    'function emit(status,complete,final_status,value){'
-    'complete=(status=="complete"&&rows>0&&malformed==0);'
-    'final_status=status;value="";'
-    'if(complete&&expected!=""&&rows!=expected+0){complete=0;final_status="row_count_mismatch"}'
-    'if(malformed){complete=0;final_status="malformed"}'
-    'if(complete){value=max_force}'
-    'printf("block\\t%d\\t%d\\t%s\\t%d\\t%s\\n",index,rows,final_status,complete,value);'
-    'state=0;rows=0;max_force=0;malformed=0}'
     '/^[[:space:]]*POSITION[[:space:]]+TOTAL-FORCE[[:space:]]+\\(eV\\/Angst\\)[[:space:]]*$/{'
-    'if(state){emit("incomplete")}index++;state=1;rows=0;max_force=0;malformed=0;next}'
+    'if(state){emit_status="incomplete";'
+    + _OUTCAR_FORCE_EXTRACTOR_AWK_EMIT
+    + '};block_no++;state=1;rows=0;max_force=0;malformed=0;next}'
     'state&&/^[[:space:]]*---[-]*[[:space:]]*$/{'
-    'if(state==1){state=2}else{emit("complete")}next}'
+    'if(state==1){state=2}else{emit_status="complete";'
+    + _OUTCAR_FORCE_EXTRACTOR_AWK_EMIT
+    + '};next}'
     'state&&NF{'
     'if(state==1){state=2;malformed=1}'
     'if(NF<6||$4!~num||$5!~num||$6!~num){malformed=1;next}'
     'fx=$4+0;fy=$5+0;fz=$6+0;rows++;force=sqrt(fx*fx+fy*fy+fz*fz);'
     'if(force>max_force){max_force=force}next}'
-    'END{if(state){emit("incomplete")}}'
+    'END{if(state){emit_status="incomplete";'
+    + _OUTCAR_FORCE_EXTRACTOR_AWK_EMIT
+    + '}}'
 )
 
 
@@ -205,8 +213,9 @@ def build_remote_outcar_force_command(
 def _outcar_extraction_error(
     exc: subprocess.CalledProcessError,
 ) -> RemoteOutcarForceExtractionError:
-    stderr_summary = _stderr_summary(exc.stderr)
-    lower = (stderr_summary or "").lower()
+    stderr_excerpt = _stderr_excerpt(exc.stderr)
+    stderr_summary = _stderr_summary(stderr_excerpt)
+    lower = (stderr_excerpt or "").lower()
     kind = "remote_command_failed"
     message = "extractor command failed"
 
@@ -246,6 +255,21 @@ def _stderr_summary(stderr: bytes | str | None) -> str | None:
         if stripped:
             return stripped[:240]
     return None
+
+
+def _stderr_excerpt(stderr: bytes | str | None) -> str | None:
+    if stderr is None:
+        return None
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else stderr
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            lines.append(stripped)
+        if len(lines) >= 12:
+            break
+    excerpt = "\n".join(lines)
+    return excerpt[:2000] if excerpt else None
 
 
 def remote_directory_exists(

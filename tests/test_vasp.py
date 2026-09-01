@@ -1,4 +1,7 @@
-from pathlib import PurePosixPath
+import os
+from pathlib import Path, PurePosixPath
+import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -187,11 +190,60 @@ def test_remote_outcar_force_extractor_uses_fixed_read_only_awk_command() -> Non
     assert parts[0:3] == ["awk", "-v", "expected=24"]
     assert "\n" not in command
     assert "python3" not in command
+    assert "function " not in command
+    assert "index" not in command
+    assert "block_no" in command
     assert "find " not in command
     assert "ls " not in command
     assert "cat " not in command
     assert "POTCAR" not in command
     assert "'/home/example/calculations/project with spaces/OUTCAR'" in command
+
+
+def test_remote_outcar_force_awk_program_avoids_cluster_rejected_constructs() -> None:
+    command = build_remote_outcar_force_command(
+        PurePosixPath("/home/example/calculations/run/OUTCAR"),
+        expected_site_count=24,
+    )
+
+    assert "}function" not in command
+    assert "function emit" not in command
+    assert "index++" not in command
+    assert "\\(eV\\/Angst\\)" in command
+
+
+def test_remote_outcar_force_awk_program_runs_with_system_awk_when_available(
+    tmp_path: Path,
+) -> None:
+    awk = shutil.which("awk")
+    if awk is None or os.name == "nt":
+        pytest.skip("system awk is not available in this environment")
+    outcar = tmp_path / "OUTCAR"
+    outcar.write_text(
+        """\
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000      3.00000000      4.00000000      0.00000000
+      0.50000000      0.50000000      0.50000000      0.00000000      0.00000000      1.00000000
+ -----------------------------------------------------------------------------------
+""",
+        encoding="utf-8",
+    )
+    command = build_remote_outcar_force_command(
+        PurePosixPath(outcar.as_posix()),
+        expected_site_count=2,
+    )
+
+    result = subprocess.run(
+        shlex.split(command),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+
+    assert "schema\tbmd-agent-outcar-force-v1" in result.stdout
+    assert "block\t1\t2\tcomplete\t1\t5" in result.stdout
 
 
 def test_extract_remote_outcar_force_blocks_returns_compact_stdout() -> None:
@@ -260,6 +312,29 @@ def test_extract_remote_outcar_force_blocks_classifies_invocation_failure() -> N
         )
 
     assert exc_info.value.kind == "command_invocation_failed"
+    assert exc_info.value.public_message == "extractor command invocation failed"
+
+
+def test_extract_remote_outcar_force_blocks_classifies_multiline_awk_syntax_failure() -> None:
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            stderr=(
+                b"awk: cmd. line:1: BEGIN{print \"schema\"}function emit(){...}\n"
+                b"awk: cmd. line:1:                                  ^ syntax error\n"
+            ),
+        )
+
+    with pytest.raises(RemoteOutcarForceExtractionError) as exc_info:
+        extract_remote_outcar_force_blocks(
+            "powerslurm-bmdguest",
+            PurePosixPath("/home/example/calculations/run/OUTCAR"),
+            runner=runner,
+        )
+
+    assert exc_info.value.kind == "command_invocation_failed"
+    assert exc_info.value.returncode == 1
     assert exc_info.value.public_message == "extractor command invocation failed"
 
 
