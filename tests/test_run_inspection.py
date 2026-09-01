@@ -1891,6 +1891,89 @@ def test_force_based_relaxation_stage_does_not_promote_electronic_convergence_al
     assert "ionic progress evidence is insufficient" in " ".join(stage.limitations)
 
 
+def test_unreached_force_criterion_without_trend_rule_is_insufficient_progress_evidence() -> None:
+    ionic_steps = tuple(
+        IonicStepObservation(
+            index,
+            8,
+            -100.0 - index,
+            -99.9 - index,
+            -0.1,
+            force,
+            "OUTCAR",
+        )
+        for index, force in enumerate(
+            (
+                0.028543,
+                0.026002,
+                0.022678,
+                0.026931,
+                0.071891,
+            ),
+            start=46,
+        )
+    )
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 200, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01, "ISIF": 3},
+        completed_ionic_steps=50,
+        electronic_iterations=(8,) * 50,
+        electronic_cycles=tuple(
+            electronic_cycle(index, 8, dE=1e-7)
+            for index in range(1, 51)
+        ),
+        ionic_steps=ionic_steps,
+        converged_electronic=True,
+        converged_ionic=None,
+    )
+    trajectory = replace(
+        trajectory,
+        outcar_path=f"{FLOW_ROOT}/OUTCAR",
+        outcar_present=True,
+        outcar_expected_site_count=24,
+        outcar_force_blocks=tuple(
+            OutcarForceBlockObservation(
+                index,
+                24,
+                "complete",
+                True,
+                f"{FLOW_ROOT}/OUTCAR",
+                force,
+            )
+            for index, force in enumerate(
+                (
+                    0.028543,
+                    0.026002,
+                    0.022678,
+                    0.026931,
+                    0.071891,
+                ),
+                start=46,
+            )
+        ),
+        outcar_complete_force_blocks=50,
+        outcar_force_alignment_status="aligned",
+        outcar_force_alignment_reason=(
+            "50 OUTCAR force block(s) aligned with OSZICAR completed ionic steps"
+        ),
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    ionic = assessment_by_scope(assessments, "ionic")
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert "final OUTCAR atomic maximum force has not reached EDIFFG" in " ".join(
+        ionic.counter_evidence
+    )
+    assert "trend-based ionic progress assessment is not implemented" in " ".join(
+        ionic.limitations
+    )
+    stage = assessment_by_scope(assessments, "stage")
+    assert stage.label == INSUFFICIENT_EVIDENCE
+    assert "ionic progress evidence is insufficient" in " ".join(stage.limitations)
+    assert all(assessment.label != NO_CLEAR_EVIDENCE_OF_PROGRESS for assessment in assessments)
+
+
 def test_convergence_progress_assessment_missing_oszicar_is_insufficient() -> None:
     trajectory = trajectory_observation(
         stage_type="static",
@@ -1952,7 +2035,7 @@ def test_convergence_progress_assessment_missing_criteria_is_insufficient() -> N
     assert "EDIFF criterion unavailable" in electronic.limitations
 
 
-def test_convergence_progress_assessment_reports_partial_stage_progress() -> None:
+def test_convergence_progress_assessment_does_not_treat_unreached_force_as_no_progress() -> None:
     trajectory = trajectory_observation(
         stage_type="relax",
         criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01},
@@ -1970,12 +2053,15 @@ def test_convergence_progress_assessment_reports_partial_stage_progress() -> Non
     assessments = assess_convergence_progress((trajectory,))
 
     assert assessment_by_scope(assessments, "electronic").label == CONVERGED
-    assert assessment_by_scope(assessments, "ionic").label == NO_CLEAR_EVIDENCE_OF_PROGRESS
-    stage = assessment_by_scope(assessments, "stage")
-    assert stage.label == NO_CLEAR_EVIDENCE_OF_PROGRESS
-    assert "ionic progress evidence does not support force-based stage progress" in " ".join(
-        stage.limitations
+    ionic = assessment_by_scope(assessments, "ionic")
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert "final maximum force has not reached EDIFFG" in " ".join(ionic.counter_evidence)
+    assert "trend-based ionic progress assessment is not implemented" in " ".join(
+        ionic.limitations
     )
+    stage = assessment_by_scope(assessments, "stage")
+    assert stage.label == INSUFFICIENT_EVIDENCE
+    assert "ionic progress evidence is insufficient" in " ".join(stage.limitations)
 
 
 def test_convergence_progress_assessment_preserves_contradictory_evidence() -> None:

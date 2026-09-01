@@ -1114,7 +1114,7 @@ def _assess_ionic_progress(
         return _assessment(
             trajectory,
             "ionic",
-            NO_CLEAR_EVIDENCE_OF_PROGRESS,
+            INSUFFICIENT_EVIDENCE,
             counter_evidence=counter,
             limitations=limitations,
             features=features,
