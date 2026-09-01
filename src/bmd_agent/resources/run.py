@@ -46,6 +46,12 @@ EXECUTED_INPUT = "executed_input"
 AGENT_COMPARISON = "agent_comparison"
 TERMINATION_OBSERVATION = "termination_observation"
 TRAJECTORY_OBSERVATION = "trajectory_observation"
+CONVERGENCE_PROGRESS_ASSESSMENT = "convergence_progress_assessment"
+
+CONVERGED = "CONVERGED"
+EVIDENCE_OF_PROGRESS = "EVIDENCE OF PROGRESS"
+NO_CLEAR_EVIDENCE_OF_PROGRESS = "NO CLEAR EVIDENCE OF PROGRESS"
+INSUFFICIENT_EVIDENCE = "INSUFFICIENT EVIDENCE"
 
 _ARTIFACT_FILENAMES = {
     "contcar": "CONTCAR",
@@ -286,6 +292,14 @@ class ElectronicIterationObservation:
 
 
 @dataclass(frozen=True)
+class ElectronicCycleObservation:
+    cycle_index: int
+    completed_ionic_step: bool
+    iterations: int
+    final_iteration: ElectronicIterationObservation | None = None
+
+
+@dataclass(frozen=True)
 class IonicStepObservation:
     step_index: int
     electronic_iterations: int | None = None
@@ -315,12 +329,14 @@ class StageTrajectoryObservation:
     criteria_discrepancies: tuple[str, ...] = ()
     ionic_steps_observed: int | None = None
     electronic_iterations_by_ionic_step: tuple[int, ...] = ()
+    electronic_cycles: tuple[ElectronicCycleObservation, ...] = ()
     final_electronic_iteration_count: int | None = None
     recent_electronic_iterations: tuple[ElectronicIterationObservation, ...] = ()
     completed_ionic_steps: int | None = None
     electronic_iterations_by_completed_ionic_step: tuple[int, ...] = ()
     incomplete_electronic_iteration_count: int | None = None
     recent_incomplete_electronic_iterations: tuple[ElectronicIterationObservation, ...] = ()
+    ionic_steps: tuple[IonicStepObservation, ...] = ()
     recent_ionic_steps: tuple[IonicStepObservation, ...] = ()
     vasprun_ionic_steps: int | None = None
     converged_electronic: bool | None = None
@@ -329,10 +345,25 @@ class StageTrajectoryObservation:
 
 
 @dataclass(frozen=True)
+class ConvergenceProgressAssessment:
+    label: str
+    stage_index: int | None
+    stage_label: str
+    scope: str
+    sufficiency: str
+    evidence_type: str = CONVERGENCE_PROGRESS_ASSESSMENT
+    basis: tuple[str, ...] = ()
+    counter_evidence: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+    features: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RunDiagnosis:
     inspection: RunInspection
     termination: TerminationObservation
     trajectories: tuple[StageTrajectoryObservation, ...]
+    assessments: tuple[ConvergenceProgressAssessment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -354,8 +385,10 @@ class _BoundStageDirectory:
 class _OszicarTrajectory:
     ionic_steps_observed: int | None
     electronic_iterations_by_ionic_step: tuple[int, ...]
+    electronic_cycles: tuple[ElectronicCycleObservation, ...]
     final_electronic_iteration_count: int | None
     recent_electronic_iterations: tuple[ElectronicIterationObservation, ...]
+    ionic_steps: tuple[IonicStepObservation, ...]
     recent_ionic_steps: tuple[IonicStepObservation, ...]
     completed_ionic_steps: int | None = None
     electronic_iterations_by_completed_ionic_step: tuple[int, ...] = ()
@@ -373,7 +406,7 @@ class _VasprunTrajectory:
     ionic_steps: int | None = None
     converged_electronic: bool | None = None
     converged_ionic: bool | None = None
-    recent_max_forces: Mapping[int, float] = field(default_factory=dict)
+    max_forces: Mapping[int, float] = field(default_factory=dict)
 
 
 def inspect_remote_run(
@@ -587,7 +620,484 @@ def diagnose_remote_run(
         inspection=inspection,
         termination=_termination_observation(inspection),
         trajectories=trajectories,
+        assessments=assess_convergence_progress(trajectories),
     )
+
+
+def assess_convergence_progress(
+    trajectories: Sequence[StageTrajectoryObservation],
+) -> tuple[ConvergenceProgressAssessment, ...]:
+    """Build conservative progress assessments from observed trajectory evidence."""
+
+    assessments: list[ConvergenceProgressAssessment] = []
+    for trajectory in trajectories:
+        electronic = _assess_electronic_progress(trajectory)
+        assessments.append(electronic)
+        ionic = (
+            _assess_ionic_progress(trajectory)
+            if _stage_uses_ionic_progress(trajectory)
+            else None
+        )
+        if ionic is not None:
+            assessments.append(ionic)
+        assessments.append(_assess_stage_progress(trajectory, electronic, ionic))
+    return tuple(assessments)
+
+
+def _assess_electronic_progress(
+    trajectory: StageTrajectoryObservation,
+) -> ConvergenceProgressAssessment:
+    basis: list[str] = []
+    counter: list[str] = []
+    limitations: list[str] = []
+    features = _assessment_features(trajectory)
+    explicit = trajectory.converged_electronic
+
+    if explicit is True:
+        basis.append("trajectory_observation: vasprun converged_electronic=True")
+        return _assessment(
+            trajectory,
+            "electronic",
+            CONVERGED,
+            basis=basis,
+            features=features,
+        )
+    if explicit is False:
+        counter.append("trajectory_observation: vasprun converged_electronic=False")
+
+    if trajectory.oszicar_error:
+        limitations.append(f"OSZICAR parsing unavailable: {trajectory.oszicar_error}")
+    if not trajectory.oszicar_present and explicit is None:
+        limitations.append("OSZICAR trajectory unavailable")
+
+    ediff = _positive_float(trajectory.criteria.get("EDIFF"))
+    if ediff is None and explicit is None:
+        limitations.append("EDIFF criterion unavailable")
+
+    final_cycle = _final_completed_electronic_cycle(trajectory)
+    final_iteration = final_cycle.final_iteration if final_cycle else None
+    reaches_ediff = _electronic_iteration_reaches_ediff(final_iteration, ediff)
+    if reaches_ediff is True:
+        basis.append(
+            "trajectory_observation: final completed electronic cycle reached EDIFF"
+        )
+    elif reaches_ediff is False:
+        counter.append(
+            "trajectory_observation: final completed electronic cycle has not reached EDIFF"
+        )
+
+    if basis and counter:
+        limitations.append("electronic convergence evidence is contradictory")
+        return _assessment(
+            trajectory,
+            "electronic",
+            INSUFFICIENT_EVIDENCE,
+            sufficiency="contradictory",
+            basis=basis,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+    if basis:
+        return _assessment(
+            trajectory,
+            "electronic",
+            CONVERGED,
+            basis=basis,
+            limitations=limitations,
+            features=features,
+        )
+
+    incomplete_first_cycle = (
+        trajectory.completed_ionic_steps == 0
+        and trajectory.incomplete_electronic_iteration_count is not None
+    )
+    if incomplete_first_cycle:
+        limitations.append("only an incomplete first electronic cycle was observed")
+        return _assessment(
+            trajectory,
+            "electronic",
+            INSUFFICIENT_EVIDENCE,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+
+    if ediff is not None and _completed_electronic_cycle_below_nelm(trajectory):
+        basis.append(
+            "trajectory_observation: a completed electronic cycle ended before NELM with EDIFF configured"
+        )
+        return _assessment(
+            trajectory,
+            "electronic",
+            EVIDENCE_OF_PROGRESS,
+            basis=basis,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+
+    if counter and final_cycle is not None and ediff is not None:
+        return _assessment(
+            trajectory,
+            "electronic",
+            NO_CLEAR_EVIDENCE_OF_PROGRESS,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+
+    if final_cycle is None and explicit is None:
+        limitations.append("completed electronic cycle unavailable")
+
+    return _assessment(
+        trajectory,
+        "electronic",
+        INSUFFICIENT_EVIDENCE,
+        counter_evidence=counter,
+        limitations=limitations,
+        features=features,
+    )
+
+
+def _assess_ionic_progress(
+    trajectory: StageTrajectoryObservation,
+) -> ConvergenceProgressAssessment:
+    basis: list[str] = []
+    counter: list[str] = []
+    limitations: list[str] = []
+    features = _assessment_features(trajectory)
+    explicit = trajectory.converged_ionic
+    completed_steps = trajectory.completed_ionic_steps
+
+    if explicit is True:
+        basis.append("trajectory_observation: vasprun converged_ionic=True")
+    elif explicit is False:
+        counter.append("trajectory_observation: vasprun converged_ionic=False")
+
+    if completed_steps is None:
+        limitations.append("completed ionic step count unavailable")
+    elif completed_steps == 0:
+        limitations.append("zero completed ionic steps observed")
+
+    ediffg = _float_or_none(trajectory.criteria.get("EDIFFG"))
+    force_criterion = abs(ediffg) if ediffg is not None and ediffg < 0 else None
+    if ediffg is None:
+        limitations.append("EDIFFG criterion unavailable")
+    elif ediffg >= 0:
+        limitations.append("positive or zero EDIFFG criterion is not interpreted in v1")
+
+    final_step = _final_ionic_step(trajectory)
+    if final_step is None:
+        limitations.append("completed ionic trajectory unavailable")
+    final_force = _float_or_none(getattr(final_step, "max_force", None))
+    if force_criterion is not None and final_force is None:
+        limitations.append("maximum force evidence unavailable")
+    elif force_criterion is not None and final_force is not None:
+        if final_force <= force_criterion:
+            basis.append("trajectory_observation: final maximum force reached EDIFFG")
+        else:
+            counter.append(
+                "trajectory_observation: final maximum force has not reached EDIFFG"
+            )
+
+    if basis and counter:
+        limitations.append("ionic convergence evidence is contradictory")
+        return _assessment(
+            trajectory,
+            "ionic",
+            INSUFFICIENT_EVIDENCE,
+            sufficiency="contradictory",
+            basis=basis,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+    if basis:
+        return _assessment(
+            trajectory,
+            "ionic",
+            CONVERGED,
+            basis=basis,
+            limitations=limitations,
+            features=features,
+        )
+    if completed_steps == 0:
+        return _assessment(
+            trajectory,
+            "ionic",
+            INSUFFICIENT_EVIDENCE,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+    if counter and completed_steps is not None and completed_steps > 0 and force_criterion is not None:
+        limitations.append("trend-based ionic progress assessment is not implemented in v1")
+        return _assessment(
+            trajectory,
+            "ionic",
+            NO_CLEAR_EVIDENCE_OF_PROGRESS,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+    return _assessment(
+        trajectory,
+        "ionic",
+        INSUFFICIENT_EVIDENCE,
+        counter_evidence=counter,
+        limitations=limitations,
+        features=features,
+    )
+
+
+def _assess_stage_progress(
+    trajectory: StageTrajectoryObservation,
+    electronic: ConvergenceProgressAssessment,
+    ionic: ConvergenceProgressAssessment | None,
+) -> ConvergenceProgressAssessment:
+    basis: list[str] = []
+    counter: list[str] = []
+    limitations: list[str] = []
+    features = _assessment_features(trajectory)
+
+    if ionic is None:
+        if electronic.label == CONVERGED:
+            basis.append("electronic scope is converged")
+            return _assessment(trajectory, "stage", CONVERGED, basis=basis, features=features)
+        if electronic.label == EVIDENCE_OF_PROGRESS:
+            basis.extend(electronic.basis)
+            limitations.extend(electronic.limitations)
+            return _assessment(
+                trajectory,
+                "stage",
+                EVIDENCE_OF_PROGRESS,
+                basis=basis,
+                counter_evidence=tuple(electronic.counter_evidence),
+                limitations=limitations,
+                features=features,
+            )
+        return _assessment(
+            trajectory,
+            "stage",
+            electronic.label,
+            sufficiency=electronic.sufficiency,
+            counter_evidence=tuple(electronic.counter_evidence),
+            limitations=tuple(electronic.limitations),
+            features=features,
+        )
+
+    if trajectory.completed_ionic_steps == 0:
+        limitations.append("zero completed ionic steps observed")
+        limitations.append("stage progress cannot be assessed from an incomplete first SCF cycle alone")
+        return _assessment(
+            trajectory,
+            "stage",
+            INSUFFICIENT_EVIDENCE,
+            limitations=limitations,
+            features=features,
+        )
+
+    if electronic.sufficiency == "contradictory" or ionic.sufficiency == "contradictory":
+        limitations.append("component convergence evidence is contradictory")
+        return _assessment(
+            trajectory,
+            "stage",
+            INSUFFICIENT_EVIDENCE,
+            sufficiency="contradictory",
+            basis=tuple(electronic.basis) + tuple(ionic.basis),
+            counter_evidence=tuple(electronic.counter_evidence) + tuple(ionic.counter_evidence),
+            limitations=limitations,
+            features=features,
+        )
+
+    if electronic.label == CONVERGED and ionic.label == CONVERGED:
+        basis.append("electronic and ionic scopes are converged")
+        return _assessment(trajectory, "stage", CONVERGED, basis=basis, features=features)
+
+    if electronic.label in (CONVERGED, EVIDENCE_OF_PROGRESS) or ionic.label == EVIDENCE_OF_PROGRESS:
+        if electronic.label in (CONVERGED, EVIDENCE_OF_PROGRESS):
+            basis.extend(electronic.basis)
+        if ionic.label == EVIDENCE_OF_PROGRESS:
+            basis.extend(ionic.basis)
+        limitations.append("not all required stage scopes are converged")
+        return _assessment(
+            trajectory,
+            "stage",
+            EVIDENCE_OF_PROGRESS,
+            basis=basis,
+            counter_evidence=tuple(electronic.counter_evidence) + tuple(ionic.counter_evidence),
+            limitations=limitations,
+            features=features,
+        )
+
+    if electronic.label == NO_CLEAR_EVIDENCE_OF_PROGRESS or ionic.label == NO_CLEAR_EVIDENCE_OF_PROGRESS:
+        counter.extend(electronic.counter_evidence)
+        counter.extend(ionic.counter_evidence)
+        limitations.append("no v1 criterion-based progress evidence was established")
+        return _assessment(
+            trajectory,
+            "stage",
+            NO_CLEAR_EVIDENCE_OF_PROGRESS,
+            counter_evidence=counter,
+            limitations=limitations,
+            features=features,
+        )
+
+    limitations.extend(electronic.limitations)
+    limitations.extend(ionic.limitations)
+    return _assessment(
+        trajectory,
+        "stage",
+        INSUFFICIENT_EVIDENCE,
+        limitations=tuple(dict.fromkeys(limitations)),
+        features=features,
+    )
+
+
+def _assessment(
+    trajectory: StageTrajectoryObservation,
+    scope: str,
+    label: str,
+    *,
+    sufficiency: str | None = None,
+    basis: Sequence[str] = (),
+    counter_evidence: Sequence[str] = (),
+    limitations: Sequence[str] = (),
+    features: Mapping[str, Any] | None = None,
+) -> ConvergenceProgressAssessment:
+    return ConvergenceProgressAssessment(
+        label=label,
+        stage_index=trajectory.stage_index,
+        stage_label=trajectory.stage_label,
+        scope=scope,
+        sufficiency=sufficiency or (
+            "insufficient" if label == INSUFFICIENT_EVIDENCE else "sufficient"
+        ),
+        basis=tuple(dict.fromkeys(basis)),
+        counter_evidence=tuple(dict.fromkeys(counter_evidence)),
+        limitations=tuple(dict.fromkeys(limitations)),
+        features=dict(features or {}),
+    )
+
+
+def _assessment_features(trajectory: StageTrajectoryObservation) -> Mapping[str, Any]:
+    final_iteration = _final_observed_electronic_iteration(trajectory)
+    final_step = _final_ionic_step(trajectory)
+    features: dict[str, Any] = {
+        "stage_type": trajectory.stage_type,
+        "theory": trajectory.theory,
+        "completed_ionic_steps": trajectory.completed_ionic_steps,
+        "incomplete_electronic_iteration_count": trajectory.incomplete_electronic_iteration_count,
+        "final_electronic_iteration_count": trajectory.final_electronic_iteration_count,
+        "converged_electronic": trajectory.converged_electronic,
+        "converged_ionic": trajectory.converged_ionic,
+    }
+    for key in _DIAGNOSE_CRITERIA_KEYS:
+        if key in trajectory.criteria:
+            features[key] = trajectory.criteria[key]
+    if final_iteration is not None:
+        for key, attribute in (
+            ("final_dE", "dE"),
+            ("final_deps", "deps"),
+            ("final_rms", "rms"),
+            ("final_rms_c", "rms_c"),
+        ):
+            value = getattr(final_iteration, attribute)
+            if value is not None:
+                features[key] = value
+    if final_step is not None and final_step.max_force is not None:
+        features["final_max_force"] = final_step.max_force
+    return {
+        key: _json_safe_value(value)
+        for key, value in features.items()
+        if value is not None
+    }
+
+
+def _stage_uses_ionic_progress(trajectory: StageTrajectoryObservation) -> bool:
+    stage_type = (trajectory.stage_type or "").lower()
+    if any(term in stage_type for term in ("relax", "optimisation", "optimization")):
+        return True
+    nsw = _int_or_none(trajectory.criteria.get("NSW"))
+    return nsw is not None and nsw > 0
+
+
+def _final_completed_electronic_cycle(
+    trajectory: StageTrajectoryObservation,
+) -> ElectronicCycleObservation | None:
+    completed = [cycle for cycle in trajectory.electronic_cycles if cycle.completed_ionic_step]
+    if completed:
+        return completed[-1]
+    if (
+        trajectory.incomplete_electronic_iteration_count is None
+        and trajectory.recent_electronic_iterations
+        and trajectory.final_electronic_iteration_count is not None
+    ):
+        return ElectronicCycleObservation(
+            cycle_index=max(1, trajectory.completed_ionic_steps or 1),
+            completed_ionic_step=True,
+            iterations=trajectory.final_electronic_iteration_count,
+            final_iteration=trajectory.recent_electronic_iterations[-1],
+        )
+    return None
+
+
+def _final_observed_electronic_iteration(
+    trajectory: StageTrajectoryObservation,
+) -> ElectronicIterationObservation | None:
+    if trajectory.incomplete_electronic_iteration_count is not None:
+        recent = trajectory.recent_incomplete_electronic_iterations
+    else:
+        recent = trajectory.recent_electronic_iterations
+    return recent[-1] if recent else None
+
+
+def _electronic_iteration_reaches_ediff(
+    iteration: ElectronicIterationObservation | None,
+    ediff: float | None,
+) -> bool | None:
+    if iteration is None or ediff is None:
+        return None
+    values = [
+        abs(value)
+        for value in (iteration.dE, iteration.deps)
+        if value is not None
+    ]
+    if not values:
+        return None
+    return any(value <= ediff for value in values)
+
+
+def _completed_electronic_cycle_below_nelm(
+    trajectory: StageTrajectoryObservation,
+) -> bool:
+    nelm = _positive_int(trajectory.criteria.get("NELM"))
+    if nelm is None:
+        return False
+    completed_cycles = [cycle for cycle in trajectory.electronic_cycles if cycle.completed_ionic_step]
+    if completed_cycles:
+        return any(cycle.iterations < nelm for cycle in completed_cycles)
+    counts = trajectory.electronic_iterations_by_completed_ionic_step
+    return any(count < nelm for count in counts)
+
+
+def _final_ionic_step(trajectory: StageTrajectoryObservation) -> IonicStepObservation | None:
+    if trajectory.ionic_steps:
+        return trajectory.ionic_steps[-1]
+    if trajectory.recent_ionic_steps:
+        return trajectory.recent_ionic_steps[-1]
+    return None
+
+
+def _positive_float(value: Any) -> float | None:
+    numeric = _float_or_none(value)
+    return numeric if numeric is not None and numeric > 0 else None
+
+
+def _positive_int(value: Any) -> int | None:
+    numeric = _int_or_none(value)
+    return numeric if numeric is not None and numeric > 0 else None
 
 
 def build_run_comparison(
@@ -903,7 +1413,7 @@ def _observe_stage_trajectory(
     )
     oszicar_present = remote_file_exists(ssh_host, oszicar_path, runner=runner, timeout=timeout)
     oszicar_error = None
-    oszicar_trajectory = _OszicarTrajectory(None, (), None, (), ())
+    oszicar_trajectory = _OszicarTrajectory(None, (), (), None, (), (), ())
     if oszicar_present:
         try:
             oszicar_trajectory = parse_oszicar_trajectory(
@@ -930,10 +1440,11 @@ def _observe_stage_trajectory(
     if not vasprun.present:
         unavailable.append("vasprun.xml is unavailable")
 
-    recent_ionic_steps = _merge_recent_max_forces(
-        oszicar_trajectory.recent_ionic_steps,
-        vasprun.recent_max_forces,
+    ionic_steps = _merge_max_forces(
+        oszicar_trajectory.ionic_steps,
+        vasprun.max_forces,
     )
+    recent_ionic_steps = tuple(ionic_steps[-_DIAGNOSE_RECENT_WINDOW:])
     criteria, criteria_sources, criteria_discrepancies = _trajectory_criteria(
         binding.stage_index,
         executed_inputs,
@@ -958,6 +1469,7 @@ def _observe_stage_trajectory(
         criteria_discrepancies=criteria_discrepancies,
         ionic_steps_observed=oszicar_trajectory.ionic_steps_observed,
         electronic_iterations_by_ionic_step=oszicar_trajectory.electronic_iterations_by_ionic_step,
+        electronic_cycles=oszicar_trajectory.electronic_cycles,
         final_electronic_iteration_count=oszicar_trajectory.final_electronic_iteration_count,
         recent_electronic_iterations=oszicar_trajectory.recent_electronic_iterations,
         completed_ionic_steps=oszicar_trajectory.completed_ionic_steps,
@@ -970,6 +1482,7 @@ def _observe_stage_trajectory(
         recent_incomplete_electronic_iterations=(
             oszicar_trajectory.recent_incomplete_electronic_iterations
         ),
+        ionic_steps=ionic_steps,
         recent_ionic_steps=recent_ionic_steps,
         vasprun_ionic_steps=vasprun.ionic_steps,
         converged_electronic=vasprun.converged_electronic,
@@ -1003,6 +1516,11 @@ def parse_oszicar_trajectory(contents: bytes | str) -> _OszicarTrajectory:
     incomplete_electronic_steps = electronic_steps[completed_ionic_steps:]
     incomplete_algorithm_steps = algorithm_steps[completed_ionic_steps:]
     final_electronic_steps = tuple(electronic_steps[-1]) if electronic_steps else ()
+    electronic_cycles = _electronic_cycle_observations(
+        electronic_steps,
+        algorithm_steps,
+        completed_ionic_steps,
+    )
     recent_electronic = _recent_electronic_iterations(
         final_electronic_steps,
         algorithm_steps[-1] if algorithm_steps else (),
@@ -1012,13 +1530,16 @@ def parse_oszicar_trajectory(contents: bytes | str) -> _OszicarTrajectory:
         incomplete_cycle,
         incomplete_algorithm_steps[-1] if incomplete_algorithm_steps else (),
     )
-    recent_ionic = _recent_ionic_steps(ionic_steps, electronic_steps)
+    ionic_step_observations = _ionic_step_observations(ionic_steps, electronic_steps)
+    recent_ionic = tuple(ionic_step_observations[-_DIAGNOSE_RECENT_WINDOW:])
 
     return _OszicarTrajectory(
         ionic_steps_observed=len(ionic_steps),
         electronic_iterations_by_ionic_step=tuple(len(step) for step in electronic_steps),
+        electronic_cycles=electronic_cycles,
         final_electronic_iteration_count=len(final_electronic_steps) if final_electronic_steps else None,
         recent_electronic_iterations=recent_electronic,
+        ionic_steps=ionic_step_observations,
         recent_ionic_steps=recent_ionic,
         completed_ionic_steps=completed_ionic_steps,
         electronic_iterations_by_completed_ionic_step=tuple(
@@ -1049,6 +1570,30 @@ def _oszicar_algorithms(text: str) -> tuple[tuple[str | None, ...], ...]:
     return tuple(tuple(group) for group in groups)
 
 
+def _electronic_cycle_observations(
+    electronic_steps: Sequence[Sequence[Mapping[str, Any]]],
+    algorithm_steps: Sequence[Sequence[str | None]],
+    completed_ionic_steps: int,
+) -> tuple[ElectronicCycleObservation, ...]:
+    observations: list[ElectronicCycleObservation] = []
+    for index, steps in enumerate(electronic_steps, start=1):
+        step_tuple = tuple(steps)
+        algorithms = algorithm_steps[index - 1] if index - 1 < len(algorithm_steps) else ()
+        final_iteration = None
+        if step_tuple:
+            recent = _recent_electronic_iterations(step_tuple[-1:], algorithms[-1:] if algorithms else ())
+            final_iteration = recent[-1] if recent else None
+        observations.append(
+            ElectronicCycleObservation(
+                cycle_index=index,
+                completed_ionic_step=index <= completed_ionic_steps,
+                iterations=len(step_tuple),
+                final_iteration=final_iteration,
+            )
+        )
+    return tuple(observations)
+
+
 def _recent_electronic_iterations(
     electronic_steps: Sequence[Mapping[str, Any]],
     algorithms: Sequence[str | None],
@@ -1070,13 +1615,12 @@ def _recent_electronic_iterations(
     return tuple(observations)
 
 
-def _recent_ionic_steps(
+def _ionic_step_observations(
     ionic_steps: Sequence[Mapping[str, Any]],
     electronic_steps: Sequence[Sequence[Mapping[str, Any]]],
 ) -> tuple[IonicStepObservation, ...]:
-    offset = max(0, len(ionic_steps) - _DIAGNOSE_RECENT_WINDOW)
     observations: list[IonicStepObservation] = []
-    for index, step in enumerate(ionic_steps[offset:], start=offset + 1):
+    for index, step in enumerate(ionic_steps, start=1):
         electronic_index = index - 1
         observations.append(
             IonicStepObservation(
@@ -1155,7 +1699,7 @@ def _observe_vasprun_trajectory(
                     getattr(vasprun, "converged_electronic", None)
                 )
                 converged_ionic = _bool_or_none(getattr(vasprun, "converged_ionic", None))
-                recent_max_forces = _recent_max_forces(ionic_steps)
+                max_forces = _max_forces_by_step(ionic_steps)
         finally:
             temporary_path.unlink(missing_ok=True)
     except Exception:
@@ -1172,7 +1716,7 @@ def _observe_vasprun_trajectory(
         ionic_steps=len(ionic_steps),
         converged_electronic=converged_electronic,
         converged_ionic=converged_ionic,
-        recent_max_forces=recent_max_forces,
+        max_forces=max_forces,
     )
 
 
@@ -1183,10 +1727,9 @@ def _has_malformed_xml_warning(caught_warnings: Sequence[warnings.WarningMessage
     )
 
 
-def _recent_max_forces(ionic_steps: Sequence[Mapping[str, Any]]) -> Mapping[int, float]:
-    offset = max(0, len(ionic_steps) - _DIAGNOSE_RECENT_WINDOW)
+def _max_forces_by_step(ionic_steps: Sequence[Mapping[str, Any]]) -> Mapping[int, float]:
     values: dict[int, float] = {}
-    for step_index, step in enumerate(ionic_steps[offset:], start=offset + 1):
+    for step_index, step in enumerate(ionic_steps, start=1):
         max_force = _max_force(step.get("forces"))
         if max_force is not None:
             values[step_index] = _round_float(max_force) or max_force
@@ -1204,7 +1747,7 @@ def _max_force(forces: Any) -> float | None:
     return max(maxima) if maxima else None
 
 
-def _merge_recent_max_forces(
+def _merge_max_forces(
     ionic_steps: Sequence[IonicStepObservation],
     max_forces: Mapping[int, float],
 ) -> tuple[IonicStepObservation, ...]:

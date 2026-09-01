@@ -15,14 +15,22 @@ from bmd_agent.config import ResourceRegistry, SlurmClusterResource
 from bmd_agent.resources.run import (
     AGENT_COMPARISON,
     ARTIFACT_OBSERVATION,
+    CONVERGED,
+    EVIDENCE_OF_PROGRESS,
     EXECUTED_INPUT,
+    INSUFFICIENT_EVIDENCE,
     LOG_OBSERVATION,
+    NO_CLEAR_EVIDENCE_OF_PROGRESS,
     PYMATGEN_DERIVED,
     AttemptStateObservation,
     ComparisonObservation,
+    ConvergenceProgressAssessment,
+    ElectronicCycleObservation,
+    ElectronicIterationObservation,
     IncarObservation,
     InitialStructureObservation,
     InputExpectationObservation,
+    IonicStepObservation,
     LogRuntimeObservation,
     PathObservation,
     RunDiagnosis,
@@ -34,6 +42,7 @@ from bmd_agent.resources.run import (
     StructureObservation,
     TRAJECTORY_OBSERVATION,
     WorkflowStage,
+    assess_convergence_progress,
     build_run_comparison,
     compare_remote_runs,
     compare_requested_options_to_executed_inputs,
@@ -81,6 +90,94 @@ def oszicar_incomplete_cycle(iterations: int = 25) -> bytes:
             "-1.00000E-03   10   1.000E-01   2.000E-02"
         )
     return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def trajectory_observation(
+    *,
+    stage_type: str = "relax",
+    criteria: dict[str, object] | None = None,
+    completed_ionic_steps: int | None = None,
+    electronic_iterations: tuple[int, ...] = (),
+    electronic_cycles: tuple[ElectronicCycleObservation, ...] = (),
+    incomplete_electronic_iteration_count: int | None = None,
+    recent_incomplete: tuple[ElectronicIterationObservation, ...] = (),
+    ionic_steps: tuple[IonicStepObservation, ...] = (),
+    converged_electronic: bool | None = None,
+    converged_ionic: bool | None = None,
+    oszicar_present: bool = True,
+    oszicar_error: str | None = None,
+    vasprun_present: bool = True,
+    vasprun_error: str | None = None,
+) -> StageTrajectoryObservation:
+    recent_electronic = (
+        (electronic_cycles[-1].final_iteration,)
+        if electronic_cycles and electronic_cycles[-1].final_iteration is not None
+        else ()
+    )
+    return StageTrajectoryObservation(
+        stage_index=1,
+        stage_label="result_dir",
+        stage_type=stage_type,
+        theory="pbe",
+        directory=FLOW_ROOT,
+        oszicar_path=f"{FLOW_ROOT}/OSZICAR",
+        oszicar_present=oszicar_present,
+        oszicar_error=oszicar_error,
+        vasprun_path=f"{FLOW_ROOT}/vasprun.xml",
+        vasprun_present=vasprun_present,
+        vasprun_error=vasprun_error,
+        criteria=criteria or {},
+        ionic_steps_observed=completed_ionic_steps,
+        electronic_iterations_by_ionic_step=electronic_iterations,
+        electronic_cycles=electronic_cycles,
+        final_electronic_iteration_count=(
+            electronic_iterations[-1] if electronic_iterations else None
+        ),
+        recent_electronic_iterations=recent_electronic,
+        completed_ionic_steps=completed_ionic_steps,
+        electronic_iterations_by_completed_ionic_step=electronic_iterations[
+            : completed_ionic_steps or 0
+        ],
+        incomplete_electronic_iteration_count=incomplete_electronic_iteration_count,
+        recent_incomplete_electronic_iterations=recent_incomplete,
+        ionic_steps=ionic_steps,
+        recent_ionic_steps=ionic_steps[-5:],
+        vasprun_ionic_steps=completed_ionic_steps,
+        converged_electronic=converged_electronic,
+        converged_ionic=converged_ionic,
+    )
+
+
+def electronic_cycle(
+    cycle_index: int,
+    iterations: int,
+    *,
+    completed: bool = True,
+    dE: float | None = None,
+    deps: float | None = None,
+) -> ElectronicCycleObservation:
+    return ElectronicCycleObservation(
+        cycle_index=cycle_index,
+        completed_ionic_step=completed,
+        iterations=iterations,
+        final_iteration=ElectronicIterationObservation(
+            iteration=iterations,
+            algorithm="RMM",
+            energy=-10.0,
+            dE=dE,
+            deps=deps,
+        ),
+    )
+
+
+def assessment_by_scope(
+    assessments: tuple[ConvergenceProgressAssessment, ...],
+    scope: str,
+) -> ConvergenceProgressAssessment:
+    for assessment in assessments:
+        if assessment.scope == scope:
+            return assessment
+    raise AssertionError(f"missing {scope} assessment")
 
 
 class RemoteFixture:
@@ -585,8 +682,11 @@ def test_parse_oszicar_trajectory_preserves_electronic_and_ionic_evidence() -> N
     assert trajectory.completed_ionic_steps == 2
     assert trajectory.electronic_iterations_by_ionic_step == (2, 2)
     assert trajectory.electronic_iterations_by_completed_ionic_step == (2, 2)
+    assert [cycle.iterations for cycle in trajectory.electronic_cycles] == [2, 2]
+    assert all(cycle.completed_ionic_step for cycle in trajectory.electronic_cycles)
     assert trajectory.incomplete_electronic_iteration_count is None
     assert trajectory.final_electronic_iteration_count == 2
+    assert [step.step_index for step in trajectory.ionic_steps] == [1, 2]
     assert trajectory.recent_electronic_iterations[-1].algorithm == "RMM"
     assert trajectory.recent_electronic_iterations[-1].iteration == 2
     assert trajectory.recent_electronic_iterations[-1].energy == -12.1
@@ -785,6 +885,243 @@ def test_diagnose_malformed_vasprun_keeps_oszicar_evidence_and_quiet_cli(
     assert "vasprun trajectory enrichment unavailable: file could not be parsed completely" in captured.out
     assert "list index out of range" not in captured.out
     assert "XML is malformed" not in captured.out
+
+
+def test_convergence_progress_assessment_reports_converged_static() -> None:
+    trajectory = trajectory_observation(
+        stage_type="static",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 0},
+        completed_ionic_steps=1,
+        electronic_iterations=(8,),
+        electronic_cycles=(electronic_cycle(1, 8, dE=1e-7),),
+        converged_electronic=True,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert assessment_by_scope(assessments, "electronic").label == CONVERGED
+    stage = assessment_by_scope(assessments, "stage")
+    assert stage.label == CONVERGED
+    assert stage.evidence_type == "convergence_progress_assessment"
+    assert all(assessment.scope != "ionic" for assessment in assessments)
+
+
+def test_convergence_progress_assessment_reports_converged_relaxation() -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 200, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01},
+        completed_ionic_steps=65,
+        electronic_iterations=(12,) * 65,
+        electronic_cycles=tuple(
+            electronic_cycle(index, 12, dE=1e-7)
+            for index in range(1, 66)
+        ),
+        ionic_steps=(IonicStepObservation(65, 12, -100.0, -99.9, -0.01, 0.009465),),
+        converged_electronic=True,
+        converged_ionic=True,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert assessment_by_scope(assessments, "electronic").label == CONVERGED
+    assert assessment_by_scope(assessments, "ionic").label == CONVERGED
+    assert assessment_by_scope(assessments, "stage").label == CONVERGED
+    assert assessment_by_scope(assessments, "stage").features["completed_ionic_steps"] == 65
+
+
+def test_convergence_progress_assessment_can_use_reached_configured_criteria() -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01},
+        completed_ionic_steps=3,
+        electronic_iterations=(8, 8, 8),
+        electronic_cycles=(
+            electronic_cycle(1, 8, dE=1e-7),
+            electronic_cycle(2, 8, dE=1e-7),
+            electronic_cycle(3, 8, dE=1e-7),
+        ),
+        ionic_steps=(IonicStepObservation(3, 8, -10.1, -10.0, -0.01, 0.009),),
+        converged_electronic=None,
+        converged_ionic=None,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert assessment_by_scope(assessments, "electronic").label == CONVERGED
+    assert assessment_by_scope(assessments, "ionic").label == CONVERGED
+    assert assessment_by_scope(assessments, "stage").label == CONVERGED
+
+
+@pytest.mark.parametrize("iterations", [25, 17])
+def test_convergence_progress_assessment_timeout_first_scf_is_insufficient(
+    iterations: int,
+) -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 200, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01},
+        completed_ionic_steps=0,
+        electronic_iterations=(iterations,),
+        electronic_cycles=(
+            electronic_cycle(iterations, iterations, completed=False, dE=-1e-3),
+        ),
+        incomplete_electronic_iteration_count=iterations,
+        recent_incomplete=(
+            ElectronicIterationObservation(iterations, "DAV", -10.0, -1e-3, -1e-4, 0.1, 0.02),
+        ),
+        converged_electronic=None,
+        converged_ionic=None,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert assessment_by_scope(assessments, "electronic").label == INSUFFICIENT_EVIDENCE
+    assert assessment_by_scope(assessments, "ionic").label == INSUFFICIENT_EVIDENCE
+    stage = assessment_by_scope(assessments, "stage")
+    assert stage.label == INSUFFICIENT_EVIDENCE
+    assert "incomplete first SCF cycle" in " ".join(stage.limitations)
+    assert all(assessment.label != NO_CLEAR_EVIDENCE_OF_PROGRESS for assessment in assessments)
+
+
+def test_convergence_progress_assessment_missing_oszicar_is_insufficient() -> None:
+    trajectory = trajectory_observation(
+        stage_type="static",
+        criteria={"NELM": 60, "EDIFF": 1e-6},
+        completed_ionic_steps=None,
+        oszicar_present=False,
+        vasprun_present=False,
+    )
+
+    electronic = assessment_by_scope(
+        assess_convergence_progress((trajectory,)),
+        "electronic",
+    )
+
+    assert electronic.label == INSUFFICIENT_EVIDENCE
+    assert "OSZICAR trajectory unavailable" in electronic.limitations
+
+
+def test_convergence_progress_assessment_malformed_vasprun_keeps_oszicar_basis() -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01},
+        completed_ionic_steps=2,
+        electronic_iterations=(8, 9),
+        electronic_cycles=(
+            electronic_cycle(1, 8, dE=1e-5),
+            electronic_cycle(2, 9, dE=1e-5),
+        ),
+        ionic_steps=(IonicStepObservation(1, 8, -10.0), IonicStepObservation(2, 9, -10.2)),
+        vasprun_error="file could not be parsed completely",
+        converged_electronic=None,
+        converged_ionic=None,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert assessment_by_scope(assessments, "electronic").label == EVIDENCE_OF_PROGRESS
+    ionic = assessment_by_scope(assessments, "ionic")
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert "maximum force evidence unavailable" in ionic.limitations
+
+
+def test_convergence_progress_assessment_missing_criteria_is_insufficient() -> None:
+    trajectory = trajectory_observation(
+        stage_type="static",
+        criteria={},
+        completed_ionic_steps=1,
+        electronic_iterations=(8,),
+        electronic_cycles=(electronic_cycle(1, 8, dE=1e-7),),
+        converged_electronic=None,
+    )
+
+    electronic = assessment_by_scope(
+        assess_convergence_progress((trajectory,)),
+        "electronic",
+    )
+
+    assert electronic.label == INSUFFICIENT_EVIDENCE
+    assert "EDIFF criterion unavailable" in electronic.limitations
+
+
+def test_convergence_progress_assessment_reports_partial_stage_progress() -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01},
+        completed_ionic_steps=2,
+        electronic_iterations=(8, 8),
+        electronic_cycles=(
+            electronic_cycle(1, 8, dE=1e-7),
+            electronic_cycle(2, 8, dE=1e-7),
+        ),
+        ionic_steps=(IonicStepObservation(2, 8, -10.1, -10.0, -0.1, 0.5),),
+        converged_electronic=True,
+        converged_ionic=False,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert assessment_by_scope(assessments, "electronic").label == CONVERGED
+    assert assessment_by_scope(assessments, "ionic").label == NO_CLEAR_EVIDENCE_OF_PROGRESS
+    stage = assessment_by_scope(assessments, "stage")
+    assert stage.label == EVIDENCE_OF_PROGRESS
+    assert "not all required stage scopes are converged" in stage.limitations
+
+
+def test_convergence_progress_assessment_preserves_contradictory_evidence() -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01},
+        completed_ionic_steps=2,
+        electronic_iterations=(8, 8),
+        electronic_cycles=(
+            electronic_cycle(1, 8, dE=1e-7),
+            electronic_cycle(2, 8, dE=1e-7),
+        ),
+        ionic_steps=(IonicStepObservation(2, 8, -10.1, -10.0, -0.1, 0.005),),
+        converged_electronic=True,
+        converged_ionic=False,
+    )
+
+    ionic = assessment_by_scope(
+        assess_convergence_progress((trajectory,)),
+        "ionic",
+    )
+
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert ionic.sufficiency == "contradictory"
+    assert "final maximum force reached EDIFFG" in " ".join(ionic.basis)
+    assert "converged_ionic=False" in " ".join(ionic.counter_evidence)
+
+
+def test_cli_prints_convergence_progress_assessment_without_prediction(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trajectory = trajectory_observation(
+        stage_type="static",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 0},
+        completed_ionic_steps=1,
+        electronic_iterations=(8,),
+        electronic_cycles=(electronic_cycle(1, 8, dE=1e-7),),
+        converged_electronic=True,
+    )
+    diagnosis = RunDiagnosis(
+        inspection=cli_run_inspection(
+            workflow_stages=(WorkflowStage(1, "static", "pbe", (), None),),
+            executed_inputs=(),
+        ),
+        termination=TerminationObservation(),
+        trajectories=(trajectory,),
+        assessments=assess_convergence_progress((trajectory,)),
+    )
+
+    cli.print_run_diagnosis(diagnosis)
+
+    captured = capsys.readouterr()
+    assert "Convergence-progress assessment (convergence_progress_assessment)" in captured.out
+    assert "based on observed trajectory evidence, not a prediction" in captured.out
+    assert "stage 1 (result_dir) electronic: CONVERGED" in captured.out
+    assert "will converge" not in captured.out.lower()
+    assert "more walltime" not in captured.out.lower()
 
 
 def test_diagnose_scheduler_timeout_is_evidence_not_prediction() -> None:

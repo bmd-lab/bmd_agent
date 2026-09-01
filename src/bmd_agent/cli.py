@@ -587,6 +587,8 @@ def print_run_diagnosis(diagnosis: RunDiagnosis) -> None:
         for item in trajectory.unavailable:
             print(f"    unavailable: {item}")
 
+    _print_convergence_progress_assessments(diagnosis)
+
 
 def print_run_comparison(
     comparison: RunComparison,
@@ -674,6 +676,46 @@ def _trajectory_heading(trajectory: object) -> str:
         prefix = f"{prefix}: {_display_theory(theory)} {_display_stage(stage_type)}"
     label = getattr(trajectory, "stage_label", None)
     return f"{prefix} ({label})" if label else prefix
+
+
+def _print_convergence_progress_assessments(diagnosis: RunDiagnosis) -> None:
+    print()
+    assessments = getattr(diagnosis, "assessments", ())
+    evidence_type = (
+        getattr(assessments[0], "evidence_type", "convergence_progress_assessment")
+        if assessments
+        else "convergence_progress_assessment"
+    )
+    print(f"Convergence-progress assessment ({evidence_type}):")
+    print("  based on observed trajectory evidence, not a prediction")
+    if not assessments:
+        print("  unavailable: no assessment was produced")
+        return
+    for assessment in assessments:
+        print(f"  {_assessment_heading(assessment)} {assessment.scope}: {assessment.label}")
+        print(f"    sufficiency: {assessment.sufficiency}")
+        if assessment.basis:
+            print("    basis:")
+            for item in assessment.basis:
+                print(f"      - {item}")
+        if assessment.counter_evidence:
+            print("    counter-evidence:")
+            for item in assessment.counter_evidence:
+                print(f"      - {item}")
+        if assessment.limitations:
+            print("    limitations:")
+            for item in assessment.limitations:
+                print(f"      - {item}")
+
+
+def _assessment_heading(assessment: object) -> str:
+    stage_index = getattr(assessment, "stage_index", None)
+    stage_label = getattr(assessment, "stage_label", None)
+    if stage_index is None:
+        prefix = "unindexed stage"
+    else:
+        prefix = f"stage {stage_index}"
+    return f"{prefix} ({stage_label})" if stage_label else prefix
 
 
 def _print_vasprun_trajectory_source(trajectory: object) -> None:
