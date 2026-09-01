@@ -20,6 +20,7 @@ from bmd_agent.resources.slurm import (
 )
 from bmd_agent.resources.vasp import (
     RemotePathError,
+    RemoteOutcarForceExtractionError,
     authorize_remote_path,
     build_remote_file_path,
     extract_remote_outcar_force_blocks,
@@ -87,7 +88,6 @@ _DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF")
 _OUTCAR_FORCE_EXTRACTION_SCHEMA = "bmd-agent-outcar-force-v1"
 _INCOMPLETE_VASPRUN_TRAJECTORY_REASON = "file could not be parsed completely"
 _UNREADABLE_VASPRUN_TRAJECTORY_REASON = "file could not be read"
-_UNREADABLE_OUTCAR_FORCE_REASON = "file could not be read"
 _PACKAGE_RE = re.compile(r"^\[runner\]\s+(\w+)\s+version:\s*(.+)$")
 _PYTHON_RE = re.compile(r"^\[runner\]\s+python:\s*(.+)$")
 _ENV_RE = re.compile(r"\b(PMG_VASP_PSP_DIR)=([^\s]+)")
@@ -361,6 +361,9 @@ class StageTrajectoryObservation:
     outcar_path: str | None = None
     outcar_present: bool = False
     outcar_error: str | None = None
+    outcar_failure_kind: str | None = None
+    outcar_failure_returncode: int | None = None
+    outcar_failure_detail: str | None = None
     outcar_expected_site_count: int | None = None
     outcar_force_blocks: tuple[OutcarForceBlockObservation, ...] = ()
     outcar_complete_force_blocks: int | None = None
@@ -480,6 +483,9 @@ class _OutcarForceTrajectory:
     present: bool
     path: str | None = None
     error: str | None = None
+    failure_kind: str | None = None
+    failure_returncode: int | None = None
+    failure_detail: str | None = None
     expected_site_count: int | None = None
     blocks: tuple[OutcarForceBlockObservation, ...] = ()
 
@@ -2037,6 +2043,9 @@ def _observe_stage_trajectory(
         outcar_path=outcar.path,
         outcar_present=outcar.present,
         outcar_error=outcar.error,
+        outcar_failure_kind=outcar.failure_kind,
+        outcar_failure_returncode=outcar.failure_returncode,
+        outcar_failure_detail=outcar.failure_detail,
         outcar_expected_site_count=outcar.expected_site_count,
         outcar_force_blocks=outcar.blocks,
         outcar_complete_force_blocks=(
@@ -2318,38 +2327,34 @@ def parse_outcar_force_extraction(
     *,
     source_path: str,
 ) -> tuple[OutcarForceBlockObservation, ...]:
-    """Validate compact JSON emitted by the fixed remote OUTCAR extractor."""
+    """Validate compact output emitted by the fixed remote OUTCAR extractor."""
 
     text = payload.decode("utf-8", "replace") if isinstance(payload, bytes) else payload
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RunInspectionError("OUTCAR force extraction returned malformed JSON") from exc
-    if not isinstance(data, Mapping):
-        raise RunInspectionError("OUTCAR force extraction returned a non-object payload")
-    if data.get("schema") != _OUTCAR_FORCE_EXTRACTION_SCHEMA:
-        raise RunInspectionError("OUTCAR force extraction returned an unsupported schema")
-    blocks = data.get("blocks")
-    if not isinstance(blocks, list):
-        raise RunInspectionError("OUTCAR force extraction returned invalid blocks")
-
+    rows = [line.split("\t") for line in text.splitlines() if line.strip()]
+    if not rows or rows[0] != ["schema", _OUTCAR_FORCE_EXTRACTION_SCHEMA]:
+        raise RunInspectionError("OUTCAR force extraction returned malformed output")
     observations: list[OutcarForceBlockObservation] = []
-    for item in blocks:
-        if not isinstance(item, Mapping):
-            raise RunInspectionError("OUTCAR force extraction returned invalid block records")
-        block_index = _int_or_none(item.get("block_index"))
-        row_count = _int_or_none(item.get("row_count"))
-        status = item.get("status")
-        complete = item.get("complete")
+    for row in rows[1:]:
+        if row[0:1] == ["expected_site_count"]:
+            if len(row) > 2:
+                raise RunInspectionError("OUTCAR force extraction returned malformed output")
+            continue
+        if len(row) != 6 or row[0] != "block":
+            raise RunInspectionError("OUTCAR force extraction returned malformed output")
+        block_index = _int_or_none(row[1])
+        row_count = _int_or_none(row[2])
+        status = row[3]
+        complete_int = _int_or_none(row[4])
         if block_index is None or block_index <= 0:
             raise RunInspectionError("OUTCAR force block has invalid block_index")
         if row_count is None or row_count < 0:
             raise RunInspectionError("OUTCAR force block has invalid row_count")
         if not isinstance(status, str) or not status:
             raise RunInspectionError("OUTCAR force block has invalid status")
-        if not isinstance(complete, bool):
+        if complete_int not in (0, 1):
             raise RunInspectionError("OUTCAR force block has invalid complete flag")
-        value = _float_or_none(item.get("max_force_eV_per_A"))
+        complete = complete_int == 1
+        value = _float_or_none(row[5])
         if complete and value is None:
             raise RunInspectionError("complete OUTCAR force block lacks max force")
         observations.append(
@@ -2397,20 +2402,39 @@ def _observe_outcar_force_trajectory(
             timeout=timeout,
         )
         blocks = parse_outcar_force_extraction(payload, source_path=str(path))
+    except RunInspectionError as exc:
+        return _OutcarForceTrajectory(
+            present=True,
+            path=str(path),
+            error=str(exc),
+            failure_kind="malformed_extractor_output",
+            expected_site_count=expected_site_count,
+        )
+    except RemoteOutcarForceExtractionError as exc:
+        return _OutcarForceTrajectory(
+            present=True,
+            path=str(path),
+            error=exc.public_message,
+            failure_kind=exc.kind,
+            failure_returncode=exc.returncode,
+            failure_detail=exc.stderr_summary,
+            expected_site_count=expected_site_count,
+        )
     except (
-        RunInspectionError,
-        subprocess.CalledProcessError,
         subprocess.TimeoutExpired,
         ValueError,
     ) as exc:
-        reason = _UNREADABLE_OUTCAR_FORCE_REASON if isinstance(
-            exc,
-            (subprocess.CalledProcessError, subprocess.TimeoutExpired),
-        ) else str(exc)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            reason = "extractor command timed out"
+            failure_kind = "timeout"
+        else:
+            reason = str(exc)
+            failure_kind = "extractor_invocation_error"
         return _OutcarForceTrajectory(
             present=True,
             path=str(path),
             error=reason,
+            failure_kind=failure_kind,
             expected_site_count=expected_site_count,
         )
 

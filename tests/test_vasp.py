@@ -5,6 +5,7 @@ import pytest
 
 from bmd_agent.resources.vasp import (
     RemotePathError,
+    RemoteOutcarForceExtractionError,
     authorize_remote_path,
     build_remote_outcar_force_command,
     build_remote_file_path,
@@ -176,21 +177,21 @@ def test_remote_file_size_uses_read_only_stat_command() -> None:
     ]
 
 
-def test_remote_outcar_force_extractor_uses_fixed_read_only_python_command() -> None:
+def test_remote_outcar_force_extractor_uses_fixed_read_only_awk_command() -> None:
     command = build_remote_outcar_force_command(
         PurePosixPath("/home/example/calculations/project with spaces/OUTCAR"),
         expected_site_count=24,
     )
 
     parts = command.split(" ")
-    assert parts[0:2] == ["python3", "-c"]
-    assert "--" in parts
+    assert parts[0:3] == ["awk", "-v", "expected=24"]
+    assert "\n" not in command
+    assert "python3" not in command
     assert "find " not in command
     assert "ls " not in command
     assert "cat " not in command
     assert "POTCAR" not in command
     assert "'/home/example/calculations/project with spaces/OUTCAR'" in command
-    assert command.endswith(" 24")
 
 
 def test_extract_remote_outcar_force_blocks_returns_compact_stdout() -> None:
@@ -201,7 +202,12 @@ def test_extract_remote_outcar_force_blocks_returns_compact_stdout() -> None:
         assert kwargs["capture_output"] is True
         assert kwargs["check"] is True
         assert kwargs["timeout"] == 20
-        return subprocess.CompletedProcess(command, 0, stdout=b'{"schema":"bmd-agent-outcar-force-v1","blocks":[]}', stderr=b"")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b"schema\tbmd-agent-outcar-force-v1\nexpected_site_count\t2\n",
+            stderr=b"",
+        )
 
     payload = extract_remote_outcar_force_blocks(
         "powerslurm-bmdguest",
@@ -210,11 +216,70 @@ def test_extract_remote_outcar_force_blocks_returns_compact_stdout() -> None:
         runner=runner,
     )
 
-    assert payload == '{"schema":"bmd-agent-outcar-force-v1","blocks":[]}'
+    assert payload == "schema\tbmd-agent-outcar-force-v1\nexpected_site_count\t2\n"
     assert len(calls) == 1
     assert calls[0][0:2] == ["ssh", "powerslurm-bmdguest"]
-    assert calls[0][2].startswith("python3 -c ")
-    assert " /home/example/calculations/run/OUTCAR 2" in calls[0][2]
+    assert calls[0][2].startswith("awk -v expected=2 ")
+    assert "\n" not in calls[0][2]
+    assert calls[0][2].endswith(" /home/example/calculations/run/OUTCAR")
+
+
+def test_extract_remote_outcar_force_blocks_classifies_remote_runtime_failure() -> None:
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.CalledProcessError(
+            127,
+            command,
+            stderr=b"sh: 1: awk: not found\n",
+        )
+
+    with pytest.raises(RemoteOutcarForceExtractionError) as exc_info:
+        extract_remote_outcar_force_blocks(
+            "powerslurm-bmdguest",
+            PurePosixPath("/home/example/calculations/run/OUTCAR"),
+            runner=runner,
+        )
+
+    assert exc_info.value.kind == "extractor_runtime_unavailable"
+    assert exc_info.value.returncode == 127
+    assert exc_info.value.public_message == "remote extractor runtime unavailable"
+
+
+def test_extract_remote_outcar_force_blocks_classifies_invocation_failure() -> None:
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.CalledProcessError(
+            2,
+            command,
+            stderr=b"sh: 1: Syntax error: Unterminated quoted string\n",
+        )
+
+    with pytest.raises(RemoteOutcarForceExtractionError) as exc_info:
+        extract_remote_outcar_force_blocks(
+            "powerslurm-bmdguest",
+            PurePosixPath("/home/example/calculations/run/OUTCAR"),
+            runner=runner,
+        )
+
+    assert exc_info.value.kind == "command_invocation_failed"
+    assert exc_info.value.public_message == "extractor command invocation failed"
+
+
+def test_extract_remote_outcar_force_blocks_classifies_outcar_read_failure() -> None:
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.CalledProcessError(
+            2,
+            command,
+            stderr=b"awk: cannot open /home/example/calculations/run/OUTCAR (Permission denied)\n",
+        )
+
+    with pytest.raises(RemoteOutcarForceExtractionError) as exc_info:
+        extract_remote_outcar_force_blocks(
+            "powerslurm-bmdguest",
+            PurePosixPath("/home/example/calculations/run/OUTCAR"),
+            runner=runner,
+        )
+
+    assert exc_info.value.kind == "outcar_read_failed"
+    assert exc_info.value.public_message == "file could not be read"
 
 
 def test_read_remote_structure_combines_authorized_retrieval_and_parsing() -> None:

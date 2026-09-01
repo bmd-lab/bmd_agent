@@ -964,6 +964,13 @@ def _print_outcar_force_source(trajectory: object) -> None:
             "      OUTCAR force trajectory unavailable: "
             f"{getattr(trajectory, 'outcar_error')}"
         )
+        failure_kind = getattr(trajectory, "outcar_failure_kind", None)
+        if failure_kind:
+            diagnostic = failure_kind
+            returncode = getattr(trajectory, "outcar_failure_returncode", None)
+            if returncode is not None:
+                diagnostic = f"{diagnostic}, exit {returncode}"
+            print(f"      OUTCAR extractor diagnostic: {diagnostic}")
     alignment_status = getattr(trajectory, "outcar_force_alignment_status", None)
     alignment_reason = getattr(trajectory, "outcar_force_alignment_reason", None)
     if alignment_status and alignment_reason:
@@ -1008,9 +1015,10 @@ def _format_ionic_step(step: object) -> str:
     ):
         value = getattr(step, attribute, None)
         if value is not None:
-            parts.append(f"{label}={value}")
-    if getattr(step, "max_force", None) is not None and getattr(step, "max_force_source", None):
-        parts.append(f"max_force_source={getattr(step, 'max_force_source')}")
+            if attribute == "max_force" and getattr(step, "max_force_source", None):
+                parts.append(f"{label}={value} [{getattr(step, 'max_force_source')}]")
+            else:
+                parts.append(f"{label}={value}")
     return " ".join(parts)
 
 

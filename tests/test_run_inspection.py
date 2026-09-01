@@ -56,6 +56,7 @@ from bmd_agent.resources.run import (
     parse_incar_contents,
     parse_oszicar_trajectory,
     parse_outcar_force_blocks,
+    parse_outcar_force_extraction,
     parse_vasp_output_files,
     run_label_from_provenance,
     vasp_reported_parameter_observations,
@@ -293,10 +294,11 @@ class RemoteFixture:
                 stderr=b"",
             )
 
-        if len(parts) >= 5 and parts[0] == "python3" and parts[1] == "-c" and parts[3] == "--":
+        if len(parts) >= 5 and parts[0] == "awk" and parts[1] == "-v":
             assert kwargs["check"] is True
+            expected_raw = parts[2].removeprefix("expected=")
+            expected = int(expected_raw) if expected_raw else None
             path = parts[4]
-            expected = int(parts[5]) if len(parts) > 5 else None
             if path not in self.files:
                 raise subprocess.CalledProcessError(1, command, stderr=b"missing")
             blocks = parse_outcar_force_blocks(
@@ -307,27 +309,37 @@ class RemoteFixture:
             return subprocess.CompletedProcess(
                 command,
                 0,
-                stdout=json.dumps(
-                    {
-                        "schema": "bmd-agent-outcar-force-v1",
-                        "expected_site_count": expected,
-                        "blocks": [
-                            {
-                                "block_index": block.block_index,
-                                "row_count": block.row_count,
-                                "status": block.status,
-                                "complete": block.complete,
-                                "max_force_eV_per_A": block.max_force_eV_per_A,
-                            }
-                            for block in blocks
-                        ],
-                    },
-                    separators=(",", ":"),
-                ).encode("utf-8"),
+                stdout=outcar_extractor_payload(blocks, expected_site_count=expected),
                 stderr=b"",
             )
 
         raise AssertionError(f"unexpected remote command: {remote_command}")
+
+
+def outcar_extractor_payload(
+    blocks: tuple[OutcarForceBlockObservation, ...],
+    *,
+    expected_site_count: int | None = None,
+) -> bytes:
+    lines = [
+        "schema\tbmd-agent-outcar-force-v1",
+        f"expected_site_count\t{expected_site_count or ''}",
+    ]
+    for block in blocks:
+        value = "" if block.max_force_eV_per_A is None else str(block.max_force_eV_per_A)
+        lines.append(
+            "\t".join(
+                (
+                    "block",
+                    str(block.block_index),
+                    str(block.row_count),
+                    block.status,
+                    "1" if block.complete else "0",
+                    value,
+                )
+            )
+        )
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def cluster() -> SlurmClusterResource:
@@ -1317,6 +1329,23 @@ def test_parse_outcar_force_blocks_validates_expected_site_count() -> None:
     assert all(block.complete is False for block in blocks)
 
 
+def test_parse_outcar_force_extraction_accepts_readable_zero_block_output() -> None:
+    blocks = parse_outcar_force_extraction(
+        b"schema\tbmd-agent-outcar-force-v1\nexpected_site_count\t24\n",
+        source_path=f"{FLOW_ROOT}/OUTCAR",
+    )
+
+    assert blocks == ()
+
+
+def test_parse_outcar_force_extraction_rejects_malformed_output() -> None:
+    with pytest.raises(RunInspectionError, match="malformed output"):
+        parse_outcar_force_extraction(
+            b"not-json-and-not-the-extractor-protocol\n",
+            source_path=f"{FLOW_ROOT}/OUTCAR",
+        )
+
+
 def test_diagnose_run_uses_producer_stage_dirs_for_oszicar_evidence() -> None:
     files = default_files(include_vasprun=False)
     files[f"{FLOW_ROOT}/producer-alpha/INCAR"] = b"NELM = 3\nEDIFF = 1E-6\nNSW = 1\nEDIFFG = -0.02\n"
@@ -1473,7 +1502,7 @@ def test_diagnose_outcar_force_blocks_align_with_oszicar_completed_steps() -> No
     assert trajectory.recent_ionic_steps[-1].max_force_source == "OUTCAR"
     remote_commands = " ".join(" ".join(command) for command in remote.commands)
     assert "cat -- /bmd-db/guest/flows/validation-run/OUTCAR" not in remote_commands
-    assert "python3 -c" in remote_commands
+    assert "awk -v expected=2" in remote_commands
     assert "find " not in remote_commands
     assert "POTCAR" not in remote_commands
 
@@ -1524,6 +1553,113 @@ def test_diagnose_outcar_count_disagreement_does_not_align_uncertain_forces() ->
     assert "OUTCAR force-block alignment discrepancy" in " ".join(trajectory.unavailable)
 
 
+def test_diagnose_readable_outcar_with_zero_force_blocks_is_not_transport_failure() -> None:
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nEDIFF = 1E-6\nNSW = 2\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files[f"{FLOW_ROOT}/OUTCAR"] = b"readable OUTCAR with no standard force table\n"
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.outcar_present is True
+    assert trajectory.outcar_error is None
+    assert trajectory.outcar_failure_kind is None
+    assert trajectory.outcar_complete_force_blocks == 0
+    assert trajectory.outcar_force_alignment_status == "unavailable"
+    assert "OUTCAR contained no standard force blocks" in " ".join(trajectory.unavailable)
+
+
+def test_diagnose_outcar_extractor_invocation_failure_preserves_kind(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailingExtractorRemote(RemoteFixture):
+        def __call__(
+            self,
+            command: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            remote_command = command[2]
+            if shlex.split(remote_command)[0:2] == ["awk", "-v"]:
+                raise subprocess.CalledProcessError(
+                    2,
+                    command,
+                    stderr=b"sh: 1: Syntax error: Unterminated quoted string\n",
+                )
+            return super().__call__(command, **kwargs)
+
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nEDIFF = 1E-6\nNSW = 2\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = FailingExtractorRemote(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.outcar_present is True
+    assert trajectory.outcar_error == "extractor command invocation failed"
+    assert trajectory.outcar_failure_kind == "command_invocation_failed"
+    assert trajectory.outcar_failure_returncode == 2
+    assert "Unterminated quoted string" in (trajectory.outcar_failure_detail or "")
+    assert all(step.max_force is None for step in trajectory.ionic_steps)
+
+    cli.print_run_diagnosis(diagnosis)
+
+    captured = capsys.readouterr()
+    assert "OUTCAR force trajectory unavailable: extractor command invocation failed" in captured.out
+    assert "OUTCAR extractor diagnostic: command_invocation_failed, exit 2" in captured.out
+    assert "Unterminated quoted string" not in captured.out
+
+
+def test_diagnose_malformed_outcar_extractor_output_is_distinct_from_read_failure() -> None:
+    class MalformedExtractorRemote(RemoteFixture):
+        def __call__(
+            self,
+            command: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            remote_command = command[2]
+            if shlex.split(remote_command)[0:2] == ["awk", "-v"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=b"this is not extractor output\n",
+                    stderr=b"",
+                )
+            return super().__call__(command, **kwargs)
+
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = MalformedExtractorRemote(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.outcar_present is True
+    assert trajectory.outcar_error == "OUTCAR force extraction returned malformed output"
+    assert trajectory.outcar_failure_kind == "malformed_extractor_output"
+    assert trajectory.outcar_failure_returncode is None
+
+
 def test_direct_vasp_outcar_force_extraction_uses_fixed_read_only_command() -> None:
     remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
 
@@ -1541,7 +1677,7 @@ def test_direct_vasp_outcar_force_extraction_uses_fixed_read_only_command() -> N
     assert trajectory.recent_ionic_steps[-1].max_force_source == "OUTCAR"
     commands = " ".join(" ".join(command) for command in remote.commands)
     assert "cat -- /bmd-db/guest/flows/direct-vasp/OUTCAR" not in commands
-    assert "python3 -c" in commands
+    assert "awk -v expected=2" in commands
     assert "find " not in commands
     assert "ls " not in commands
     assert "POTCAR" not in commands
@@ -2845,7 +2981,7 @@ def test_cli_prints_compact_outcar_force_evidence_without_full_history(
             -10.0 - index,
             -9.9 - index,
             -0.1,
-            0.1 * index,
+            round(0.1 * index, 1),
             "OUTCAR",
         )
         for index in range(1, 8)
@@ -2875,7 +3011,7 @@ def test_cli_prints_compact_outcar_force_evidence_without_full_history(
                 "complete",
                 True,
                 f"{FLOW_ROOT}/OUTCAR",
-                0.1 * index,
+                round(0.1 * index, 1),
             )
             for index in range(1, 8)
         ),
@@ -2895,7 +3031,7 @@ def test_cli_prints_compact_outcar_force_evidence_without_full_history(
     assert "ISIF: 2" in captured.out
     assert "step 3" in captured.out
     assert "step 7" in captured.out
-    assert "max_force_source=OUTCAR" in captured.out
+    assert "max_force=0.7 [OUTCAR]" in captured.out
     assert "step 1 electronic_iterations" not in captured.out
     assert "step 2 electronic_iterations" not in captured.out
 

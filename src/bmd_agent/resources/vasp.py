@@ -9,111 +9,47 @@ from pymatgen.io.vasp import Poscar
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
 
-_OUTCAR_FORCE_EXTRACTOR_SCRIPT = r"""
-import json
-import math
-import re
-import sys
-
-HEADER = re.compile(r"^\s*POSITION\s+TOTAL-FORCE\s+\(eV/Angst\)\s*$")
-SEPARATOR = re.compile(r"^\s*-{3,}\s*$")
-
-args = sys.argv[1:]
-if args and args[0] == "--":
-    args = args[1:]
-path = args[0]
-expected = int(args[1]) if len(args) > 1 else None
-blocks = []
-state = None
-index = 0
-rows = 0
-max_force = 0.0
-malformed = False
-
-
-def finish(status):
-    global state, rows, max_force, malformed
-    complete = status == "complete" and rows > 0 and not malformed
-    final_status = status
-    value = max_force if complete else None
-    if complete and expected is not None and rows != expected:
-        complete = False
-        final_status = "row_count_mismatch"
-        value = None
-    if malformed:
-        complete = False
-        final_status = "malformed"
-        value = None
-    blocks.append(
-        {
-            "block_index": index,
-            "row_count": rows,
-            "status": final_status,
-            "complete": complete,
-            "max_force_eV_per_A": value,
-        }
-    )
-    state = None
-    rows = 0
-    max_force = 0.0
-    malformed = False
-
-
-with open(path, encoding="utf-8", errors="replace") as handle:
-    for line in handle:
-        if HEADER.match(line):
-            if state is not None:
-                finish("incomplete")
-            index += 1
-            state = "await_separator"
-            rows = 0
-            max_force = 0.0
-            malformed = False
-            continue
-
-        if state is None:
-            continue
-
-        if SEPARATOR.match(line):
-            if state == "await_separator":
-                state = "rows"
-            else:
-                finish("complete")
-            continue
-
-        if not line.strip():
-            continue
-
-        if state == "await_separator":
-            state = "rows"
-            malformed = True
-
-        parts = line.split()
-        if len(parts) < 6:
-            malformed = True
-            continue
-        try:
-            fx, fy, fz = (float(value) for value in parts[3:6])
-        except Exception:
-            malformed = True
-            continue
-        rows += 1
-        max_force = max(max_force, math.sqrt(fx * fx + fy * fy + fz * fz))
-
-if state is not None:
-    finish("incomplete")
-
-print(
-    json.dumps(
-        {
-            "schema": "bmd-agent-outcar-force-v1",
-            "expected_site_count": expected,
-            "blocks": blocks,
-        },
-        separators=(",", ":"),
-    )
+_OUTCAR_FORCE_EXTRACTOR_AWK = (
+    'BEGIN{print "schema\\tbmd-agent-outcar-force-v1";'
+    'print "expected_site_count\\t" expected;'
+    'num="^[-+]?(([0-9]+([.][0-9]*)?)|([.][0-9]+))([Ee][-+]?[0-9]+)?$"}'
+    'function emit(status,complete,final_status,value){'
+    'complete=(status=="complete"&&rows>0&&malformed==0);'
+    'final_status=status;value="";'
+    'if(complete&&expected!=""&&rows!=expected+0){complete=0;final_status="row_count_mismatch"}'
+    'if(malformed){complete=0;final_status="malformed"}'
+    'if(complete){value=max_force}'
+    'printf("block\\t%d\\t%d\\t%s\\t%d\\t%s\\n",index,rows,final_status,complete,value);'
+    'state=0;rows=0;max_force=0;malformed=0}'
+    '/^[[:space:]]*POSITION[[:space:]]+TOTAL-FORCE[[:space:]]+\\(eV\\/Angst\\)[[:space:]]*$/{'
+    'if(state){emit("incomplete")}index++;state=1;rows=0;max_force=0;malformed=0;next}'
+    'state&&/^[[:space:]]*---[-]*[[:space:]]*$/{'
+    'if(state==1){state=2}else{emit("complete")}next}'
+    'state&&NF{'
+    'if(state==1){state=2;malformed=1}'
+    'if(NF<6||$4!~num||$5!~num||$6!~num){malformed=1;next}'
+    'fx=$4+0;fy=$5+0;fz=$6+0;rows++;force=sqrt(fx*fx+fy*fy+fz*fz);'
+    'if(force>max_force){max_force=force}next}'
+    'END{if(state){emit("incomplete")}}'
 )
-""".strip()
+
+
+class RemoteOutcarForceExtractionError(RuntimeError):
+    """Raised when the fixed remote OUTCAR extractor fails before valid output."""
+
+    def __init__(
+        self,
+        public_message: str,
+        *,
+        kind: str,
+        returncode: int | None = None,
+        stderr_summary: str | None = None,
+    ) -> None:
+        super().__init__(public_message)
+        self.public_message = public_message
+        self.kind = kind
+        self.returncode = returncode
+        self.stderr_summary = stderr_summary
 
 
 class RemotePathError(ValueError):
@@ -231,12 +167,15 @@ def extract_remote_outcar_force_blocks(
         remote_path,
         expected_site_count=expected_site_count,
     )
-    result = runner(
-        ["ssh", ssh_host, remote_command],
-        capture_output=True,
-        check=True,
-        timeout=timeout,
-    )
+    try:
+        result = runner(
+            ["ssh", ssh_host, remote_command],
+            capture_output=True,
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise _outcar_extraction_error(exc) from exc
 
     return result.stdout.decode("utf-8", "replace")
 
@@ -248,19 +187,65 @@ def build_remote_outcar_force_command(
 ) -> str:
     """Build the fixed read-only remote OUTCAR force extractor command."""
 
+    expected = "" if expected_site_count is None else str(expected_site_count)
     command = [
-        "python3",
-        "-c",
-        shlex.quote(_OUTCAR_FORCE_EXTRACTOR_SCRIPT),
-        "--",
+        "awk",
+        "-v",
+        "expected=" + expected,
+        shlex.quote(_OUTCAR_FORCE_EXTRACTOR_AWK),
         shlex.quote(str(remote_path)),
     ]
     if expected_site_count is not None:
         if expected_site_count <= 0:
             raise ValueError("expected site count must be positive")
-        command.append(str(expected_site_count))
 
     return " ".join(command)
+
+
+def _outcar_extraction_error(
+    exc: subprocess.CalledProcessError,
+) -> RemoteOutcarForceExtractionError:
+    stderr_summary = _stderr_summary(exc.stderr)
+    lower = (stderr_summary or "").lower()
+    kind = "remote_command_failed"
+    message = "extractor command failed"
+
+    if (
+        "cannot open" in lower
+        or "permission denied" in lower
+        or "no such file" in lower
+    ):
+        kind = "outcar_read_failed"
+        message = "file could not be read"
+    elif exc.returncode == 127 or "command not found" in lower or "awk: not found" in lower:
+        kind = "extractor_runtime_unavailable"
+        message = "remote extractor runtime unavailable"
+    elif (
+        "syntax error" in lower
+        or "unexpected eof" in lower
+        or "unterminated" in lower
+        or "unexpected token" in lower
+    ):
+        kind = "command_invocation_failed"
+        message = "extractor command invocation failed"
+
+    return RemoteOutcarForceExtractionError(
+        message,
+        kind=kind,
+        returncode=exc.returncode,
+        stderr_summary=stderr_summary,
+    )
+
+
+def _stderr_summary(stderr: bytes | str | None) -> str | None:
+    if stderr is None:
+        return None
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else stderr
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:240]
+    return None
 
 
 def remote_directory_exists(
