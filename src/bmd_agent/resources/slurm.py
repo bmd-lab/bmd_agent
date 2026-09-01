@@ -10,7 +10,31 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 _PARTITION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _JOB_ID_RE = re.compile(r"^\d+(?:_\d+)?(?:\.(?:batch|extern))?$")
 _SQUEUE_FORMAT = "%i|%u|%j|%t|%M|%R"
-_SACCT_FORMAT = "JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
+_SACCT_FIELDS = (
+    "JobIDRaw",
+    "JobName%30",
+    "User%20",
+    "Account%30",
+    "State",
+    "ExitCode",
+    "Elapsed",
+    "ElapsedRaw",
+    "Start",
+    "End",
+    "Partition%20",
+    "Timelimit%20",
+    "NodeList%80",
+    "NNodes",
+    "AllocCPUS",
+    "NTasks",
+    "ReqMem",
+    "ReqTRES%120",
+    "AllocTRES%120",
+    "TotalCPU",
+    "CPUTimeRAW",
+    "WorkDir%160",
+)
+_SACCT_FORMAT = ",".join(_SACCT_FIELDS)
 
 
 @dataclass
@@ -34,6 +58,19 @@ class SlurmAccountingRecord:
     partition: str
     exit_code: str
     timelimit: str | None = None
+    user: str | None = None
+    account: str | None = None
+    elapsed_raw: int | None = None
+    node_list: str | None = None
+    node_count: int | None = None
+    allocated_cpus: int | None = None
+    task_count: int | None = None
+    req_mem: str | None = None
+    req_tres: str | None = None
+    alloc_tres: str | None = None
+    total_cpu: str | None = None
+    cpu_time_raw: int | None = None
+    work_dir: str | None = None
 
 
 def get_queue(
@@ -170,17 +207,7 @@ def parse_sacct_output(job_id: str, output: str) -> SlurmAccountingRecord | None
         if len(parts) < 8 or parts[0].strip() not in wanted:
             continue
 
-        record = SlurmAccountingRecord(
-            job_id=normalize_job_id(parts[0].strip()),
-            name=parts[1].strip(),
-            state=parts[2].strip(),
-            elapsed=parts[3].strip(),
-            start=parts[4].strip(),
-            end=parts[5].strip(),
-            partition=parts[6].strip(),
-            exit_code=parts[7].strip(),
-            timelimit=parts[8].strip() if len(parts) > 8 and parts[8].strip() else None,
-        )
+        record = _parse_sacct_record(parts)
 
         if parts[0].strip() == normalized_job_id:
             return record
@@ -188,6 +215,63 @@ def parse_sacct_output(job_id: str, output: str) -> SlurmAccountingRecord | None
         fallback = fallback or record
 
     return fallback
+
+
+def _parse_sacct_record(parts: list[str]) -> SlurmAccountingRecord:
+    if len(parts) >= len(_SACCT_FIELDS):
+        return SlurmAccountingRecord(
+            job_id=normalize_job_id(parts[0].strip()),
+            name=_optional_part(parts, 1) or "",
+            user=_optional_part(parts, 2),
+            account=_optional_part(parts, 3),
+            state=_optional_part(parts, 4) or "",
+            exit_code=_optional_part(parts, 5) or "",
+            elapsed=_optional_part(parts, 6) or "",
+            elapsed_raw=_optional_int(parts, 7),
+            start=_optional_part(parts, 8) or "",
+            end=_optional_part(parts, 9) or "",
+            partition=_optional_part(parts, 10) or "",
+            timelimit=_optional_part(parts, 11),
+            node_list=_optional_part(parts, 12),
+            node_count=_optional_int(parts, 13),
+            allocated_cpus=_optional_int(parts, 14),
+            task_count=_optional_int(parts, 15),
+            req_mem=_optional_part(parts, 16),
+            req_tres=_optional_part(parts, 17),
+            alloc_tres=_optional_part(parts, 18),
+            total_cpu=_optional_part(parts, 19),
+            cpu_time_raw=_optional_int(parts, 20),
+            work_dir=_optional_part(parts, 21),
+        )
+
+    return SlurmAccountingRecord(
+        job_id=normalize_job_id(parts[0].strip()),
+        name=parts[1].strip(),
+        state=parts[2].strip(),
+        elapsed=parts[3].strip(),
+        start=parts[4].strip(),
+        end=parts[5].strip(),
+        partition=parts[6].strip(),
+        exit_code=parts[7].strip(),
+        timelimit=parts[8].strip() if len(parts) > 8 and parts[8].strip() else None,
+    )
+
+
+def _optional_part(parts: list[str], index: int) -> str | None:
+    if index >= len(parts):
+        return None
+    value = parts[index].strip()
+    return value or None
+
+
+def _optional_int(parts: list[str], index: int) -> int | None:
+    value = _optional_part(parts, index)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def normalize_job_id(job_id: str) -> str:

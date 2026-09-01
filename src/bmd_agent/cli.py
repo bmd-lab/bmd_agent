@@ -19,12 +19,14 @@ from bmd_agent.resources.compute import (
 from bmd_agent.resources.git import GitInspection, inspect_repository
 from bmd_agent.resources.run import (
     PRODUCER_REQUESTED,
+    JobInspection,
     RunDiagnosis,
     RunInspection,
     RunComparison,
     RunInspectionError,
     compare_remote_runs,
     diagnose_remote_run,
+    inspect_slurm_job,
     inspect_remote_run,
 )
 from bmd_agent.resources.slurm import get_queue
@@ -401,6 +403,117 @@ def show_diagnose_run(flow_root: str, registry: ResourceRegistry | None = None) 
     return 0
 
 
+def show_job(job_id: str, registry: ResourceRegistry | None = None) -> int:
+    """Display scheduler-bound evidence for one calculation job."""
+
+    registry = registry or load_resources()
+    cluster = powerslurm_cluster(registry)
+    modifier_policies, _ = modifier_policies_from_compute(registry)
+
+    print("BMD Job Inspection")
+    print("==================")
+    print()
+
+    try:
+        inspection = inspect_slurm_job(
+            cluster,
+            job_id,
+            modifier_policies=modifier_policies,
+        )
+
+    except ValueError as exc:
+        print(f"Unable to inspect job: {exc}")
+        return 2
+
+    except (RemotePathError, subprocess.TimeoutExpired, subprocess.CalledProcessError, RunInspectionError) as exc:
+        print(f"Unable to inspect job: {exc}")
+        return 1
+
+    print_job_inspection(inspection)
+    return 0
+
+
+def print_job_inspection(inspection: JobInspection) -> None:
+    """Print a concise student-oriented job inspection summary."""
+
+    print("Job (scheduler_observation):")
+    print(f"  ID: {_diagnosis_value(inspection.job_id)}")
+    record = inspection.scheduler
+    if record is None:
+        print(f"  unavailable: {inspection.scheduler_error or 'no scheduler accounting record found'}")
+    else:
+        _print_job_record(record)
+    print()
+
+    print("Calculation:")
+    print(f"  scheduler WorkDir: {_diagnosis_value(inspection.scheduler_work_dir)}")
+    print(f"  directory: {_diagnosis_value(inspection.calculation_directory)}")
+    print(f"  type: {inspection.calculation_type}")
+    if inspection.calculation_reason:
+        print(f"  reason: {inspection.calculation_reason}")
+    print()
+
+    if inspection.bmd_compute is not None:
+        print_run_diagnosis(inspection.bmd_compute)
+        return
+
+    if inspection.direct_vasp is None:
+        print("Producer provenance (producer_provenance):")
+        print("  unavailable")
+        print("  reason: no supported calculation evidence was identified")
+        return
+
+    direct = inspection.direct_vasp
+    print("Producer provenance (producer_provenance):")
+    print("  unavailable")
+    print(f"  reason: {direct.producer_reason}")
+    print()
+
+    print("Executed VASP inputs (executed_input):")
+    _print_executed_input_observations(direct.executed_inputs, ())
+    print()
+
+    print("Artifact observation (artifact_observation):")
+    for artifact in direct.artifacts:
+        print(f"  {artifact.label}: {_present_text(artifact)}")
+    print()
+
+    print("Independent parsing (pymatgen_derived):")
+    _print_scientific_result(direct.scientific)
+    print()
+
+    _print_trajectory_observations((direct.trajectory,))
+    _print_convergence_progress_assessment_values(direct.assessments)
+
+
+def _print_job_record(record: object) -> None:
+    for label, attribute in (
+        ("name", "name"),
+        ("user", "user"),
+        ("account", "account"),
+        ("state", "state"),
+        ("exit", "exit_code"),
+        ("node", "node_list"),
+        ("elapsed", "elapsed"),
+        ("elapsed raw seconds", "elapsed_raw"),
+        ("time limit", "timelimit"),
+        ("partition", "partition"),
+    ):
+        print(f"  {label}: {_diagnosis_value(getattr(record, attribute, None))}")
+    print("  resources:")
+    for label, attribute in (
+        ("nodes", "node_count"),
+        ("allocated CPUs", "allocated_cpus"),
+        ("tasks", "task_count"),
+        ("requested memory", "req_mem"),
+        ("ReqTRES", "req_tres"),
+        ("AllocTRES", "alloc_tres"),
+        ("total CPU", "total_cpu"),
+        ("CPUTimeRAW", "cpu_time_raw"),
+    ):
+        print(f"    {label}: {_diagnosis_value(getattr(record, attribute, None))}")
+
+
 def print_run_inspection(inspection: RunInspection) -> None:
     """Print a concise evidence-oriented run inspection summary."""
 
@@ -499,21 +612,7 @@ def print_run_inspection(inspection: RunInspection) -> None:
     print()
 
     print("Independent parsing (pymatgen_derived):")
-    scientific = inspection.scientific
-    if scientific.error:
-        print(f"  unavailable: {scientific.error}")
-    else:
-        _print_optional_value("final formula", scientific.final_formula)
-        if scientific.structure:
-            _print_structure_observation(scientific.structure)
-        _print_optional_value("final energy eV", scientific.final_energy_ev)
-        _print_optional_value("energy/atom eV", scientific.energy_per_atom_ev)
-        _print_optional_value("electronic convergence", scientific.electronic_convergence)
-        _print_optional_value("band gap eV", scientific.band_gap_ev)
-        _print_optional_value("band k-points", scientific.band_kpoints)
-        _print_optional_value("bands", scientific.bands)
-        for item in scientific.unavailable:
-            print(f"  unavailable: {item}")
+    _print_scientific_result(inspection.scientific)
     print()
 
     print("Comparison with durable producer result:")
@@ -562,30 +661,8 @@ def print_run_diagnosis(diagnosis: RunDiagnosis) -> None:
         print(f"  unavailable: {item}")
     print()
 
-    print("Trajectory evidence (trajectory_observation):")
-    if not diagnosis.trajectories:
-        print("  unavailable: no producer-bound VASP stage directories were available")
+    if not _print_trajectory_observations(diagnosis.trajectories):
         return
-
-    for trajectory in diagnosis.trajectories:
-        print(f"  {_trajectory_heading(trajectory)}:")
-        print(f"    directory: {trajectory.directory}")
-        print(
-            f"    OSZICAR: "
-            f"{'present' if trajectory.oszicar_present else 'unavailable'} "
-            f"({trajectory.oszicar_path})"
-        )
-        if trajectory.oszicar_error:
-            print(f"      error: {trajectory.oszicar_error}")
-        _print_vasprun_trajectory_source(trajectory)
-        _print_trajectory_criteria(trajectory)
-        _print_electronic_trajectory(trajectory)
-        _print_ionic_trajectory(trajectory)
-        print("    convergence flags:")
-        print(f"      electronic: {_diagnosis_value(trajectory.converged_electronic)}")
-        print(f"      ionic: {_diagnosis_value(trajectory.converged_ionic)}")
-        for item in trajectory.unavailable:
-            print(f"    unavailable: {item}")
 
     _print_convergence_progress_assessments(diagnosis)
 
@@ -672,15 +749,48 @@ def _trajectory_heading(trajectory: object) -> str:
         prefix = f"stage {stage_index}"
     theory = getattr(trajectory, "theory", None)
     stage_type = getattr(trajectory, "stage_type", None)
-    if theory and stage_type:
+    if stage_type == "direct_vasp":
+        prefix = f"{prefix}: Direct VASP calculation"
+    elif theory and stage_type:
         prefix = f"{prefix}: {_display_theory(theory)} {_display_stage(stage_type)}"
     label = getattr(trajectory, "stage_label", None)
     return f"{prefix} ({label})" if label else prefix
 
 
+def _print_trajectory_observations(trajectories: tuple[object, ...]) -> bool:
+    print("Trajectory evidence (trajectory_observation):")
+    if not trajectories:
+        print("  unavailable: no producer-bound VASP stage directories were available")
+        return False
+
+    for trajectory in trajectories:
+        print(f"  {_trajectory_heading(trajectory)}:")
+        print(f"    directory: {trajectory.directory}")
+        print(
+            f"    OSZICAR: "
+            f"{'present' if trajectory.oszicar_present else 'unavailable'} "
+            f"({trajectory.oszicar_path})"
+        )
+        if trajectory.oszicar_error:
+            print(f"      error: {trajectory.oszicar_error}")
+        _print_vasprun_trajectory_source(trajectory)
+        _print_trajectory_criteria(trajectory)
+        _print_electronic_trajectory(trajectory)
+        _print_ionic_trajectory(trajectory)
+        print("    convergence flags:")
+        print(f"      electronic: {_diagnosis_value(trajectory.converged_electronic)}")
+        print(f"      ionic: {_diagnosis_value(trajectory.converged_ionic)}")
+        for item in trajectory.unavailable:
+            print(f"    unavailable: {item}")
+    return True
+
+
 def _print_convergence_progress_assessments(diagnosis: RunDiagnosis) -> None:
     print()
-    assessments = getattr(diagnosis, "assessments", ())
+    _print_convergence_progress_assessment_values(getattr(diagnosis, "assessments", ()))
+
+
+def _print_convergence_progress_assessment_values(assessments: tuple[object, ...]) -> None:
     evidence_type = (
         getattr(assessments[0], "evidence_type", "convergence_progress_assessment")
         if assessments
@@ -937,6 +1047,13 @@ def main(argv: list[str] | None = None) -> int:
         if command == "queue":
             return show_queue()
 
+        if command == "job":
+            if len(argv) < 2:
+                print("Usage: bmd-agent job <SLURM_JOB_ID>")
+                return 2
+
+            return show_job(argv[1])
+
         if command == "compute":
             return show_compute()
 
@@ -973,6 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Available commands:")
     print("  status")
     print("  queue")
+    print("  job <SLURM_JOB_ID>")
     print("  compute")
     print("  structure <remote-directory>")
     print("  inspect-run <remote-flow-root>")
@@ -1058,6 +1176,24 @@ def _print_optional_value(label: str, value: object) -> None:
         print(f"  {label}: {value}")
 
 
+def _print_scientific_result(scientific: object) -> None:
+    if getattr(scientific, "error", None):
+        print(f"  unavailable: {getattr(scientific, 'error')}")
+        return
+    _print_optional_value("final formula", getattr(scientific, "final_formula", None))
+    structure = getattr(scientific, "structure", None)
+    if structure:
+        _print_structure_observation(structure)
+    _print_optional_value("final energy eV", getattr(scientific, "final_energy_ev", None))
+    _print_optional_value("energy/atom eV", getattr(scientific, "energy_per_atom_ev", None))
+    _print_optional_value("electronic convergence", getattr(scientific, "electronic_convergence", None))
+    _print_optional_value("band gap eV", getattr(scientific, "band_gap_ev", None))
+    _print_optional_value("band k-points", getattr(scientific, "band_kpoints", None))
+    _print_optional_value("bands", getattr(scientific, "bands", None))
+    for item in getattr(scientific, "unavailable", ()):
+        print(f"  unavailable: {item}")
+
+
 def _print_structure_observation(observation: object) -> None:
     print("  final structure:")
     _print_optional_nested_value("formula", getattr(observation, "formula", None))
@@ -1100,12 +1236,19 @@ def _flatten_options(options: Mapping[str, Any], prefix: str = "") -> list[tuple
 
 
 def _print_executed_input_summary(inspection: RunInspection) -> None:
-    groups = _executed_input_groups(inspection.executed_inputs)
+    _print_executed_input_observations(inspection.executed_inputs, inspection.workflow_stages)
+
+
+def _print_executed_input_observations(
+    executed_inputs: tuple[object, ...],
+    workflow_stages: tuple[object, ...],
+) -> None:
+    groups = _executed_input_groups(executed_inputs)
     if not groups:
         print("  unavailable: no executed-input observations were gathered")
         return
 
-    stages = {stage.index: stage for stage in inspection.workflow_stages}
+    stages = {getattr(stage, "index"): stage for stage in workflow_stages}
     for stage_index, observations in groups:
         print(f"  {_executed_stage_heading(stage_index, observations, stages)}:")
         for observation in observations:

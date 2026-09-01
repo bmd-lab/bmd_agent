@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 import shlex
@@ -31,6 +32,7 @@ from bmd_agent.resources.run import (
     InitialStructureObservation,
     InputExpectationObservation,
     IonicStepObservation,
+    JobInspection,
     LogRuntimeObservation,
     PathObservation,
     RunDiagnosis,
@@ -48,6 +50,7 @@ from bmd_agent.resources.run import (
     compare_requested_options_to_executed_inputs,
     diagnose_remote_run,
     inspect_remote_run,
+    inspect_slurm_job,
     parse_incar_contents,
     parse_oszicar_trajectory,
     parse_vasp_output_files,
@@ -59,8 +62,15 @@ from bmd_agent.resources.vasp import RemotePathError
 
 
 FLOW_ROOT = "/bmd-db/guest/flows/validation-run"
+DIRECT_DIR = "/bmd-db/guest/flows/direct-vasp"
 LOG_ROOT = "/bmd-db/guest/logs"
 RESULT_DIR = f"{FLOW_ROOT}/producer-delta"
+SACCT_FORMAT = (
+    "--format=JobIDRaw,JobName%30,User%20,Account%30,State,ExitCode,Elapsed,"
+    "ElapsedRaw,Start,End,Partition%20,Timelimit%20,NodeList%80,NNodes,"
+    "AllocCPUS,NTasks,ReqMem,ReqTRES%120,AllocTRES%120,TotalCPU,CPUTimeRAW,"
+    "WorkDir%160"
+)
 OSZICAR_TWO_STEP = b"""\
        N       E                     dE             d eps       ncg     rms          rms(c)
 DAV:   1   -1.000000000000E+01   -1.00000E+01   -1.00000E+01   10   1.000E+00   2.000E-01
@@ -483,7 +493,7 @@ def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedPr
         "powerslurm-bmdguest",
         (
             "sacct -X -P -n -j 20893681 "
-            "--format=JobIDRaw,JobName%30,State,Elapsed,Start,End,Partition%20,ExitCode,Timelimit%20"
+            f"{SACCT_FORMAT}"
         ),
     ]
     assert kwargs["capture_output"] is True
@@ -517,6 +527,441 @@ def fake_scientific_parser(
         band_kpoints=310,
         bands=24,
     )
+
+
+def fake_direct_scientific_parser(
+    local_paths: dict[str, Path],
+    display_paths: dict[str, str],
+    workflow_spec: dict,
+) -> ScientificResult:
+    assert set(local_paths).issubset({"contcar", "vasprun"})
+    assert "kpoints" not in local_paths
+    assert workflow_spec["stages"][0]["stage_type"] == "direct_vasp"
+    return ScientificResult(
+        source_paths=tuple(display_paths.values()),
+        final_formula="Example",
+        final_energy_ev=-10.0,
+        energy_per_atom_ev=-5.0,
+        electronic_convergence=True,
+        executed_parameters=(
+            IncarObservation(
+                "vasprun_xml.parameters",
+                display_paths.get("vasprun", f"{DIRECT_DIR}/vasprun.xml"),
+                True,
+                1,
+                source_type="vasprun_xml.parameters",
+                values={"NELM": 60, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01},
+            ),
+        ),
+    )
+
+
+def direct_vasp_files(
+    *,
+    include_vasprun: bool = True,
+    oszicar: bytes = OSZICAR_TWO_STEP,
+) -> dict[str, bytes]:
+    files = {
+        f"{DIRECT_DIR}/INCAR": b"NELM = 60\nEDIFF = 1E-6\nNSW = 99\nEDIFFG = -0.01\n",
+        f"{DIRECT_DIR}/POSCAR": b"poscar",
+        f"{DIRECT_DIR}/KPOINTS": b"kpoints",
+        f"{DIRECT_DIR}/OSZICAR": oszicar,
+        f"{DIRECT_DIR}/OUTCAR": b"outcar",
+        f"{DIRECT_DIR}/CONTCAR": b"contcar",
+    }
+    if include_vasprun:
+        files[f"{DIRECT_DIR}/vasprun.xml"] = b"<modeling/>"
+    return files
+
+
+def job_sacct_output(
+    *,
+    job_id: str = "20893681",
+    state: str = "COMPLETED",
+    work_dir: str | None = DIRECT_DIR,
+) -> str:
+    return (
+        f"{job_id}|direct-vasp|guest|power-leeburton-users_v2|{state}|0:0|06:00:20|"
+        "21620|2026-08-30T00:00:00|2026-08-30T06:00:20|leeburton-pool|"
+        "06:00:00|compute-0-269|1|24|24|128G|billing=24,cpu=24,mem=128G,node=1|"
+        "billing=24,cpu=24,mem=128G,node=1|120:00:00|518880|"
+        f"{work_dir or ''}\n"
+    )
+
+
+def job_slurm_runner(
+    *,
+    job_id: str = "20893681",
+    state: str = "COMPLETED",
+    work_dir: str | None = DIRECT_DIR,
+) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == [
+            "ssh",
+            "powerslurm-bmdguest",
+            f"sacct -X -P -n -j {job_id} {SACCT_FORMAT}",
+        ]
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        assert kwargs["check"] is True
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=job_sacct_output(job_id=job_id, state=state, work_dir=work_dir),
+            stderr="",
+        )
+
+    return runner
+
+
+def test_inspect_slurm_job_rejects_invalid_job_id_without_scheduler_or_remote_reads() -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+    slurm_calls = 0
+
+    def unused_slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal slurm_calls
+        slurm_calls += 1
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    with pytest.raises(ValueError, match="unsafe"):
+        inspect_slurm_job(
+            cluster(),
+            "20893681;scancel 1",
+            remote_runner=remote,
+            slurm_runner=unused_slurm_runner,
+            scientific_parser=fake_direct_scientific_parser,
+        )
+
+    assert slurm_calls == 0
+    assert remote.commands == []
+
+
+def test_inspect_slurm_job_reports_missing_workdir_without_remote_reads() -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(work_dir=None),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.scheduler is not None
+    assert inspection.scheduler.work_dir is None
+    assert inspection.scheduler_work_dir is None
+    assert inspection.calculation_directory is None
+    assert inspection.calculation_type == "unknown"
+    assert inspection.calculation_reason == "scheduler WorkDir was unavailable"
+    assert remote.commands == []
+
+
+def test_inspect_slurm_job_rejects_workdir_outside_allowed_roots_without_remote_reads() -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(work_dir="/etc/scratch-job"),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.scheduler_work_dir == "/etc/scratch-job"
+    assert inspection.calculation_directory is None
+    assert inspection.calculation_type == "unknown"
+    assert inspection.calculation_reason is not None
+    assert "scheduler WorkDir is not authorized" in inspection.calculation_reason
+    assert remote.commands == []
+
+
+def test_inspect_slurm_job_reports_unknown_directory_without_direct_vasp_markers() -> None:
+    files = {
+        f"{DIRECT_DIR}/INCAR": b"ENCUT = 520\n",
+        f"{DIRECT_DIR}/POSCAR": b"poscar",
+    }
+    remote = RemoteFixture(files=files, directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.calculation_directory is None
+    assert inspection.calculation_type == "unknown"
+    assert inspection.calculation_reason is not None
+    assert "direct VASP marker set was incomplete" in inspection.calculation_reason
+    assert "KPOINTS" in inspection.calculation_reason
+    remote_commands = " ".join(" ".join(command) for command in remote.commands)
+    assert "find " not in remote_commands
+    assert "ls " not in remote_commands
+    assert "POTCAR" not in remote_commands
+
+
+def test_inspect_slurm_job_identifies_direct_vasp_without_submission_json() -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.calculation_directory == DIRECT_DIR
+    assert inspection.calculation_type == "direct VASP"
+    assert inspection.bmd_compute is None
+    assert inspection.direct_vasp is not None
+    direct = inspection.direct_vasp
+    assert direct.producer_reason == "no BMD Compute producer record found"
+    artifacts = {artifact.label: artifact for artifact in direct.artifacts}
+    assert artifacts["incar"].present is True
+    assert artifacts["poscar"].present is True
+    assert artifacts["kpoints"].present is True
+    assert direct.scientific.final_formula == "Example"
+    assert {item.source_type for item in direct.executed_inputs} == {
+        "retained_incar",
+        "vasprun_xml.parameters",
+    }
+    assert direct.trajectory.stage_label == "work_dir"
+    assert direct.trajectory.stage_index == 1
+    assert direct.trajectory.completed_ionic_steps == 2
+    assert direct.assessments
+    remote_commands = " ".join(" ".join(command) for command in remote.commands)
+    assert "find " not in remote_commands
+    assert "ls " not in remote_commands
+    assert "POTCAR" not in remote_commands
+
+
+def test_inspect_slurm_job_can_identify_direct_vasp_with_invalid_submission_json() -> None:
+    files = direct_vasp_files()
+    files[f"{DIRECT_DIR}/submission.json"] = b"{not-json"
+    remote = RemoteFixture(files=files, directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.calculation_directory == DIRECT_DIR
+    assert inspection.calculation_type == "direct VASP"
+    assert inspection.direct_vasp is not None
+    assert "no valid BMD Compute producer record" in inspection.direct_vasp.producer_reason
+
+
+def test_inspect_slurm_job_delegates_bmd_compute_workdir_to_existing_diagnosis() -> None:
+    remote = RemoteFixture(files=default_files(), directories=default_directories())
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(work_dir=FLOW_ROOT),
+        scientific_parser=fake_direct_scientific_parser,
+        max_vasprun_bytes=0,
+    )
+
+    assert inspection.calculation_directory == FLOW_ROOT
+    assert inspection.calculation_type == "BMD Compute"
+    assert inspection.bmd_compute is not None
+    assert inspection.direct_vasp is None
+    assert inspection.bmd_compute.inspection.workflow_stages[0].stage_type == "relax"
+
+
+def test_direct_vasp_truncated_vasprun_keeps_oszicar_trajectory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def malformed_loader(*args: object, **kwargs: object) -> object:
+        warnings.warn(
+            "XML is malformed. Parsing has stopped but partial data is available.",
+            UserWarning,
+        )
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(run_resource, "_load_vasprun", malformed_loader)
+    remote = RemoteFixture(
+        files=direct_vasp_files(oszicar=oszicar_incomplete_cycle(25)),
+        directories={DIRECT_DIR},
+    )
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(state="TIMEOUT"),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.direct_vasp is not None
+    trajectory = inspection.direct_vasp.trajectory
+    assert trajectory.oszicar_present is True
+    assert trajectory.completed_ionic_steps == 0
+    assert trajectory.electronic_iterations_by_completed_ionic_step == ()
+    assert trajectory.incomplete_electronic_iteration_count == 25
+    assert trajectory.vasprun_present is True
+    assert trajectory.vasprun_error == "file could not be parsed completely"
+    assert "list index out of range" not in " ".join(trajectory.unavailable)
+    stage = assessment_by_scope(inspection.direct_vasp.assessments, "stage")
+    assert stage.label == INSUFFICIENT_EVIDENCE
+
+
+def test_direct_vasp_scientific_parsing_captures_malformed_vasprun_warning(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    with fake_pymatgen_modules(FakeMalformedVasprun), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        inspection = inspect_slurm_job(
+            cluster(),
+            "20893681",
+            remote_runner=remote,
+            slurm_runner=job_slurm_runner(state="TIMEOUT"),
+            scientific_parser=parse_vasp_output_files,
+        )
+
+    assert caught == []
+    assert inspection.direct_vasp is not None
+    scientific = inspection.direct_vasp.scientific
+    assert "vasprun.xml could not be parsed completely" in scientific.unavailable
+    assert "list index out of range" not in " ".join(scientific.unavailable)
+    assert "XML is malformed" not in " ".join(scientific.unavailable)
+    assert scientific.error is None
+
+    cli.print_job_inspection(inspection)
+
+    captured = capsys.readouterr()
+    assert "vasprun.xml could not be parsed completely" in captured.out
+    assert "file could not be parsed completely" in captured.out
+    assert "list index out of range" not in captured.out
+    assert "XML is malformed" not in captured.out
+
+
+def test_completed_direct_vasp_relaxation_reports_converged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTrajectoryVasprun:
+        parameters = {"NELM": 60, "EDIFF": 1e-06, "NSW": 2, "EDIFFG": -0.01}
+        converged_electronic = True
+        converged_ionic = True
+        ionic_steps = (
+            {"forces": ((0.0, 0.0, 0.008),)},
+            {"forces": ((0.0, 0.0, 0.004),)},
+        )
+
+    monkeypatch.setattr(run_resource, "_load_vasprun", lambda *args, **kwargs: FakeTrajectoryVasprun())
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.direct_vasp is not None
+    assessments = inspection.direct_vasp.assessments
+    assert assessment_by_scope(assessments, "electronic").label == CONVERGED
+    assert assessment_by_scope(assessments, "ionic").label == CONVERGED
+    assert assessment_by_scope(assessments, "stage").label == CONVERGED
+
+
+def test_cli_prints_direct_vasp_job_summary_without_prediction(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trajectory = StageTrajectoryObservation(
+        stage_index=1,
+        stage_label="work_dir",
+        stage_type="direct_vasp",
+        theory="unknown",
+        directory=DIRECT_DIR,
+        oszicar_path=f"{DIRECT_DIR}/OSZICAR",
+        oszicar_present=True,
+        vasprun_path=f"{DIRECT_DIR}/vasprun.xml",
+        vasprun_present=True,
+        criteria={"NELM": 60, "NSW": 1, "EDIFFG": -0.01},
+        completed_ionic_steps=1,
+        electronic_iterations_by_completed_ionic_step=(8,),
+        final_electronic_iteration_count=8,
+        recent_electronic_iterations=(
+            ElectronicIterationObservation(8, "DAV", -10.0, -1e-5, -1e-6),
+        ),
+        recent_ionic_steps=(IonicStepObservation(1, 8, -10.0, -9.99, -0.1, 0.005),),
+        converged_electronic=True,
+        converged_ionic=True,
+    )
+    assessments = assess_convergence_progress((trajectory,))
+    direct = run_resource.DirectVaspInspection(
+        directory=DIRECT_DIR,
+        artifacts=(
+            PathObservation("incar", f"{DIRECT_DIR}/INCAR", "file", True, ARTIFACT_OBSERVATION),
+            PathObservation("poscar", f"{DIRECT_DIR}/POSCAR", "file", True, ARTIFACT_OBSERVATION),
+            PathObservation("kpoints", f"{DIRECT_DIR}/KPOINTS", "file", True, ARTIFACT_OBSERVATION),
+            PathObservation("oszicar", f"{DIRECT_DIR}/OSZICAR", "file", True, ARTIFACT_OBSERVATION),
+        ),
+        executed_inputs=(
+            IncarObservation(
+                "work_dir",
+                f"{DIRECT_DIR}/INCAR",
+                True,
+                1,
+                values={"ENCUT": 520, "NSW": 1},
+            ),
+        ),
+        scientific=ScientificResult(
+            source_paths=(f"{DIRECT_DIR}/CONTCAR",),
+            final_formula="Example",
+            electronic_convergence=True,
+        ),
+        trajectory=trajectory,
+        assessments=assessments,
+    )
+    inspection = JobInspection(
+        job_id="20893681",
+        scheduler=SlurmAccountingRecord(
+            job_id="20893681",
+            name="direct-vasp",
+            state="COMPLETED",
+            elapsed="00:10:00",
+            start="2026-08-30T00:00:00",
+            end="2026-08-30T00:10:00",
+            partition="leeburton-pool",
+            exit_code="0:0",
+            allocated_cpus=24,
+            work_dir=DIRECT_DIR,
+        ),
+        scheduler_error=None,
+        scheduler_work_dir=DIRECT_DIR,
+        calculation_directory=DIRECT_DIR,
+        calculation_type="direct VASP",
+        calculation_reason=None,
+        direct_vasp=direct,
+    )
+
+    cli.print_job_inspection(inspection)
+
+    captured = capsys.readouterr()
+    assert "BMD Job Inspection" not in captured.out
+    assert "Job (scheduler_observation)" in captured.out
+    assert "scheduler WorkDir: /bmd-db/guest/flows/direct-vasp" in captured.out
+    assert "type: direct VASP" in captured.out
+    assert "Producer provenance (producer_provenance):" in captured.out
+    assert "unavailable" in captured.out
+    assert "Executed VASP inputs (executed_input)" in captured.out
+    assert "ENCUT=520" in captured.out
+    assert "Trajectory evidence (trajectory_observation)" in captured.out
+    assert "stage 1: Direct VASP calculation (work_dir)" in captured.out
+    assert "UNKNOWN Direct Vasp" not in captured.out
+    assert "Convergence-progress assessment (convergence_progress_assessment)" in captured.out
+    assert "more walltime" not in captured.out.lower()
 
 
 def test_inspect_run_uses_submission_stage_dirs_and_preserves_sources() -> None:
@@ -982,6 +1427,35 @@ def test_convergence_progress_assessment_timeout_first_scf_is_insufficient(
     assert all(assessment.label != NO_CLEAR_EVIDENCE_OF_PROGRESS for assessment in assessments)
 
 
+def test_force_based_relaxation_stage_does_not_promote_electronic_convergence_alone() -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 200, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01},
+        completed_ionic_steps=50,
+        electronic_iterations=(8,) * 50,
+        electronic_cycles=tuple(
+            electronic_cycle(index, 8, dE=1e-7)
+            for index in range(1, 51)
+        ),
+        ionic_steps=(
+            IonicStepObservation(50, 8, -100.0, -99.9, -0.1, None),
+        ),
+        converged_electronic=True,
+        converged_ionic=None,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert assessment_by_scope(assessments, "electronic").label == CONVERGED
+    ionic = assessment_by_scope(assessments, "ionic")
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert "maximum force evidence unavailable" in ionic.limitations
+    stage = assessment_by_scope(assessments, "stage")
+    assert stage.label == INSUFFICIENT_EVIDENCE
+    assert "converged_electronic=True" in " ".join(stage.basis)
+    assert "ionic progress evidence is insufficient" in " ".join(stage.limitations)
+
+
 def test_convergence_progress_assessment_missing_oszicar_is_insufficient() -> None:
     trajectory = trajectory_observation(
         stage_type="static",
@@ -1315,6 +1789,15 @@ class FakeFailingBandVasprun(FakeBandVasprun):
     def get_band_structure(self, **kwargs: object) -> FakeBandStructure:
         self.band_calls.append(kwargs)
         raise ValueError("e_fermi is None.")
+
+
+class FakeMalformedVasprun(FakeBandVasprun):
+    def __init__(self, path: str, **kwargs: object) -> None:
+        warnings.warn(
+            "XML is malformed. Parsing has stopped but partial data is available.",
+            UserWarning,
+        )
+        raise IndexError("list index out of range")
 
 
 @contextmanager

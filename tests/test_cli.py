@@ -42,6 +42,14 @@ def test_cli_diagnose_run_requires_root(capsys: pytest.CaptureFixture[str]) -> N
     assert "Usage: bmd-agent diagnose-run <remote-flow-root>" in captured.out
 
 
+def test_cli_job_requires_id(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = cli.main(["job"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "Usage: bmd-agent job <SLURM_JOB_ID>" in captured.out
+
+
 def test_cli_compare_runs_summary(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
