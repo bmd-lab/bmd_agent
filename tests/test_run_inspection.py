@@ -1,6 +1,7 @@
 import json
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 import shlex
 import subprocess
@@ -34,6 +35,7 @@ from bmd_agent.resources.run import (
     IonicStepObservation,
     JobInspection,
     LogRuntimeObservation,
+    OutcarForceBlockObservation,
     PathObservation,
     RunDiagnosis,
     RunInspection,
@@ -53,6 +55,8 @@ from bmd_agent.resources.run import (
     inspect_slurm_job,
     parse_incar_contents,
     parse_oszicar_trajectory,
+    parse_outcar_force_blocks,
+    parse_outcar_force_extraction,
     parse_vasp_output_files,
     run_label_from_provenance,
     vasp_reported_parameter_observations,
@@ -87,6 +91,54 @@ DAV:   1   -1.000000000000E+01   -1.00000E+01   -1.00000E+01   10   1.000E+00   
 DAV:   2   -1.100000000000E+01   -1.00000E+00   -2.00000E-01   12   1.000E-01   2.000E-02
 DAV:   3   -1.110000000000E+01   -1.00000E-01   -2.00000E-02   12   9.000E-02   1.000E-02
    1 F= -.11100000E+02 E0= -.11050000E+02  d E =-.111000E+02
+"""
+POSCAR_TWO_SITE = b"""\
+Example
+1.0
+1 0 0
+0 1 0
+0 0 1
+X
+2
+Direct
+0 0 0
+0.5 0.5 0.5
+"""
+OUTCAR_TWO_FORCE_BLOCKS = b"""\
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000      3.00000000      4.00000000      0.00000000
+      0.50000000      0.50000000      0.50000000      0.00000000      0.00000000      1.00000000
+ -----------------------------------------------------------------------------------
+ total drift:                               0.00000000      0.00000000      0.00000000
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000      0.00000000      0.30000000      0.40000000
+      0.50000000      0.50000000      0.50000000     -0.10000000     -0.20000000     -0.20000000
+ -----------------------------------------------------------------------------------
+ total drift:                               0.00000000      0.00000000      0.00000000
+"""
+OUTCAR_INCOMPLETE_FINAL_BLOCK = b"""\
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000      0.10000000      0.00000000      0.00000000
+      0.50000000      0.50000000      0.50000000      0.00000000      0.20000000      0.00000000
+ -----------------------------------------------------------------------------------
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000      0.30000000      0.00000000      0.00000000
+"""
+OUTCAR_MALFORMED_FORCE_BLOCK = b"""\
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000      not-a-force      0.00000000      0.00000000
+ -----------------------------------------------------------------------------------
+"""
+OUTCAR_SCIENTIFIC_NOTATION_BLOCK = b"""\
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000     -1.00000000E-01      2.00000000E-01     -2.00000000E-01
+ -----------------------------------------------------------------------------------
 """
 
 
@@ -242,7 +294,52 @@ class RemoteFixture:
                 stderr=b"",
             )
 
+        if len(parts) >= 5 and parts[0] == "awk" and parts[1] == "-v":
+            assert kwargs["check"] is True
+            expected_raw = parts[2].removeprefix("expected=")
+            expected = int(expected_raw) if expected_raw else None
+            path = parts[4]
+            if path not in self.files:
+                raise subprocess.CalledProcessError(1, command, stderr=b"missing")
+            blocks = parse_outcar_force_blocks(
+                self.files[path],
+                source_path=path,
+                expected_site_count=expected,
+            )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=outcar_extractor_payload(blocks, expected_site_count=expected),
+                stderr=b"",
+            )
+
         raise AssertionError(f"unexpected remote command: {remote_command}")
+
+
+def outcar_extractor_payload(
+    blocks: tuple[OutcarForceBlockObservation, ...],
+    *,
+    expected_site_count: int | None = None,
+) -> bytes:
+    lines = [
+        "schema\tbmd-agent-outcar-force-v1",
+        f"expected_site_count\t{expected_site_count or ''}",
+    ]
+    for block in blocks:
+        value = "" if block.max_force_eV_per_A is None else str(block.max_force_eV_per_A)
+        lines.append(
+            "\t".join(
+                (
+                    "block",
+                    str(block.block_index),
+                    str(block.row_count),
+                    block.status,
+                    "1" if block.complete else "0",
+                    value,
+                )
+            )
+        )
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def cluster() -> SlurmClusterResource:
@@ -431,8 +528,9 @@ def single_stage_files(*, custom: bool = False) -> dict[str, bytes]:
         ).encode("utf-8"),
         f"{LOG_ROOT}/validation-run.out": b"",
         f"{LOG_ROOT}/validation-run.err": b"",
+        f"{FLOW_ROOT}/POSCAR": POSCAR_TWO_SITE,
         f"{FLOW_ROOT}/CONTCAR": b"contcar",
-        f"{FLOW_ROOT}/OUTCAR": b"outcar",
+        f"{FLOW_ROOT}/OUTCAR": OUTCAR_TWO_FORCE_BLOCKS,
         f"{FLOW_ROOT}/vasprun.xml": b"vasprun",
         f"{FLOW_ROOT}/INCAR": b"IVDW = 11\n",
     }
@@ -560,13 +658,14 @@ def direct_vasp_files(
     *,
     include_vasprun: bool = True,
     oszicar: bytes = OSZICAR_TWO_STEP,
+    outcar: bytes = OUTCAR_TWO_FORCE_BLOCKS,
 ) -> dict[str, bytes]:
     files = {
         f"{DIRECT_DIR}/INCAR": b"NELM = 60\nEDIFF = 1E-6\nNSW = 99\nEDIFFG = -0.01\n",
-        f"{DIRECT_DIR}/POSCAR": b"poscar",
+        f"{DIRECT_DIR}/POSCAR": POSCAR_TWO_SITE,
         f"{DIRECT_DIR}/KPOINTS": b"kpoints",
         f"{DIRECT_DIR}/OSZICAR": oszicar,
-        f"{DIRECT_DIR}/OUTCAR": b"outcar",
+        f"{DIRECT_DIR}/OUTCAR": outcar,
         f"{DIRECT_DIR}/CONTCAR": b"contcar",
     }
     if include_vasprun:
@@ -1152,6 +1251,101 @@ def test_parse_oszicar_distinguishes_incomplete_first_electronic_cycle() -> None
     assert trajectory.recent_ionic_steps == ()
 
 
+def test_parse_outcar_force_blocks_preserves_complete_atomic_force_evidence() -> None:
+    blocks = parse_outcar_force_blocks(
+        OUTCAR_TWO_FORCE_BLOCKS,
+        source_path=f"{FLOW_ROOT}/OUTCAR",
+        expected_site_count=2,
+    )
+
+    assert blocks == (
+        OutcarForceBlockObservation(
+            1,
+            2,
+            "complete",
+            True,
+            f"{FLOW_ROOT}/OUTCAR",
+            5.0,
+        ),
+        OutcarForceBlockObservation(
+            2,
+            2,
+            "complete",
+            True,
+            f"{FLOW_ROOT}/OUTCAR",
+            0.5,
+        ),
+    )
+    assert all(block.evidence_type == TRAJECTORY_OBSERVATION for block in blocks)
+
+
+def test_parse_outcar_force_blocks_accepts_scientific_notation_and_signs() -> None:
+    blocks = parse_outcar_force_blocks(
+        OUTCAR_SCIENTIFIC_NOTATION_BLOCK,
+        source_path=f"{FLOW_ROOT}/OUTCAR",
+        expected_site_count=1,
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].complete is True
+    assert blocks[0].max_force_eV_per_A == pytest.approx(0.3)
+
+
+def test_parse_outcar_force_blocks_reports_incomplete_final_block() -> None:
+    blocks = parse_outcar_force_blocks(
+        OUTCAR_INCOMPLETE_FINAL_BLOCK,
+        source_path=f"{FLOW_ROOT}/OUTCAR",
+        expected_site_count=2,
+    )
+
+    assert [(block.block_index, block.status, block.complete) for block in blocks] == [
+        (1, "complete", True),
+        (2, "incomplete", False),
+    ]
+    assert blocks[1].max_force_eV_per_A is None
+
+
+def test_parse_outcar_force_blocks_reports_malformed_rows() -> None:
+    blocks = parse_outcar_force_blocks(
+        OUTCAR_MALFORMED_FORCE_BLOCK,
+        source_path=f"{FLOW_ROOT}/OUTCAR",
+        expected_site_count=1,
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].status == "malformed"
+    assert blocks[0].complete is False
+    assert blocks[0].row_count == 0
+
+
+def test_parse_outcar_force_blocks_validates_expected_site_count() -> None:
+    blocks = parse_outcar_force_blocks(
+        OUTCAR_TWO_FORCE_BLOCKS,
+        source_path=f"{FLOW_ROOT}/OUTCAR",
+        expected_site_count=3,
+    )
+
+    assert all(block.status == "row_count_mismatch" for block in blocks)
+    assert all(block.complete is False for block in blocks)
+
+
+def test_parse_outcar_force_extraction_accepts_readable_zero_block_output() -> None:
+    blocks = parse_outcar_force_extraction(
+        b"schema\tbmd-agent-outcar-force-v1\nexpected_site_count\t24\n",
+        source_path=f"{FLOW_ROOT}/OUTCAR",
+    )
+
+    assert blocks == ()
+
+
+def test_parse_outcar_force_extraction_rejects_malformed_output() -> None:
+    with pytest.raises(RunInspectionError, match="malformed output"):
+        parse_outcar_force_extraction(
+            b"not-json-and-not-the-extractor-protocol\n",
+            source_path=f"{FLOW_ROOT}/OUTCAR",
+        )
+
+
 def test_diagnose_run_uses_producer_stage_dirs_for_oszicar_evidence() -> None:
     files = default_files(include_vasprun=False)
     files[f"{FLOW_ROOT}/producer-alpha/INCAR"] = b"NELM = 3\nEDIFF = 1E-6\nNSW = 1\nEDIFFG = -0.02\n"
@@ -1283,6 +1477,212 @@ def test_diagnose_vasprun_enriches_force_and_convergence_evidence(
     assert trajectory.criteria_discrepancies == ()
 
 
+def test_diagnose_outcar_force_blocks_align_with_oszicar_completed_steps() -> None:
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nEDIFF = 1E-6\nNSW = 2\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files[f"{FLOW_ROOT}/OUTCAR"] = OUTCAR_TWO_FORCE_BLOCKS
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.outcar_present is True
+    assert trajectory.outcar_expected_site_count == 2
+    assert trajectory.outcar_complete_force_blocks == 2
+    assert trajectory.outcar_force_alignment_status == "aligned"
+    assert [block.max_force_eV_per_A for block in trajectory.outcar_force_blocks] == [5.0, 0.5]
+    assert trajectory.recent_ionic_steps[-1].max_force == 0.5
+    assert trajectory.recent_ionic_steps[-1].max_force_source == "OUTCAR"
+    remote_commands = " ".join(" ".join(command) for command in remote.commands)
+    assert "cat -- /bmd-db/guest/flows/validation-run/OUTCAR" not in remote_commands
+    assert "awk -v expected=2" in remote_commands
+    assert "find " not in remote_commands
+    assert "POTCAR" not in remote_commands
+
+
+def test_diagnose_outcar_incomplete_final_block_keeps_complete_step_forces() -> None:
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nEDIFF = 1E-6\nNSW = 1\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_NELM_LIMIT
+    files[f"{FLOW_ROOT}/OUTCAR"] = OUTCAR_INCOMPLETE_FINAL_BLOCK
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.completed_ionic_steps == 1
+    assert trajectory.outcar_complete_force_blocks == 1
+    assert trajectory.outcar_force_alignment_status == "aligned"
+    assert trajectory.recent_ionic_steps[-1].max_force == 0.2
+    assert any("OUTCAR force block 2 incomplete" in item for item in trajectory.unavailable)
+
+
+def test_diagnose_outcar_count_disagreement_does_not_align_uncertain_forces() -> None:
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nEDIFF = 1E-6\nNSW = 3\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files[f"{FLOW_ROOT}/OUTCAR"] = OUTCAR_INCOMPLETE_FINAL_BLOCK
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.completed_ionic_steps == 2
+    assert trajectory.outcar_complete_force_blocks == 1
+    assert trajectory.outcar_force_alignment_status == "discrepancy"
+    assert all(step.max_force is None for step in trajectory.ionic_steps)
+    assert "OUTCAR force-block alignment discrepancy" in " ".join(trajectory.unavailable)
+
+
+def test_diagnose_readable_outcar_with_zero_force_blocks_is_not_transport_failure() -> None:
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nEDIFF = 1E-6\nNSW = 2\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files[f"{FLOW_ROOT}/OUTCAR"] = b"readable OUTCAR with no standard force table\n"
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.outcar_present is True
+    assert trajectory.outcar_error is None
+    assert trajectory.outcar_failure_kind is None
+    assert trajectory.outcar_complete_force_blocks == 0
+    assert trajectory.outcar_force_alignment_status == "unavailable"
+    assert "OUTCAR contained no standard force blocks" in " ".join(trajectory.unavailable)
+
+
+def test_diagnose_outcar_extractor_invocation_failure_preserves_kind(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailingExtractorRemote(RemoteFixture):
+        def __call__(
+            self,
+            command: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            remote_command = command[2]
+            if shlex.split(remote_command)[0:2] == ["awk", "-v"]:
+                raise subprocess.CalledProcessError(
+                    2,
+                    command,
+                    stderr=b"sh: 1: Syntax error: Unterminated quoted string\n",
+                )
+            return super().__call__(command, **kwargs)
+
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/INCAR"] = b"NELM = 60\nEDIFF = 1E-6\nNSW = 2\nEDIFFG = -0.01\n"
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = FailingExtractorRemote(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.outcar_present is True
+    assert trajectory.outcar_error == "extractor command invocation failed"
+    assert trajectory.outcar_failure_kind == "command_invocation_failed"
+    assert trajectory.outcar_failure_returncode == 2
+    assert "Unterminated quoted string" in (trajectory.outcar_failure_detail or "")
+    assert all(step.max_force is None for step in trajectory.ionic_steps)
+
+    cli.print_run_diagnosis(diagnosis)
+
+    captured = capsys.readouterr()
+    assert "OUTCAR force trajectory unavailable: extractor command invocation failed" in captured.out
+    assert "OUTCAR extractor diagnostic: command_invocation_failed, exit 2" in captured.out
+    assert "Unterminated quoted string" not in captured.out
+
+
+def test_diagnose_malformed_outcar_extractor_output_is_distinct_from_read_failure() -> None:
+    class MalformedExtractorRemote(RemoteFixture):
+        def __call__(
+            self,
+            command: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            remote_command = command[2]
+            if shlex.split(remote_command)[0:2] == ["awk", "-v"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=b"this is not extractor output\n",
+                    stderr=b"",
+                )
+            return super().__call__(command, **kwargs)
+
+    files = single_stage_files()
+    files[f"{FLOW_ROOT}/OSZICAR"] = OSZICAR_TWO_STEP
+    files.pop(f"{FLOW_ROOT}/vasprun.xml")
+    remote = MalformedExtractorRemote(files=files, directories={FLOW_ROOT})
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    trajectory = diagnosis.trajectories[0]
+    assert trajectory.outcar_present is True
+    assert trajectory.outcar_error == "OUTCAR force extraction returned malformed output"
+    assert trajectory.outcar_failure_kind == "malformed_extractor_output"
+    assert trajectory.outcar_failure_returncode is None
+
+
+def test_direct_vasp_outcar_force_extraction_uses_fixed_read_only_command() -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.direct_vasp is not None
+    trajectory = inspection.direct_vasp.trajectory
+    assert trajectory.outcar_force_alignment_status == "aligned"
+    assert trajectory.recent_ionic_steps[-1].max_force_source == "OUTCAR"
+    commands = " ".join(" ".join(command) for command in remote.commands)
+    assert "cat -- /bmd-db/guest/flows/direct-vasp/OUTCAR" not in commands
+    assert "awk -v expected=2" in commands
+    assert "find " not in commands
+    assert "ls " not in commands
+    assert "POTCAR" not in commands
+
+
 def test_diagnose_malformed_vasprun_keeps_oszicar_evidence_and_quiet_cli(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1397,6 +1797,41 @@ def test_convergence_progress_assessment_can_use_reached_configured_criteria() -
     assert assessment_by_scope(assessments, "stage").label == CONVERGED
 
 
+def test_outcar_atomic_forces_do_not_claim_variable_cell_convergence_alone() -> None:
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01, "ISIF": 3},
+        completed_ionic_steps=3,
+        electronic_iterations=(8, 8, 8),
+        electronic_cycles=(
+            electronic_cycle(1, 8, dE=1e-7),
+            electronic_cycle(2, 8, dE=1e-7),
+            electronic_cycle(3, 8, dE=1e-7),
+        ),
+        ionic_steps=(
+            IonicStepObservation(
+                3,
+                8,
+                -10.1,
+                -10.0,
+                -0.01,
+                0.009,
+                "OUTCAR",
+            ),
+        ),
+        converged_electronic=True,
+        converged_ionic=None,
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    ionic = assessment_by_scope(assessments, "ionic")
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert "OUTCAR atomic maximum force reached EDIFFG" in " ".join(ionic.basis)
+    assert "cell degrees of freedom" in " ".join(ionic.limitations)
+    assert assessment_by_scope(assessments, "stage").label == INSUFFICIENT_EVIDENCE
+
+
 @pytest.mark.parametrize("iterations", [25, 17])
 def test_convergence_progress_assessment_timeout_first_scf_is_insufficient(
     iterations: int,
@@ -1454,6 +1889,89 @@ def test_force_based_relaxation_stage_does_not_promote_electronic_convergence_al
     assert stage.label == INSUFFICIENT_EVIDENCE
     assert "converged_electronic=True" in " ".join(stage.basis)
     assert "ionic progress evidence is insufficient" in " ".join(stage.limitations)
+
+
+def test_unreached_force_criterion_without_trend_rule_is_insufficient_progress_evidence() -> None:
+    ionic_steps = tuple(
+        IonicStepObservation(
+            index,
+            8,
+            -100.0 - index,
+            -99.9 - index,
+            -0.1,
+            force,
+            "OUTCAR",
+        )
+        for index, force in enumerate(
+            (
+                0.028543,
+                0.026002,
+                0.022678,
+                0.026931,
+                0.071891,
+            ),
+            start=46,
+        )
+    )
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 200, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01, "ISIF": 3},
+        completed_ionic_steps=50,
+        electronic_iterations=(8,) * 50,
+        electronic_cycles=tuple(
+            electronic_cycle(index, 8, dE=1e-7)
+            for index in range(1, 51)
+        ),
+        ionic_steps=ionic_steps,
+        converged_electronic=True,
+        converged_ionic=None,
+    )
+    trajectory = replace(
+        trajectory,
+        outcar_path=f"{FLOW_ROOT}/OUTCAR",
+        outcar_present=True,
+        outcar_expected_site_count=24,
+        outcar_force_blocks=tuple(
+            OutcarForceBlockObservation(
+                index,
+                24,
+                "complete",
+                True,
+                f"{FLOW_ROOT}/OUTCAR",
+                force,
+            )
+            for index, force in enumerate(
+                (
+                    0.028543,
+                    0.026002,
+                    0.022678,
+                    0.026931,
+                    0.071891,
+                ),
+                start=46,
+            )
+        ),
+        outcar_complete_force_blocks=50,
+        outcar_force_alignment_status="aligned",
+        outcar_force_alignment_reason=(
+            "50 OUTCAR force block(s) aligned with OSZICAR completed ionic steps"
+        ),
+    )
+
+    assessments = assess_convergence_progress((trajectory,))
+
+    ionic = assessment_by_scope(assessments, "ionic")
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert "final OUTCAR atomic maximum force has not reached EDIFFG" in " ".join(
+        ionic.counter_evidence
+    )
+    assert "trend-based ionic progress assessment is not implemented" in " ".join(
+        ionic.limitations
+    )
+    stage = assessment_by_scope(assessments, "stage")
+    assert stage.label == INSUFFICIENT_EVIDENCE
+    assert "ionic progress evidence is insufficient" in " ".join(stage.limitations)
+    assert all(assessment.label != NO_CLEAR_EVIDENCE_OF_PROGRESS for assessment in assessments)
 
 
 def test_convergence_progress_assessment_missing_oszicar_is_insufficient() -> None:
@@ -1517,7 +2035,7 @@ def test_convergence_progress_assessment_missing_criteria_is_insufficient() -> N
     assert "EDIFF criterion unavailable" in electronic.limitations
 
 
-def test_convergence_progress_assessment_reports_partial_stage_progress() -> None:
+def test_convergence_progress_assessment_does_not_treat_unreached_force_as_no_progress() -> None:
     trajectory = trajectory_observation(
         stage_type="relax",
         criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01},
@@ -1535,10 +2053,15 @@ def test_convergence_progress_assessment_reports_partial_stage_progress() -> Non
     assessments = assess_convergence_progress((trajectory,))
 
     assert assessment_by_scope(assessments, "electronic").label == CONVERGED
-    assert assessment_by_scope(assessments, "ionic").label == NO_CLEAR_EVIDENCE_OF_PROGRESS
+    ionic = assessment_by_scope(assessments, "ionic")
+    assert ionic.label == INSUFFICIENT_EVIDENCE
+    assert "final maximum force has not reached EDIFFG" in " ".join(ionic.counter_evidence)
+    assert "trend-based ionic progress assessment is not implemented" in " ".join(
+        ionic.limitations
+    )
     stage = assessment_by_scope(assessments, "stage")
-    assert stage.label == EVIDENCE_OF_PROGRESS
-    assert "not all required stage scopes are converged" in stage.limitations
+    assert stage.label == INSUFFICIENT_EVIDENCE
+    assert "ionic progress evidence is insufficient" in " ".join(stage.limitations)
 
 
 def test_convergence_progress_assessment_preserves_contradictory_evidence() -> None:
@@ -2532,6 +3055,71 @@ def test_cli_diagnose_run_summary_is_descriptive_not_predictive(
     assert "step 2 electronic_iterations=60 F=-12.1 E0=-12.05 dE=-0.1 max_force=0.5" in captured.out
     forbidden = ("likely to benefit", "more walltime alone", "stalled", "oscillating", "diverging")
     assert all(term not in captured.out.lower() for term in forbidden)
+
+
+def test_cli_prints_compact_outcar_force_evidence_without_full_history(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ionic_steps = tuple(
+        IonicStepObservation(
+            index,
+            8,
+            -10.0 - index,
+            -9.9 - index,
+            -0.1,
+            round(0.1 * index, 1),
+            "OUTCAR",
+        )
+        for index in range(1, 8)
+    )
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01, "ISIF": 2},
+        completed_ionic_steps=7,
+        electronic_iterations=(8,) * 7,
+        electronic_cycles=tuple(
+            electronic_cycle(index, 8, dE=1e-7)
+            for index in range(1, 8)
+        ),
+        ionic_steps=ionic_steps,
+        converged_electronic=True,
+        converged_ionic=False,
+    )
+    trajectory = replace(
+        trajectory,
+        outcar_path=f"{FLOW_ROOT}/OUTCAR",
+        outcar_present=True,
+        outcar_expected_site_count=24,
+        outcar_force_blocks=tuple(
+            OutcarForceBlockObservation(
+                index,
+                24,
+                "complete",
+                True,
+                f"{FLOW_ROOT}/OUTCAR",
+                round(0.1 * index, 1),
+            )
+            for index in range(1, 8)
+        ),
+        outcar_complete_force_blocks=7,
+        outcar_force_alignment_status="aligned",
+        outcar_force_alignment_reason=(
+            "7 OUTCAR force block(s) aligned with OSZICAR completed ionic steps"
+        ),
+    )
+
+    cli._print_trajectory_observations((trajectory,))
+
+    captured = capsys.readouterr()
+    assert "OUTCAR atomic forces: present" in captured.out
+    assert "OUTCAR complete force blocks: 7" in captured.out
+    assert "OUTCAR expected site count: 24" in captured.out
+    assert "ISIF: 2" in captured.out
+    assert "step 3" in captured.out
+    assert "step 7" in captured.out
+    assert "max_force=0.7 [OUTCAR]" in captured.out
+    assert "step 1 electronic_iterations" not in captured.out
+    assert "step 2 electronic_iterations" not in captured.out
 
 
 def test_cli_executed_input_wording_distinguishes_unavailable_and_absent(
