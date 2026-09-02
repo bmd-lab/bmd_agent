@@ -50,6 +50,7 @@ EXECUTED_INPUT = "executed_input"
 AGENT_COMPARISON = "agent_comparison"
 TERMINATION_OBSERVATION = "termination_observation"
 TRAJECTORY_OBSERVATION = "trajectory_observation"
+TRAJECTORY_PROGRESS_EVIDENCE = "trajectory_progress_evidence"
 CONVERGENCE_PROGRESS_ASSESSMENT = "convergence_progress_assessment"
 
 CONVERGED = "CONVERGED"
@@ -87,6 +88,10 @@ _DIAGNOSE_RECENT_WINDOW = 5
 _DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF")
 _OUTCAR_FORCE_EXTRACTION_SCHEMA = "bmd-agent-outcar-force-v1"
 _JOB_TRAJECTORY_JSON_SCHEMA_VERSION = 1
+_OSZICAR_IONIC_DE_SEMANTICS = (
+    "VASP OSZICAR ionic-line d E value parsed by pymatgen; "
+    "not Agent-computed F_n - F_(n-1)"
+)
 _INCOMPLETE_VASPRUN_TRAJECTORY_REASON = "file could not be parsed completely"
 _UNREADABLE_VASPRUN_TRAJECTORY_REASON = "file could not be read"
 _PACKAGE_RE = re.compile(r"^\[runner\]\s+(\w+)\s+version:\s*(.+)$")
@@ -388,6 +393,33 @@ class StageTrajectoryObservation:
     converged_electronic: bool | None = None
     converged_ionic: bool | None = None
     unavailable: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TrajectoryProgressEvidence:
+    stage_index: int | None
+    stage_label: str
+    atomic_force_status: str
+    electronic_iteration_status: str
+    evidence_type: str = TRAJECTORY_PROGRESS_EVIDENCE
+    force_source: str | None = None
+    force_observation_count: int = 0
+    force_criterion_magnitude_eV_A: float | None = None
+    initial_max_force_eV_A: float | None = None
+    current_max_force_eV_A: float | None = None
+    best_max_force_eV_A: float | None = None
+    best_force_step: int | None = None
+    initial_force_over_abs_EDIFFG: float | None = None
+    current_force_over_abs_EDIFFG: float | None = None
+    best_force_over_abs_EDIFFG: float | None = None
+    initial_to_current_force_ratio: float | None = None
+    initial_to_best_force_ratio: float | None = None
+    current_to_best_force_ratio: float | None = None
+    new_best_force_count: int | None = None
+    min_electronic_iterations: int | None = None
+    median_electronic_iterations: float | None = None
+    max_electronic_iterations: int | None = None
+    limitations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -881,6 +913,205 @@ def inspect_slurm_job(
     )
 
 
+def derive_trajectory_progress_evidence(
+    trajectory: StageTrajectoryObservation,
+) -> TrajectoryProgressEvidence:
+    """Derive descriptive progress evidence without assigning progress labels.
+
+    The electronic-iteration median is the standard mathematical median of
+    completed-step iteration counts; even-length sequences use the mean of the
+    two central values and are therefore represented as a float.
+    """
+
+    limitations: list[str] = []
+    force_criterion = _force_criterion(trajectory.criteria)
+    if force_criterion is None:
+        ediffg = _float_or_none(trajectory.criteria.get("EDIFFG"))
+        if ediffg is None:
+            limitations.append("negative EDIFFG force criterion unavailable")
+        elif ediffg >= 0:
+            limitations.append("EDIFFG is not a negative force criterion")
+
+    if _is_variable_cell_relaxation(trajectory):
+        limitations.append(
+            "atomic-force evidence only; variable-cell convergence also "
+            "requires broader cell/stress evidence"
+        )
+
+    force_steps = _trajectory_force_steps(trajectory)
+    electronic_counts = _completed_electronic_iteration_counts(trajectory)
+    min_iterations, median_iterations, max_iterations = _electronic_iteration_stats(
+        electronic_counts
+    )
+    if not electronic_counts:
+        limitations.append("completed-step electronic iteration counts unavailable")
+
+    if not force_steps:
+        alignment_status = trajectory.outcar_force_alignment_status
+        alignment_reason = trajectory.outcar_force_alignment_reason
+        if alignment_status in {"unavailable", "discrepancy"} and alignment_reason:
+            limitations.append(
+                f"aligned OUTCAR force evidence unavailable: {alignment_reason}"
+            )
+        else:
+            limitations.append("completed-step atomic maximum-force evidence unavailable")
+        return TrajectoryProgressEvidence(
+            stage_index=trajectory.stage_index,
+            stage_label=trajectory.stage_label,
+            atomic_force_status="unavailable",
+            electronic_iteration_status=(
+                "available" if electronic_counts else "unavailable"
+            ),
+            force_criterion_magnitude_eV_A=force_criterion,
+            min_electronic_iterations=min_iterations,
+            median_electronic_iterations=median_iterations,
+            max_electronic_iterations=max_iterations,
+            limitations=tuple(dict.fromkeys(limitations)),
+        )
+
+    first_step = force_steps[0]
+    current_step = force_steps[-1]
+    best_step = _best_force_step(force_steps)
+    initial_force = _round_float(first_step.max_force)
+    current_force = _round_float(current_step.max_force)
+    best_force = _round_float(best_step.max_force)
+    initial_to_current = _safe_ratio(initial_force, current_force)
+    initial_to_best = _safe_ratio(initial_force, best_force)
+    current_to_best = _safe_ratio(current_force, best_force)
+    if (
+        (current_force == 0 and initial_force is not None)
+        or (best_force == 0 and (initial_force is not None or current_force is not None))
+    ):
+        limitations.append("force ratio unavailable where denominator force is zero")
+
+    return TrajectoryProgressEvidence(
+        stage_index=trajectory.stage_index,
+        stage_label=trajectory.stage_label,
+        atomic_force_status="available",
+        electronic_iteration_status=("available" if electronic_counts else "unavailable"),
+        force_source=_force_source_label(force_steps),
+        force_observation_count=len(force_steps),
+        force_criterion_magnitude_eV_A=force_criterion,
+        initial_max_force_eV_A=initial_force,
+        current_max_force_eV_A=current_force,
+        best_max_force_eV_A=best_force,
+        best_force_step=best_step.step_index,
+        initial_force_over_abs_EDIFFG=_safe_ratio(initial_force, force_criterion),
+        current_force_over_abs_EDIFFG=_safe_ratio(current_force, force_criterion),
+        best_force_over_abs_EDIFFG=_safe_ratio(best_force, force_criterion),
+        initial_to_current_force_ratio=initial_to_current,
+        initial_to_best_force_ratio=initial_to_best,
+        current_to_best_force_ratio=current_to_best,
+        new_best_force_count=_new_best_force_count(force_steps),
+        min_electronic_iterations=min_iterations,
+        median_electronic_iterations=median_iterations,
+        max_electronic_iterations=max_iterations,
+        limitations=tuple(dict.fromkeys(limitations)),
+    )
+
+
+def _trajectory_force_steps(
+    trajectory: StageTrajectoryObservation,
+) -> tuple[IonicStepObservation, ...]:
+    completed_steps = trajectory.completed_ionic_steps
+    aligned_outcar = trajectory.outcar_force_alignment_status == "aligned"
+    steps: list[IonicStepObservation] = []
+    for step in trajectory.ionic_steps:
+        if completed_steps is not None and step.step_index > completed_steps:
+            continue
+        force = _float_or_none(step.max_force)
+        if force is None or force < 0:
+            continue
+        if step.max_force_source == "OUTCAR" and not aligned_outcar:
+            continue
+        steps.append(step)
+    return tuple(sorted(steps, key=lambda item: item.step_index))
+
+
+def _completed_electronic_iteration_counts(
+    trajectory: StageTrajectoryObservation,
+) -> tuple[int, ...]:
+    counts = tuple(
+        count
+        for count in (
+            _int_or_none(value)
+            for value in trajectory.electronic_iterations_by_completed_ionic_step
+        )
+        if count is not None and count >= 0
+    )
+    if counts:
+        return counts
+    return tuple(
+        count
+        for count in (
+            _int_or_none(step.electronic_iterations)
+            for step in trajectory.ionic_steps
+        )
+        if count is not None and count >= 0
+    )
+
+
+def _electronic_iteration_stats(
+    counts: Sequence[int],
+) -> tuple[int | None, float | None, int | None]:
+    if not counts:
+        return None, None, None
+    ordered = sorted(counts)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        median = float(ordered[midpoint])
+    else:
+        median = (ordered[midpoint - 1] + ordered[midpoint]) / 2
+    return min(ordered), _round_float(median), max(ordered)
+
+
+def _best_force_step(
+    force_steps: Sequence[IonicStepObservation],
+) -> IonicStepObservation:
+    best = force_steps[0]
+    best_force = _float_or_none(best.max_force)
+    for step in force_steps[1:]:
+        force = _float_or_none(step.max_force)
+        if force is not None and best_force is not None and force < best_force:
+            best = step
+            best_force = force
+    return best
+
+
+def _new_best_force_count(force_steps: Sequence[IonicStepObservation]) -> int:
+    count = 0
+    best_force: float | None = None
+    for step in force_steps:
+        force = _float_or_none(step.max_force)
+        if force is None:
+            continue
+        if best_force is None or force < best_force:
+            count += 1
+            best_force = force
+    return count
+
+
+def _force_source_label(force_steps: Sequence[IonicStepObservation]) -> str | None:
+    sources = tuple(
+        dict.fromkeys(
+            step.max_force_source
+            for step in force_steps
+            if step.max_force_source
+        )
+    )
+    if not sources:
+        return None
+    if len(sources) == 1:
+        return sources[0]
+    return "mixed"
+
+
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return _round_float(numerator / denominator)
+
+
 def serialize_job_trajectory_evidence(inspection: JobInspection) -> Mapping[str, Any]:
     """Serialize already-observed compact trajectory evidence for analysis."""
 
@@ -985,6 +1216,7 @@ def _serialize_stage_trajectory(
     trajectory: StageTrajectoryObservation,
 ) -> Mapping[str, Any]:
     force_criterion = _force_criterion(trajectory.criteria)
+    progress = derive_trajectory_progress_evidence(trajectory)
     outcar_force_block_count = (
         len(trajectory.outcar_force_blocks)
         if trajectory.outcar_present and trajectory.outcar_error is None
@@ -1060,6 +1292,9 @@ def _serialize_stage_trajectory(
             _serialize_ionic_step(step, force_criterion=force_criterion)
             for step in trajectory.ionic_steps
         ],
+        "trajectory_progress_evidence": _serialize_trajectory_progress_evidence(
+            progress
+        ),
         "unavailable": list(trajectory.unavailable),
     }
 
@@ -1132,6 +1367,37 @@ def _serialize_outcar_force_block(
         "complete": block.complete,
         "max_force_eV_per_A": block.max_force_eV_per_A,
         "evidence_type": block.evidence_type,
+    }
+
+
+def _serialize_trajectory_progress_evidence(
+    progress: TrajectoryProgressEvidence,
+) -> Mapping[str, Any]:
+    return {
+        "stage_index": progress.stage_index,
+        "stage_label": progress.stage_label,
+        "atomic_force_status": progress.atomic_force_status,
+        "electronic_iteration_status": progress.electronic_iteration_status,
+        "evidence_type": progress.evidence_type,
+        "force_source": progress.force_source,
+        "force_observation_count": progress.force_observation_count,
+        "force_criterion_magnitude_eV_A": progress.force_criterion_magnitude_eV_A,
+        "initial_max_force_eV_A": progress.initial_max_force_eV_A,
+        "current_max_force_eV_A": progress.current_max_force_eV_A,
+        "best_max_force_eV_A": progress.best_max_force_eV_A,
+        "best_force_step": progress.best_force_step,
+        "initial_force_over_abs_EDIFFG": progress.initial_force_over_abs_EDIFFG,
+        "current_force_over_abs_EDIFFG": progress.current_force_over_abs_EDIFFG,
+        "best_force_over_abs_EDIFFG": progress.best_force_over_abs_EDIFFG,
+        "initial_to_current_force_ratio": progress.initial_to_current_force_ratio,
+        "initial_to_best_force_ratio": progress.initial_to_best_force_ratio,
+        "current_to_best_force_ratio": progress.current_to_best_force_ratio,
+        "new_best_force_count": progress.new_best_force_count,
+        "min_electronic_iterations": progress.min_electronic_iterations,
+        "median_electronic_iterations": progress.median_electronic_iterations,
+        "max_electronic_iterations": progress.max_electronic_iterations,
+        "ionic_dE_semantics": _OSZICAR_IONIC_DE_SEMANTICS,
+        "limitations": list(progress.limitations),
     }
 
 
