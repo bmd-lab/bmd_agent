@@ -1,5 +1,6 @@
 from collections.abc import Iterable, Mapping
 import hashlib
+import json
 import subprocess
 import sys
 from typing import Any
@@ -28,6 +29,7 @@ from bmd_agent.resources.run import (
     diagnose_remote_run,
     inspect_slurm_job,
     inspect_remote_run,
+    serialize_job_trajectory_evidence,
 )
 from bmd_agent.resources.slurm import get_queue
 from bmd_agent.resources.vasp import RemotePathError, read_remote_structure
@@ -403,16 +405,22 @@ def show_diagnose_run(flow_root: str, registry: ResourceRegistry | None = None) 
     return 0
 
 
-def show_job(job_id: str, registry: ResourceRegistry | None = None) -> int:
+def show_job(
+    job_id: str,
+    registry: ResourceRegistry | None = None,
+    *,
+    trajectory_json: bool = False,
+) -> int:
     """Display scheduler-bound evidence for one calculation job."""
 
     registry = registry or load_resources()
     cluster = powerslurm_cluster(registry)
     modifier_policies, _ = modifier_policies_from_compute(registry)
 
-    print("BMD Job Inspection")
-    print("==================")
-    print()
+    if not trajectory_json:
+        print("BMD Job Inspection")
+        print("==================")
+        print()
 
     try:
         inspection = inspect_slurm_job(
@@ -429,7 +437,17 @@ def show_job(job_id: str, registry: ResourceRegistry | None = None) -> int:
         print(f"Unable to inspect job: {exc}")
         return 1
 
-    print_job_inspection(inspection)
+    if trajectory_json:
+        print(
+            json.dumps(
+                serialize_job_trajectory_evidence(inspection),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
+    else:
+        print_job_inspection(inspection)
     return 0
 
 
@@ -1084,11 +1102,15 @@ def main(argv: list[str] | None = None) -> int:
             return show_queue()
 
         if command == "job":
-            if len(argv) < 2:
-                print("Usage: bmd-agent job <SLURM_JOB_ID>")
+            if (
+                len(argv) < 2
+                or len(argv) > 3
+                or (len(argv) == 3 and argv[2] != "--trajectory-json")
+            ):
+                print("Usage: bmd-agent job <SLURM_JOB_ID> [--trajectory-json]")
                 return 2
 
-            return show_job(argv[1])
+            return show_job(argv[1], trajectory_json=len(argv) == 3)
 
         if command == "compute":
             return show_compute()
@@ -1126,7 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Available commands:")
     print("  status")
     print("  queue")
-    print("  job <SLURM_JOB_ID>")
+    print("  job <SLURM_JOB_ID> [--trajectory-json]")
     print("  compute")
     print("  structure <remote-directory>")
     print("  inspect-run <remote-flow-root>")

@@ -59,6 +59,7 @@ from bmd_agent.resources.run import (
     parse_outcar_force_extraction,
     parse_vasp_output_files,
     run_label_from_provenance,
+    serialize_job_trajectory_evidence,
     vasp_reported_parameter_observations,
 )
 from bmd_agent.resources.slurm import SlurmAccountingRecord
@@ -1681,6 +1682,289 @@ def test_direct_vasp_outcar_force_extraction_uses_fixed_read_only_command() -> N
     assert "find " not in commands
     assert "ls " not in commands
     assert "POTCAR" not in commands
+
+
+def test_serialize_job_trajectory_evidence_completed_direct_vasp_job() -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    payload = serialize_job_trajectory_evidence(inspection)
+
+    assert payload["schema_version"] == 1
+    assert payload["job"]["job_id"] == "20893681"
+    assert payload["job"]["job_name"] == "direct-vasp"
+    assert payload["job"]["node_list"] == "compute-0-269"
+    assert payload["job"]["scheduler_state"] == "COMPLETED"
+    assert payload["job"]["elapsed_raw"] == 21620
+    assert payload["job"]["timelimit"] == "06:00:00"
+    assert payload["job"]["allocated_cpus"] == 24
+    assert payload["job"]["work_dir"] == DIRECT_DIR
+    assert payload["calculation"]["calculation_type"] == "direct VASP"
+    assert payload["calculation"]["producer_provenance"]["status"] == "unavailable"
+
+    stages = payload["stages"]
+    assert len(stages) == 1
+    stage = stages[0]
+    assert stage["stage_index"] == 1
+    assert stage["stage_label"] == "work_dir"
+    assert stage["criteria"]["NELM"] == 60
+    assert stage["criteria"]["EDIFF"] == 1e-06
+    assert stage["criteria"]["EDIFFG"] == -0.01
+    assert stage["criteria"]["ISIF"] is None
+    assert stage["completed_ionic_steps"] == 2
+    assert stage["outcar_force_block_count"] == 2
+    assert stage["outcar_force_alignment_status"] == "aligned"
+    assert stage["outcar"]["force_block_count"] == 2
+    assert stage["outcar"]["complete_force_blocks"] == 2
+    assert stage["outcar"]["force_alignment"]["status"] == "aligned"
+    assert [block["max_force_eV_per_A"] for block in stage["outcar"]["force_blocks"]] == [5.0, 0.5]
+    assert len(stage["ionic_steps"]) == 2
+    assert stage["ionic_steps"][0]["step_index"] == 1
+    assert stage["ionic_steps"][0]["free_energy"] == -11.0
+    assert stage["ionic_steps"][0]["energy_zero"] == -10.95
+    assert stage["ionic_steps"][0]["ionic_dE"] == -11.0
+    assert stage["ionic_steps"][0]["electronic_iterations"] == 2
+    assert stage["ionic_steps"][0]["max_force"] == 5.0
+    assert stage["ionic_steps"][0]["max_force_source"] == "OUTCAR"
+    assert stage["ionic_steps"][0]["force_over_abs_EDIFFG"] == 500.0
+    assert payload["convergence_progress_assessment"]
+    assert "POTCAR" not in json.dumps(payload, sort_keys=True)
+
+
+def test_serialize_job_trajectory_evidence_timeout_keeps_oszicar_without_vasprun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def malformed_loader(*args: object, **kwargs: object) -> object:
+        warnings.warn(
+            "XML is malformed. Parsing has stopped but partial data is available.",
+            UserWarning,
+        )
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(run_resource, "_load_vasprun", malformed_loader)
+    remote = RemoteFixture(
+        files=direct_vasp_files(oszicar=oszicar_incomplete_cycle(25)),
+        directories={DIRECT_DIR},
+    )
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(state="TIMEOUT"),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    payload = serialize_job_trajectory_evidence(inspection)
+    stage = payload["stages"][0]
+
+    assert payload["job"]["scheduler_state"] == "TIMEOUT"
+    assert stage["completed_ionic_steps"] == 0
+    assert stage["ionic_steps"] == []
+    assert stage["electronic"]["incomplete_electronic_iteration_count"] == 25
+    assert stage["electronic"]["electronic_iterations_by_completed_ionic_step"] == []
+    assert stage["vasprun"]["present"] is True
+    assert stage["vasprun"]["error"] == "file could not be parsed completely"
+    assert stage["vasprun"]["ionic_steps"] is None
+    assert stage["converged_electronic"] is None
+    assert stage["converged_ionic"] is None
+    assert stage["criteria"]["ISIF"] is None
+    assert "list index out of range" not in json.dumps(payload)
+    assert "XML is malformed" not in json.dumps(payload)
+    assessment_labels = {
+        assessment["scope"]: assessment["label"]
+        for assessment in payload["convergence_progress_assessment"]
+    }
+    assert assessment_labels["stage"] == INSUFFICIENT_EVIDENCE
+
+
+def test_serialize_job_trajectory_evidence_preserves_force_alignment_discrepancy() -> None:
+    remote = RemoteFixture(
+        files=direct_vasp_files(outcar=OUTCAR_INCOMPLETE_FINAL_BLOCK),
+        directories={DIRECT_DIR},
+    )
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(state="TIMEOUT"),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    payload = serialize_job_trajectory_evidence(inspection)
+    stage = payload["stages"][0]
+
+    assert stage["outcar"]["force_block_count"] == 2
+    assert stage["outcar"]["complete_force_blocks"] == 1
+    assert stage["outcar_force_block_count"] == 2
+    assert stage["outcar_force_alignment_status"] == "discrepancy"
+    assert stage["outcar"]["force_alignment"]["status"] == "discrepancy"
+    assert "did not align" in stage["outcar"]["force_alignment"]["reason"]
+    assert stage["ionic_steps"][0]["max_force"] is None
+    assert stage["ionic_steps"][0]["force_over_abs_EDIFFG"] is None
+    assert "OUTCAR force-block alignment discrepancy" in " ".join(stage["unavailable"])
+
+
+def test_serialize_job_trajectory_evidence_retains_full_ionic_sequence() -> None:
+    ionic_steps = tuple(
+        IonicStepObservation(
+            index,
+            8,
+            -10.0 - index,
+            -9.9 - index,
+            -0.1,
+            round(0.1 * index, 1),
+            "OUTCAR",
+        )
+        for index in range(1, 8)
+    )
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria={"NELM": 60, "EDIFF": 1e-6, "NSW": 20, "EDIFFG": -0.01, "ISIF": 3},
+        completed_ionic_steps=7,
+        electronic_iterations=(8,) * 7,
+        electronic_cycles=tuple(
+            electronic_cycle(index, 8, dE=1e-7)
+            for index in range(1, 8)
+        ),
+        ionic_steps=ionic_steps,
+        converged_electronic=True,
+        converged_ionic=False,
+    )
+    direct = run_resource.DirectVaspInspection(
+        directory=DIRECT_DIR,
+        artifacts=(),
+        executed_inputs=(),
+        scientific=ScientificResult(source_paths=()),
+        trajectory=trajectory,
+        assessments=assess_convergence_progress((trajectory,)),
+    )
+    inspection = JobInspection(
+        job_id="20893681",
+        scheduler=None,
+        scheduler_error=None,
+        scheduler_work_dir=DIRECT_DIR,
+        calculation_directory=DIRECT_DIR,
+        calculation_type="direct VASP",
+        calculation_reason=None,
+        direct_vasp=direct,
+    )
+
+    payload = serialize_job_trajectory_evidence(inspection)
+    exported_steps = payload["stages"][0]["ionic_steps"]
+
+    assert len(exported_steps) == 7
+    assert [step["step_index"] for step in exported_steps] == list(range(1, 8))
+    assert payload["stages"][0]["completed_ionic_steps"] == 7
+    assert payload["stages"][0]["ionic_steps"][-1]["max_force"] == 0.7
+
+
+def test_cli_job_trajectory_json_uses_existing_inspection_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trajectory = trajectory_observation(
+        completed_ionic_steps=1,
+        electronic_iterations=(8,),
+        ionic_steps=(IonicStepObservation(1, 8, -10.0, -9.9, -0.1, 0.02, "OUTCAR"),),
+        criteria={"NELM": 60, "EDIFFG": -0.01},
+    )
+    direct = run_resource.DirectVaspInspection(
+        directory=DIRECT_DIR,
+        artifacts=(),
+        executed_inputs=(),
+        scientific=ScientificResult(source_paths=()),
+        trajectory=trajectory,
+        assessments=assess_convergence_progress((trajectory,)),
+    )
+    inspection = JobInspection(
+        job_id="20893681",
+        scheduler=SlurmAccountingRecord(
+            job_id="20893681",
+            name="direct-vasp",
+            state="TIMEOUT",
+            elapsed="06:00:20",
+            start="2026-08-30T00:00:00",
+            end="2026-08-30T06:00:20",
+            partition="leeburton-pool",
+            exit_code="0:0",
+            node_list="compute-0-269",
+            allocated_cpus=24,
+            work_dir=DIRECT_DIR,
+        ),
+        scheduler_error=None,
+        scheduler_work_dir=DIRECT_DIR,
+        calculation_directory=DIRECT_DIR,
+        calculation_type="direct VASP",
+        calculation_reason=None,
+        direct_vasp=direct,
+    )
+    registry = ResourceRegistry(repositories={}, clusters={"powerslurm": cluster()})
+    calls: list[str] = []
+
+    def fake_inspect_slurm_job(
+        cluster: SlurmClusterResource,
+        job_id: str,
+        **kwargs: object,
+    ) -> JobInspection:
+        calls.append(job_id)
+        return inspection
+
+    def fail_text_summary(inspection: JobInspection) -> None:
+        raise AssertionError("text summary should not be used for trajectory JSON")
+
+    monkeypatch.setattr(cli, "load_resources", lambda: registry)
+    monkeypatch.setattr(cli, "modifier_policies_from_compute", lambda registry: ((), None))
+    monkeypatch.setattr(cli, "inspect_slurm_job", fake_inspect_slurm_job)
+    monkeypatch.setattr(cli, "print_job_inspection", fail_text_summary)
+
+    exit_code = cli.main(["job", "20893681", "--trajectory-json"])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert calls == ["20893681"]
+    assert "BMD Job Inspection" not in captured.out
+    assert payload["schema_version"] == 1
+    assert payload["job"]["scheduler_state"] == "TIMEOUT"
+    assert payload["stages"][0]["ionic_steps"][0]["max_force"] == 0.02
+    assert captured.err == ""
+
+
+def test_cli_job_without_trajectory_json_keeps_normal_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry = ResourceRegistry(repositories={}, clusters={"powerslurm": cluster()})
+    inspection = JobInspection(
+        job_id="20893681",
+        scheduler=None,
+        scheduler_error="not available",
+        scheduler_work_dir=None,
+        calculation_directory=None,
+        calculation_type="unknown",
+        calculation_reason="scheduler accounting was unavailable",
+    )
+
+    monkeypatch.setattr(cli, "load_resources", lambda: registry)
+    monkeypatch.setattr(cli, "modifier_policies_from_compute", lambda registry: ((), None))
+    monkeypatch.setattr(cli, "inspect_slurm_job", lambda *args, **kwargs: inspection)
+
+    exit_code = cli.main(["job", "20893681"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.startswith("BMD Job Inspection\n==================\n\n")
+    assert "Job (scheduler_observation):" in captured.out
+    assert "{" not in captured.out
 
 
 def test_diagnose_malformed_vasprun_keeps_oszicar_evidence_and_quiet_cli(
