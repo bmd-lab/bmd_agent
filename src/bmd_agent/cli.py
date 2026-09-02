@@ -26,6 +26,7 @@ from bmd_agent.resources.run import (
     RunComparison,
     RunInspectionError,
     compare_remote_runs,
+    derive_trajectory_progress_evidence,
     diagnose_remote_run,
     inspect_slurm_job,
     inspect_remote_run,
@@ -795,6 +796,7 @@ def _print_trajectory_observations(trajectories: tuple[object, ...]) -> bool:
         _print_trajectory_criteria(trajectory)
         _print_electronic_trajectory(trajectory)
         _print_ionic_trajectory(trajectory)
+        _print_trajectory_progress_evidence(trajectory)
         print("    convergence flags:")
         print(f"      electronic: {_diagnosis_value(trajectory.converged_electronic)}")
         print(f"      ionic: {_diagnosis_value(trajectory.converged_ionic)}")
@@ -995,6 +997,53 @@ def _print_outcar_force_source(trajectory: object) -> None:
         print(f"      OUTCAR force alignment: {alignment_status} ({alignment_reason})")
 
 
+def _print_trajectory_progress_evidence(trajectory: object) -> None:
+    evidence = derive_trajectory_progress_evidence(trajectory)
+    if evidence.atomic_force_status != "available":
+        return
+
+    print("    atomic-force trajectory summary (trajectory_progress_evidence):")
+    if evidence.force_criterion_magnitude_eV_A is not None:
+        print(
+            "      criterion magnitude: "
+            f"{_format_force(evidence.force_criterion_magnitude_eV_A)} eV/A"
+        )
+    print(
+        "      initial/current/best: "
+        f"{_format_force(evidence.initial_max_force_eV_A)} / "
+        f"{_format_force(evidence.current_max_force_eV_A)} / "
+        f"{_format_force(evidence.best_max_force_eV_A)} eV/A"
+    )
+    if evidence.best_force_step is not None:
+        print(f"      best observed at ionic step: {evidence.best_force_step}")
+    if evidence.initial_force_over_abs_EDIFFG is not None:
+        print(
+            "      relative to criterion: "
+            f"initial {_format_ratio(evidence.initial_force_over_abs_EDIFFG)}, "
+            f"current {_format_ratio(evidence.current_force_over_abs_EDIFFG)}, "
+            f"best {_format_ratio(evidence.best_force_over_abs_EDIFFG)}"
+        )
+    if evidence.initial_to_best_force_ratio is not None:
+        print(
+            "      force ratios: "
+            f"initial/current {_format_ratio(evidence.initial_to_current_force_ratio)}, "
+            f"initial/best {_format_ratio(evidence.initial_to_best_force_ratio)}, "
+            f"current/best {_format_ratio(evidence.current_to_best_force_ratio)}"
+        )
+    if evidence.new_best_force_count is not None:
+        print(f"      new best observations: {evidence.new_best_force_count}")
+    if evidence.min_electronic_iterations is not None:
+        print(
+            "      electronic iterations per completed ionic step: "
+            f"min {evidence.min_electronic_iterations}, "
+            f"median {_format_decimal(evidence.median_electronic_iterations)}, "
+            f"max {evidence.max_electronic_iterations}"
+        )
+    for limitation in evidence.limitations:
+        if "variable-cell convergence" in limitation:
+            print(f"      note: {limitation}")
+
+
 def _nelm_suffix(trajectory: object) -> str:
     criteria = getattr(trajectory, "criteria", {})
     if isinstance(criteria, Mapping) and "NELM" in criteria:
@@ -1045,6 +1094,21 @@ def _format_count_sequence(values: tuple[int, ...]) -> str:
         return "[" + ", ".join(str(value) for value in values) + "]"
     recent = ", ".join(str(value) for value in values[-5:])
     return f"{len(values)} values, last five [{recent}]"
+
+
+def _format_force(value: object) -> str:
+    numeric = _float_or_none(value)
+    return "unavailable" if numeric is None else f"{numeric:.6f}"
+
+
+def _format_ratio(value: object) -> str:
+    numeric = _float_or_none(value)
+    return "unavailable" if numeric is None else f"{numeric:.2f}x"
+
+
+def _format_decimal(value: object) -> str:
+    numeric = _float_or_none(value)
+    return "unavailable" if numeric is None else f"{numeric:g}"
 
 
 def _diagnosis_value(value: object) -> str:

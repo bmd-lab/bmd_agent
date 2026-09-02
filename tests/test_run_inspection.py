@@ -42,6 +42,7 @@ from bmd_agent.resources.run import (
     RunInspectionError,
     ScientificResult,
     StageTrajectoryObservation,
+    TRAJECTORY_PROGRESS_EVIDENCE,
     TerminationObservation,
     StructureObservation,
     TRAJECTORY_OBSERVATION,
@@ -50,6 +51,7 @@ from bmd_agent.resources.run import (
     build_run_comparison,
     compare_remote_runs,
     compare_requested_options_to_executed_inputs,
+    derive_trajectory_progress_evidence,
     diagnose_remote_run,
     inspect_remote_run,
     inspect_slurm_job,
@@ -241,6 +243,72 @@ def assessment_by_scope(
         if assessment.scope == scope:
             return assessment
     raise AssertionError(f"missing {scope} assessment")
+
+
+def force_progress_trajectory(
+    forces: tuple[float | None, ...],
+    *,
+    criteria: dict[str, object] | None = None,
+    electronic_counts: tuple[int, ...] | None = None,
+    alignment_status: str | None = "aligned",
+    alignment_reason: str | None = None,
+) -> StageTrajectoryObservation:
+    counts = electronic_counts or tuple(8 for _ in forces)
+    ionic_steps = tuple(
+        IonicStepObservation(
+            index,
+            counts[index - 1] if index - 1 < len(counts) else None,
+            -100.0 - index,
+            -99.9 - index,
+            -0.1,
+            force,
+            "OUTCAR" if force is not None else None,
+        )
+        for index, force in enumerate(forces, start=1)
+    )
+    blocks = tuple(
+        OutcarForceBlockObservation(
+            index,
+            24,
+            "complete",
+            True,
+            f"{FLOW_ROOT}/OUTCAR",
+            force,
+        )
+        for index, force in enumerate(forces, start=1)
+        if force is not None
+    )
+    trajectory = trajectory_observation(
+        stage_type="relax",
+        criteria=(
+            {"NELM": 200, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01}
+            if criteria is None
+            else criteria
+        ),
+        completed_ionic_steps=len(forces),
+        electronic_iterations=counts,
+        electronic_cycles=tuple(
+            electronic_cycle(index, count, dE=1e-7)
+            for index, count in enumerate(counts, start=1)
+        ),
+        ionic_steps=ionic_steps,
+        converged_electronic=True,
+        converged_ionic=False,
+    )
+    return replace(
+        trajectory,
+        outcar_path=f"{FLOW_ROOT}/OUTCAR",
+        outcar_present=True,
+        outcar_expected_site_count=24,
+        outcar_force_blocks=blocks,
+        outcar_complete_force_blocks=len(blocks),
+        outcar_force_alignment_status=alignment_status,
+        outcar_force_alignment_reason=(
+            alignment_reason
+            if alignment_reason is not None
+            else f"{len(blocks)} OUTCAR force block(s) aligned with OSZICAR completed ionic steps"
+        ),
+    )
 
 
 class RemoteFixture:
@@ -1684,6 +1752,129 @@ def test_direct_vasp_outcar_force_extraction_uses_fixed_read_only_command() -> N
     assert "POTCAR" not in commands
 
 
+def test_trajectory_progress_evidence_describes_force_history_without_assessment_change() -> None:
+    trajectory = force_progress_trajectory(
+        (0.854786, 0.2, 0.014801, 0.08, 0.071891),
+        criteria={"NELM": 200, "EDIFF": 1e-6, "NSW": 99, "EDIFFG": -0.01, "ISIF": 3},
+        electronic_counts=(12, 14, 20, 18, 16),
+    )
+
+    progress = derive_trajectory_progress_evidence(trajectory)
+    assessments = assess_convergence_progress((trajectory,))
+
+    assert progress.evidence_type == TRAJECTORY_PROGRESS_EVIDENCE
+    assert progress.atomic_force_status == "available"
+    assert progress.force_source == "OUTCAR"
+    assert progress.force_observation_count == 5
+    assert progress.force_criterion_magnitude_eV_A == 0.01
+    assert progress.initial_max_force_eV_A == 0.854786
+    assert progress.current_max_force_eV_A == 0.071891
+    assert progress.best_max_force_eV_A == 0.014801
+    assert progress.best_force_step == 3
+    assert progress.initial_force_over_abs_EDIFFG == pytest.approx(85.4786)
+    assert progress.current_force_over_abs_EDIFFG == pytest.approx(7.1891)
+    assert progress.best_force_over_abs_EDIFFG == pytest.approx(1.4801)
+    assert progress.initial_to_current_force_ratio == pytest.approx(
+        round(0.854786 / 0.071891, 6)
+    )
+    assert progress.initial_to_best_force_ratio == pytest.approx(
+        round(0.854786 / 0.014801, 6)
+    )
+    assert progress.current_to_best_force_ratio == pytest.approx(
+        round(0.071891 / 0.014801, 6)
+    )
+    assert progress.new_best_force_count == 3
+    assert progress.min_electronic_iterations == 12
+    assert progress.median_electronic_iterations == 16.0
+    assert progress.max_electronic_iterations == 20
+    assert "variable-cell convergence" in " ".join(progress.limitations)
+    assert assessment_by_scope(assessments, "ionic").label == INSUFFICIENT_EVIDENCE
+    assert assessment_by_scope(assessments, "stage").label == INSUFFICIENT_EVIDENCE
+
+
+def test_trajectory_progress_evidence_uses_first_best_force_occurrence() -> None:
+    trajectory = force_progress_trajectory((0.5, 0.2, 0.2, 0.3))
+
+    progress = derive_trajectory_progress_evidence(trajectory)
+
+    assert progress.best_max_force_eV_A == 0.2
+    assert progress.best_force_step == 2
+    assert progress.new_best_force_count == 2
+
+
+@pytest.mark.parametrize("criteria", [{"EDIFFG": 0.01}, {"EDIFFG": 0}, {}])
+def test_trajectory_progress_evidence_has_null_criterion_ratios_without_negative_ediffg(
+    criteria: dict[str, object],
+) -> None:
+    trajectory = force_progress_trajectory((0.5, 0.25), criteria=criteria)
+
+    progress = derive_trajectory_progress_evidence(trajectory)
+
+    assert progress.force_criterion_magnitude_eV_A is None
+    assert progress.initial_force_over_abs_EDIFFG is None
+    assert progress.current_force_over_abs_EDIFFG is None
+    assert progress.best_force_over_abs_EDIFFG is None
+
+
+def test_trajectory_progress_evidence_handles_zero_force_denominators() -> None:
+    trajectory = force_progress_trajectory((1.0, 0.0))
+
+    progress = derive_trajectory_progress_evidence(trajectory)
+
+    assert progress.current_max_force_eV_A == 0.0
+    assert progress.best_max_force_eV_A == 0.0
+    assert progress.current_force_over_abs_EDIFFG == 0.0
+    assert progress.best_force_over_abs_EDIFFG == 0.0
+    assert progress.initial_to_current_force_ratio is None
+    assert progress.initial_to_best_force_ratio is None
+    assert progress.current_to_best_force_ratio is None
+    assert "denominator force is zero" in " ".join(progress.limitations)
+
+
+def test_trajectory_progress_evidence_reports_even_length_electronic_median() -> None:
+    trajectory = force_progress_trajectory(
+        (0.5, 0.4, 0.3, 0.2),
+        electronic_counts=(5, 9, 17, 21),
+    )
+
+    progress = derive_trajectory_progress_evidence(trajectory)
+
+    assert progress.min_electronic_iterations == 5
+    assert progress.median_electronic_iterations == 13.0
+    assert progress.max_electronic_iterations == 21
+
+
+def test_trajectory_progress_evidence_reports_missing_force_evidence() -> None:
+    trajectory = force_progress_trajectory((None, None), electronic_counts=(7, 9))
+
+    progress = derive_trajectory_progress_evidence(trajectory)
+
+    assert progress.atomic_force_status == "unavailable"
+    assert progress.initial_max_force_eV_A is None
+    assert progress.best_force_step is None
+    assert progress.new_best_force_count is None
+    assert progress.electronic_iteration_status == "available"
+    assert progress.min_electronic_iterations == 7
+    assert "completed-step atomic maximum-force evidence unavailable" in " ".join(
+        progress.limitations
+    )
+
+
+def test_trajectory_progress_evidence_rejects_discrepant_outcar_alignment() -> None:
+    trajectory = force_progress_trajectory(
+        (0.5, 0.25),
+        alignment_status="discrepancy",
+        alignment_reason="OSZICAR completed ionic steps 2 did not align with OUTCAR blocks",
+    )
+
+    progress = derive_trajectory_progress_evidence(trajectory)
+
+    assert progress.atomic_force_status == "unavailable"
+    assert progress.force_observation_count == 0
+    assert progress.initial_max_force_eV_A is None
+    assert "aligned OUTCAR force evidence unavailable" in " ".join(progress.limitations)
+
+
 def test_serialize_job_trajectory_evidence_completed_direct_vasp_job() -> None:
     remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
 
@@ -1696,6 +1887,9 @@ def test_serialize_job_trajectory_evidence_completed_direct_vasp_job() -> None:
     )
 
     payload = serialize_job_trajectory_evidence(inspection)
+    commands_after_inspection = list(remote.commands)
+    serialize_job_trajectory_evidence(inspection)
+    assert remote.commands == commands_after_inspection
 
     assert payload["schema_version"] == 1
     assert payload["job"]["job_id"] == "20893681"
@@ -1734,6 +1928,13 @@ def test_serialize_job_trajectory_evidence_completed_direct_vasp_job() -> None:
     assert stage["ionic_steps"][0]["max_force"] == 5.0
     assert stage["ionic_steps"][0]["max_force_source"] == "OUTCAR"
     assert stage["ionic_steps"][0]["force_over_abs_EDIFFG"] == 500.0
+    progress = stage["trajectory_progress_evidence"]
+    assert progress["evidence_type"] == TRAJECTORY_PROGRESS_EVIDENCE
+    assert progress["atomic_force_status"] == "available"
+    assert progress["initial_max_force_eV_A"] == 5.0
+    assert progress["current_max_force_eV_A"] == 0.5
+    assert progress["best_force_step"] == 2
+    assert progress["ionic_dE_semantics"].startswith("VASP OSZICAR ionic-line d E")
     assert payload["convergence_progress_assessment"]
     assert "POTCAR" not in json.dumps(payload, sort_keys=True)
 
@@ -1839,6 +2040,28 @@ def test_serialize_job_trajectory_evidence_retains_full_ionic_sequence() -> None
         converged_electronic=True,
         converged_ionic=False,
     )
+    trajectory = replace(
+        trajectory,
+        outcar_path=f"{DIRECT_DIR}/OUTCAR",
+        outcar_present=True,
+        outcar_expected_site_count=24,
+        outcar_force_blocks=tuple(
+            OutcarForceBlockObservation(
+                index,
+                24,
+                "complete",
+                True,
+                f"{DIRECT_DIR}/OUTCAR",
+                round(0.1 * index, 1),
+            )
+            for index in range(1, 8)
+        ),
+        outcar_complete_force_blocks=7,
+        outcar_force_alignment_status="aligned",
+        outcar_force_alignment_reason=(
+            "7 OUTCAR force block(s) aligned with OSZICAR completed ionic steps"
+        ),
+    )
     direct = run_resource.DirectVaspInspection(
         directory=DIRECT_DIR,
         artifacts=(),
@@ -1865,6 +2088,7 @@ def test_serialize_job_trajectory_evidence_retains_full_ionic_sequence() -> None
     assert [step["step_index"] for step in exported_steps] == list(range(1, 8))
     assert payload["stages"][0]["completed_ionic_steps"] == 7
     assert payload["stages"][0]["ionic_steps"][-1]["max_force"] == 0.7
+    assert payload["stages"][0]["trajectory_progress_evidence"]["force_observation_count"] == 7
 
 
 def test_cli_job_trajectory_json_uses_existing_inspection_once(
@@ -3399,6 +3623,11 @@ def test_cli_prints_compact_outcar_force_evidence_without_full_history(
     assert "OUTCAR complete force blocks: 7" in captured.out
     assert "OUTCAR expected site count: 24" in captured.out
     assert "ISIF: 2" in captured.out
+    assert "atomic-force trajectory summary (trajectory_progress_evidence):" in captured.out
+    assert "criterion magnitude: 0.010000 eV/A" in captured.out
+    assert "initial/current/best: 0.100000 / 0.700000 / 0.100000 eV/A" in captured.out
+    assert "best observed at ionic step: 1" in captured.out
+    assert "electronic iterations per completed ionic step: min 8, median 8, max 8" in captured.out
     assert "step 3" in captured.out
     assert "step 7" in captured.out
     assert "max_force=0.7 [OUTCAR]" in captured.out
