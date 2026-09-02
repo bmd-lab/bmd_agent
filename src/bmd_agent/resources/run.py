@@ -86,6 +86,7 @@ _DIAGNOSE_VASPRUN_MAX_BYTES = 50_000_000
 _DIAGNOSE_RECENT_WINDOW = 5
 _DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF")
 _OUTCAR_FORCE_EXTRACTION_SCHEMA = "bmd-agent-outcar-force-v1"
+_JOB_TRAJECTORY_JSON_SCHEMA_VERSION = 1
 _INCOMPLETE_VASPRUN_TRAJECTORY_REASON = "file could not be parsed completely"
 _UNREADABLE_VASPRUN_TRAJECTORY_REASON = "file could not be read"
 _PACKAGE_RE = re.compile(r"^\[runner\]\s+(\w+)\s+version:\s*(.+)$")
@@ -878,6 +879,284 @@ def inspect_slurm_job(
         calculation_reason=None,
         direct_vasp=direct,
     )
+
+
+def serialize_job_trajectory_evidence(inspection: JobInspection) -> Mapping[str, Any]:
+    """Serialize already-observed compact trajectory evidence for analysis."""
+
+    trajectories = _job_trajectories(inspection)
+    assessments = _job_assessments(inspection)
+    return {
+        "schema_version": _JOB_TRAJECTORY_JSON_SCHEMA_VERSION,
+        "job": _serialize_job_summary(inspection),
+        "calculation": _serialize_calculation_summary(inspection),
+        "stages": [
+            _serialize_stage_trajectory(trajectory)
+            for trajectory in trajectories
+        ],
+        "convergence_progress_assessment": [
+            _serialize_convergence_assessment(assessment)
+            for assessment in assessments
+        ],
+    }
+
+
+def _job_trajectories(
+    inspection: JobInspection,
+) -> tuple[StageTrajectoryObservation, ...]:
+    if inspection.bmd_compute is not None:
+        return inspection.bmd_compute.trajectories
+    if inspection.direct_vasp is not None:
+        return (inspection.direct_vasp.trajectory,)
+    return ()
+
+
+def _job_assessments(
+    inspection: JobInspection,
+) -> tuple[ConvergenceProgressAssessment, ...]:
+    if inspection.bmd_compute is not None:
+        return inspection.bmd_compute.assessments
+    if inspection.direct_vasp is not None:
+        return inspection.direct_vasp.assessments
+    return ()
+
+
+def _serialize_job_summary(inspection: JobInspection) -> Mapping[str, Any]:
+    record = inspection.scheduler
+    return {
+        "job_id": inspection.job_id,
+        "job_name": getattr(record, "name", None),
+        "node_list": getattr(record, "node_list", None),
+        "scheduler_state": getattr(record, "state", None),
+        "exit_code": getattr(record, "exit_code", None),
+        "elapsed": getattr(record, "elapsed", None),
+        "elapsed_raw": getattr(record, "elapsed_raw", None),
+        "timelimit": getattr(record, "timelimit", None),
+        "allocated_cpus": getattr(record, "allocated_cpus", None),
+        "work_dir": getattr(record, "work_dir", None) or inspection.scheduler_work_dir,
+        "scheduler_error": inspection.scheduler_error,
+        "evidence_type": SCHEDULER_OBSERVATION,
+    }
+
+
+def _serialize_calculation_summary(inspection: JobInspection) -> Mapping[str, Any]:
+    return {
+        "calculation_type": inspection.calculation_type,
+        "calculation_directory": inspection.calculation_directory,
+        "calculation_reason": inspection.calculation_reason,
+        "producer_provenance": _serialize_job_producer_provenance(inspection),
+    }
+
+
+def _serialize_job_producer_provenance(
+    inspection: JobInspection,
+) -> Mapping[str, Any]:
+    if inspection.bmd_compute is not None:
+        run = inspection.bmd_compute.inspection
+        status = "available" if run.producer_git else "unavailable"
+        return {
+            "status": status,
+            "evidence_type": PRODUCER_PROVENANCE,
+            "flow_root": run.flow_root,
+            "submission_path": run.submission_path,
+            "git_commit": run.producer_git.get("git_commit"),
+            "git_state": run.producer_git.get("state"),
+            "dirty": run.producer_git.get("dirty"),
+            "reason": (
+                None
+                if status == "available"
+                else "producer git provenance unavailable"
+            ),
+        }
+    if inspection.direct_vasp is not None:
+        return {
+            "status": "unavailable",
+            "evidence_type": PRODUCER_PROVENANCE,
+            "reason": inspection.direct_vasp.producer_reason,
+        }
+    return {
+        "status": "unavailable",
+        "evidence_type": PRODUCER_PROVENANCE,
+        "reason": inspection.calculation_reason,
+    }
+
+
+def _serialize_stage_trajectory(
+    trajectory: StageTrajectoryObservation,
+) -> Mapping[str, Any]:
+    force_criterion = _force_criterion(trajectory.criteria)
+    outcar_force_block_count = (
+        len(trajectory.outcar_force_blocks)
+        if trajectory.outcar_present and trajectory.outcar_error is None
+        else None
+    )
+    return {
+        "stage_index": trajectory.stage_index,
+        "stage_label": trajectory.stage_label,
+        "stage_type": trajectory.stage_type,
+        "theory": trajectory.theory,
+        "directory": trajectory.directory,
+        "evidence_type": trajectory.evidence_type,
+        "criteria": _serialize_trajectory_criteria(trajectory.criteria),
+        "criteria_source_values": _json_safe_value(trajectory.criteria_source_values),
+        "criteria_discrepancies": list(trajectory.criteria_discrepancies),
+        "completed_ionic_steps": trajectory.completed_ionic_steps,
+        "ionic_steps_observed": trajectory.ionic_steps_observed,
+        "converged_electronic": trajectory.converged_electronic,
+        "converged_ionic": trajectory.converged_ionic,
+        "outcar_force_block_count": outcar_force_block_count,
+        "outcar_force_alignment_status": trajectory.outcar_force_alignment_status,
+        "outcar_force_alignment_reason": trajectory.outcar_force_alignment_reason,
+        "oszicar": {
+            "path": trajectory.oszicar_path,
+            "present": trajectory.oszicar_present,
+            "error": trajectory.oszicar_error,
+        },
+        "vasprun": {
+            "path": trajectory.vasprun_path,
+            "present": trajectory.vasprun_present,
+            "error": trajectory.vasprun_error,
+            "skipped_reason": trajectory.vasprun_skipped_reason,
+            "ionic_steps": trajectory.vasprun_ionic_steps,
+        },
+        "outcar": {
+            "path": trajectory.outcar_path,
+            "present": trajectory.outcar_present,
+            "error": trajectory.outcar_error,
+            "failure_kind": trajectory.outcar_failure_kind,
+            "failure_returncode": trajectory.outcar_failure_returncode,
+            "expected_site_count": trajectory.outcar_expected_site_count,
+            "force_block_count": outcar_force_block_count,
+            "complete_force_blocks": trajectory.outcar_complete_force_blocks,
+            "force_alignment": {
+                "status": trajectory.outcar_force_alignment_status,
+                "reason": trajectory.outcar_force_alignment_reason,
+            },
+            "force_blocks": [
+                _serialize_outcar_force_block(block)
+                for block in trajectory.outcar_force_blocks
+            ],
+        },
+        "electronic": {
+            "final_electronic_iteration_count": (
+                trajectory.final_electronic_iteration_count
+            ),
+            "incomplete_electronic_iteration_count": (
+                trajectory.incomplete_electronic_iteration_count
+            ),
+            "electronic_iterations_by_completed_ionic_step": list(
+                trajectory.electronic_iterations_by_completed_ionic_step
+            ),
+            "electronic_cycles": [
+                _serialize_electronic_cycle(cycle)
+                for cycle in trajectory.electronic_cycles
+            ],
+            "recent_incomplete_electronic_iterations": [
+                _serialize_electronic_iteration(iteration)
+                for iteration in trajectory.recent_incomplete_electronic_iterations
+            ],
+        },
+        "ionic_steps": [
+            _serialize_ionic_step(step, force_criterion=force_criterion)
+            for step in trajectory.ionic_steps
+        ],
+        "unavailable": list(trajectory.unavailable),
+    }
+
+
+def _serialize_trajectory_criteria(criteria: Mapping[str, Any]) -> Mapping[str, Any]:
+    return {
+        key: _json_safe_value(criteria.get(key))
+        for key in _DIAGNOSE_CRITERIA_KEYS
+    }
+
+
+def _serialize_electronic_cycle(
+    cycle: ElectronicCycleObservation,
+) -> Mapping[str, Any]:
+    return {
+        "cycle_index": cycle.cycle_index,
+        "completed_ionic_step": cycle.completed_ionic_step,
+        "iterations": cycle.iterations,
+        "final_iteration": (
+            _serialize_electronic_iteration(cycle.final_iteration)
+            if cycle.final_iteration is not None
+            else None
+        ),
+    }
+
+
+def _serialize_electronic_iteration(
+    iteration: ElectronicIterationObservation,
+) -> Mapping[str, Any]:
+    return {
+        "iteration": iteration.iteration,
+        "algorithm": iteration.algorithm,
+        "energy": iteration.energy,
+        "dE": iteration.dE,
+        "deps": iteration.deps,
+        "rms": iteration.rms,
+        "rms_c": iteration.rms_c,
+    }
+
+
+def _serialize_ionic_step(
+    step: IonicStepObservation,
+    *,
+    force_criterion: float | None,
+) -> Mapping[str, Any]:
+    force = _float_or_none(step.max_force)
+    return {
+        "step_index": step.step_index,
+        "free_energy": step.free_energy,
+        "energy_zero": step.energy_zero,
+        "ionic_dE": step.dE,
+        "electronic_iterations": step.electronic_iterations,
+        "max_force": step.max_force,
+        "max_force_source": step.max_force_source,
+        "force_over_abs_EDIFFG": (
+            _round_float(force / force_criterion)
+            if force is not None and force_criterion is not None
+            else None
+        ),
+    }
+
+
+def _serialize_outcar_force_block(
+    block: OutcarForceBlockObservation,
+) -> Mapping[str, Any]:
+    return {
+        "block_index": block.block_index,
+        "row_count": block.row_count,
+        "status": block.status,
+        "complete": block.complete,
+        "max_force_eV_per_A": block.max_force_eV_per_A,
+        "evidence_type": block.evidence_type,
+    }
+
+
+def _serialize_convergence_assessment(
+    assessment: ConvergenceProgressAssessment,
+) -> Mapping[str, Any]:
+    return {
+        "label": assessment.label,
+        "stage_index": assessment.stage_index,
+        "stage_label": assessment.stage_label,
+        "scope": assessment.scope,
+        "sufficiency": assessment.sufficiency,
+        "evidence_type": assessment.evidence_type,
+        "basis": list(assessment.basis),
+        "counter_evidence": list(assessment.counter_evidence),
+        "limitations": list(assessment.limitations),
+        "features": _json_safe_value(assessment.features),
+    }
+
+
+def _force_criterion(criteria: Mapping[str, Any]) -> float | None:
+    ediffg = _float_or_none(criteria.get("EDIFFG"))
+    if ediffg is not None and ediffg < 0:
+        return abs(ediffg)
+    return None
 
 
 def assess_convergence_progress(
