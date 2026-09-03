@@ -24,9 +24,11 @@ protected = true
 live = true
 
 # Python executable from BMD Compute's own environment. BMD Agent uses this
-# only to run:
+# only to run fixed read-only producer modules from the configured checkout,
+# currently:
 #
 #   python -m backend.calculations.capabilities
+#   python -m backend.calculations.input_reference
 #
 # from the configured checkout.
 capability_python = "/home/example/micromamba/envs/bmd-compute/bin/python"
