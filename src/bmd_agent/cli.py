@@ -18,6 +18,10 @@ from bmd_agent.resources.compute import (
     inspect_compute_capabilities,
 )
 from bmd_agent.resources.git import GitInspection, inspect_repository
+from bmd_agent.resources.input_check import (
+    InputCheckObservation,
+    check_remote_input_directory,
+)
 from bmd_agent.resources.run import (
     PRODUCER_REQUESTED,
     JobInspection,
@@ -265,6 +269,134 @@ def show_structure(directory: str, registry: ResourceRegistry | None = None) -> 
     print(f"  c: {info.c:.6f} A")
 
     return 0
+
+
+def show_check_input(args: list[str], registry: ResourceRegistry | None = None) -> int:
+    """Display a BMD Compute generated-reference comparison for proposed inputs."""
+
+    parsed, error = _parse_check_input_args(args)
+    if error:
+        print(f"Usage: {_check_input_usage()}")
+        print(f"Error: {error}")
+        return 2
+
+    assert parsed is not None
+    registry = registry or load_resources()
+    cluster = powerslurm_cluster(registry)
+    repository = bmd_compute_repository(registry)
+
+    try:
+        observation = check_remote_input_directory(
+            cluster,
+            repository,
+            parsed["directory"],
+            stage=parsed["stage"],
+            theory=parsed["theory"],
+            nodes=parsed["nodes"],
+            ntasks=parsed["ntasks"],
+            mem_gb=parsed["mem_gb"],
+        )
+
+    except RemotePathError as exc:
+        print(f"Refusing remote read: {exc}")
+        return 2
+
+    except ValueError as exc:
+        print(f"Usage: {_check_input_usage()}")
+        print(f"Error: {exc}")
+        return 2
+
+    print_input_check(observation)
+    return 0
+
+
+def print_input_check(observation: InputCheckObservation) -> None:
+    """Print a concise user-facing BMD VASP input check summary."""
+
+    print("BMD VASP Input Check")
+    print("====================")
+    print()
+
+    print("Proposed calculation:")
+    print(f"  {_display_theory(observation.theory)} {_display_stage(observation.stage_type)}")
+    print()
+
+    print("Input directory:")
+    print(f"  {observation.remote_directory}")
+    print()
+
+    print("Supplied structure:")
+    if observation.proposed.error:
+        print(f"  unavailable: {observation.proposed.error}")
+    else:
+        _print_optional_value("formula", observation.proposed.reduced_formula)
+        _print_optional_value("sites", observation.proposed.site_count)
+    print()
+
+    print("Reference resources:")
+    _print_mapping_values(dict(observation.resources), ("nodes", "ntasks", "mem_gb"))
+    print()
+
+    print("BMD Compute reference:")
+    print(f"  producer:       {observation.reference.producer_repository or 'unavailable'}")
+    print(f"  commit:         {_display_commit(observation.reference.producer_commit)}")
+    print(f"  state:          {_display_dirty_state(observation.reference.producer_dirty)}")
+    print(f"  schema_version: {_display_value(observation.reference.schema_version)}")
+    print(f"  phase:          {_display_value(observation.reference.reference_phase)}")
+    if observation.reference.workflow_label:
+        print(f"  workflow:       {observation.reference.workflow_label}")
+    if observation.reference.error_code or observation.reference.error_message:
+        print("  producer status:")
+        if observation.reference.error_code:
+            print(f"    code: {observation.reference.error_code}")
+        if observation.reference.error_message:
+            print(f"    message: {observation.reference.error_message}")
+    print()
+
+    print("INCAR:")
+    if observation.incar_comparisons:
+        print(f"  {observation.matching_incar_settings} settings match")
+        differences = observation.nonmatching_incar_settings
+        if differences:
+            print()
+            print("  differences:")
+            for comparison in differences:
+                print(f"    {comparison.setting}")
+                print(f"      supplied:  {_format_input_value(comparison.supplied_value)}")
+                print(f"      reference: {_format_input_value(comparison.reference_value)}")
+                print(f"      status:    {comparison.status}")
+    else:
+        print("  unavailable")
+    print()
+
+    print("KPOINTS:")
+    if observation.kpoints_comparison is None:
+        print("  unavailable")
+    else:
+        comparison = observation.kpoints_comparison
+        print(f"  supplied:  {_display_value(comparison.supplied_summary)}")
+        print(f"  reference: {_display_value(comparison.reference_summary)}")
+        print(f"  status:    {comparison.status}")
+        if comparison.reason:
+            print(f"  reason:    {comparison.reason}")
+    print()
+
+    print("Overall:")
+    print(f"  {observation.overall_status}")
+    if observation.limitations:
+        for limitation in observation.limitations:
+            print(f"  reason: {limitation}")
+    print()
+
+    print("Note:")
+    print(
+        "  This compares the supplied input with the current BMD Compute "
+        "generated reference."
+    )
+    print(
+        "  A difference is not by itself evidence that the supplied setting "
+        "is scientifically invalid."
+    )
 
 
 def show_inspect_run(flow_root: str, registry: ResourceRegistry | None = None) -> int:
@@ -1122,6 +1254,83 @@ def _float_or_none(value: object) -> float | None:
         return None
 
 
+def _parse_check_input_args(args: list[str]) -> tuple[dict[str, Any] | None, str | None]:
+    if not args:
+        return None, "missing remote directory"
+
+    directory = args[0]
+    remaining = args[1:]
+    if len(remaining) % 2 != 0:
+        return None, "options must be provided as --name value pairs"
+
+    option_names = {"--stage", "--theory", "--nodes", "--ntasks", "--mem-gb"}
+    values: dict[str, str] = {}
+    for index in range(0, len(remaining), 2):
+        name = remaining[index]
+        value = remaining[index + 1]
+        if name not in option_names:
+            return None, f"unknown option {name}"
+        if name in values:
+            return None, f"duplicate option {name}"
+        values[name] = value
+
+    missing = [name for name in option_names if name not in values]
+    if missing:
+        return None, "missing required option(s): " + ", ".join(sorted(missing))
+
+    try:
+        nodes = _positive_cli_int(values["--nodes"], "--nodes")
+        ntasks = _positive_cli_int(values["--ntasks"], "--ntasks")
+        mem_gb = _positive_cli_int(values["--mem-gb"], "--mem-gb")
+    except ValueError as exc:
+        return None, str(exc)
+
+    stage = values["--stage"].strip()
+    theory = values["--theory"].strip()
+    if not stage:
+        return None, "--stage must not be empty"
+    if not theory:
+        return None, "--theory must not be empty"
+
+    return {
+        "directory": directory,
+        "stage": stage,
+        "theory": theory,
+        "nodes": nodes,
+        "ntasks": ntasks,
+        "mem_gb": mem_gb,
+    }, None
+
+
+def _positive_cli_int(value: str, label: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return parsed
+
+
+def _check_input_usage() -> str:
+    return (
+        "bmd-agent check-input <remote-directory> --stage <stage> "
+        "--theory <theory> --nodes <n> --ntasks <n> --mem-gb <n>"
+    )
+
+
+def _display_value(value: object) -> str:
+    return "unavailable" if value is None else str(value)
+
+
+def _format_input_value(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
 def bmd_compute_repository(registry: ResourceRegistry) -> GitRepositoryResource:
     """Return the configured BMD Compute repository resource."""
 
@@ -1186,6 +1395,9 @@ def main(argv: list[str] | None = None) -> int:
 
             return show_structure(argv[1])
 
+        if command == "check-input":
+            return show_check_input(argv[1:])
+
         if command == "inspect-run":
             if len(argv) < 2:
                 print("Usage: bmd-agent inspect-run <remote-flow-root>")
@@ -1215,6 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
     print("  job <SLURM_JOB_ID> [--trajectory-json]")
     print("  compute")
     print("  structure <remote-directory>")
+    print(f"  {_check_input_usage()}")
     print("  inspect-run <remote-flow-root>")
     print("  compare-runs <flow-a> <flow-b> [<flow-c> ...]")
     print("  diagnose-run <remote-flow-root>")
