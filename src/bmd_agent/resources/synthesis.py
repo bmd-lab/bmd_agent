@@ -609,10 +609,34 @@ def _add_context_gap_items(
     items: list[ScientificEvidenceItem],
     context: EnrichedScientificContext,
 ) -> None:
+    mirrored_limitations = _mirrored_native_limitation_keys(context)
     for index, gap in enumerate(context.base.evidence_gaps):
+        if _gap_key(gap) in mirrored_limitations:
+            continue
         _add_gap_item(items, gap, f"source_context.base.evidence_gaps[{index}]")
     for index, gap in enumerate(context.evidence_gaps):
         _add_gap_item(items, gap, f"source_context.evidence_gaps[{index}]")
+
+
+def _mirrored_native_limitation_keys(
+    context: EnrichedScientificContext,
+) -> set[tuple[str, str, str]]:
+    """Return broad context gaps already emitted as native limitation items."""
+
+    keys: set[tuple[str, str, str]] = set()
+    for trajectory in _job_trajectories(context.base.job):
+        progress = derive_trajectory_progress_evidence(trajectory)
+        for limitation in progress.limitations:
+            keys.add((progress.evidence_type, _trajectory_scope(progress), limitation))
+    for assessment in _job_assessments(context.base.job):
+        scope = f"{assessment.stage_label}.{assessment.scope}"
+        for limitation in assessment.limitations:
+            keys.add((assessment.evidence_type, scope, limitation))
+    return keys
+
+
+def _gap_key(gap: EvidenceGap) -> tuple[str, str, str]:
+    return (gap.evidence_type, gap.scope, gap.reason)
 
 
 def _add_gap_item(

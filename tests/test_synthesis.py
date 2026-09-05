@@ -21,6 +21,7 @@ from bmd_agent.resources.run import (
     EXECUTED_INPUT,
     PRODUCER_REQUESTED,
     TRAJECTORY_PROGRESS_EVIDENCE,
+    ConvergenceProgressAssessment,
     JobInspection,
     WorkflowStage,
 )
@@ -282,6 +283,182 @@ def test_limitations_remain_source_separated() -> None:
         and item.subject == "BMDex composition_context"
         for item in limitation_items
     )
+
+
+def test_variable_cell_force_scope_limitation_is_not_reemitted_as_gap() -> None:
+    limitation = (
+        "atomic-force evidence only; variable-cell convergence also requires "
+        "broader cell/stress evidence"
+    )
+
+    summary = build_scientific_evidence_summary(enriched_direct_context(with_bmdex=False))
+
+    limitation_items = [
+        item for item in summary.items
+        if item.category == CATEGORY_LIMITATION and item.value == limitation
+    ]
+    mirrored_gap_items = [
+        item for item in summary.items
+        if item.category == CATEGORY_EVIDENCE_GAP and item.value == limitation
+    ]
+    assert len(limitation_items) == 1
+    assert limitation_items[0].source is not None
+    assert limitation_items[0].source.source_evidence_type == TRAJECTORY_PROGRESS_EVIDENCE
+    assert mirrored_gap_items == []
+
+
+def test_assessment_limitations_are_not_reemitted_as_gaps() -> None:
+    trend_limitation = "trend-based ionic progress assessment is not implemented in v1"
+    stage_limitation = (
+        "ionic progress evidence is insufficient for force-based stage progress assessment"
+    )
+    expected_limitations = {trend_limitation, stage_limitation}
+    inspection = direct_job()
+    assessments = (
+        ConvergenceProgressAssessment(
+            label="INSUFFICIENT EVIDENCE",
+            stage_index=1,
+            stage_label="work_dir",
+            scope="ionic",
+            sufficiency="insufficient",
+            limitations=(trend_limitation,),
+        ),
+        ConvergenceProgressAssessment(
+            label="INSUFFICIENT EVIDENCE",
+            stage_index=1,
+            stage_label="work_dir",
+            scope="stage",
+            sufficiency="insufficient",
+            limitations=(stage_limitation,),
+        ),
+    )
+    updated = replace(
+        inspection,
+        direct_vasp=replace(inspection.direct_vasp, assessments=assessments),
+    )
+
+    summary = build_scientific_evidence_summary(
+        EnrichedScientificContext(base=build_scientific_context(updated))
+    )
+
+    limitation_items = [
+        item for item in summary.items
+        if item.category == CATEGORY_LIMITATION and item.value in expected_limitations
+    ]
+    mirrored_gap_items = [
+        item for item in summary.items
+        if item.category == CATEGORY_EVIDENCE_GAP and item.value in expected_limitations
+    ]
+    assert {item.value for item in limitation_items} == expected_limitations
+    assert {
+        item.source.source_scope
+        for item in limitation_items
+        if item.source is not None
+    } == {"work_dir.ionic", "work_dir.stage"}
+    assert mirrored_gap_items == []
+
+
+def test_same_limitation_text_survives_at_distinct_assessment_scopes() -> None:
+    shared_limitation = "shared native limitation"
+    inspection = direct_job()
+    assessments = (
+        ConvergenceProgressAssessment(
+            label="INSUFFICIENT EVIDENCE",
+            stage_index=1,
+            stage_label="work_dir",
+            scope="ionic",
+            sufficiency="insufficient",
+            limitations=(shared_limitation,),
+        ),
+        ConvergenceProgressAssessment(
+            label="INSUFFICIENT EVIDENCE",
+            stage_index=1,
+            stage_label="work_dir",
+            scope="stage",
+            sufficiency="insufficient",
+            limitations=(shared_limitation,),
+        ),
+    )
+    updated = replace(
+        inspection,
+        direct_vasp=replace(inspection.direct_vasp, assessments=assessments),
+    )
+
+    summary = build_scientific_evidence_summary(
+        EnrichedScientificContext(base=build_scientific_context(updated))
+    )
+
+    limitation_items = [
+        item for item in summary.items
+        if item.category == CATEGORY_LIMITATION and item.value == shared_limitation
+    ]
+    mirrored_gap_items = [
+        item for item in summary.items
+        if item.category == CATEGORY_EVIDENCE_GAP and item.value == shared_limitation
+    ]
+    assert {
+        item.source.source_scope
+        for item in limitation_items
+        if item.source is not None
+    } == {"work_dir.ionic", "work_dir.stage"}
+    assert mirrored_gap_items == []
+
+
+def test_genuine_context_gaps_remain_evidence_gaps_after_limitation_filter() -> None:
+    trajectory = direct_trajectory(vasprun_error="file could not be parsed completely")
+
+    summary = build_scientific_evidence_summary(
+        EnrichedScientificContext(
+            base=build_scientific_context(direct_job(trajectory=trajectory))
+        )
+    )
+
+    gap_values = [
+        item.value for item in summary.items
+        if item.category == CATEGORY_EVIDENCE_GAP
+    ]
+    assert "no BMD Compute producer record found" in gap_values
+    assert "file could not be parsed completely" in gap_values
+
+
+def test_bmdex_scientific_limitations_are_not_evidence_gaps() -> None:
+    payload = mncu5_payload()
+    abundance_limitation = payload["limitations"][0]
+    context = EnrichedScientificContext(
+        base=build_scientific_context(direct_job()),
+        composition_context=BmdexCompositionEvidence(payload),
+    )
+
+    summary = build_scientific_evidence_summary(context)
+
+    assert any(
+        item.category == CATEGORY_LIMITATION
+        and item.value == abundance_limitation
+        and item.source is not None
+        and item.source.source_evidence_type == "composition_context"
+        for item in summary.items
+    )
+    assert not [
+        item for item in summary.items
+        if item.category == CATEGORY_EVIDENCE_GAP and item.value == abundance_limitation
+    ]
+
+
+def test_upstream_context_and_assessment_objects_are_not_changed_by_filter() -> None:
+    context = build_scientific_context(direct_job())
+    expected_gaps = context.evidence_gaps
+    expected_assessments = context.job.direct_vasp.assessments
+
+    summary = build_scientific_evidence_summary(
+        EnrichedScientificContext(base=context)
+    )
+
+    assert context.evidence_gaps == expected_gaps
+    assert context.job.direct_vasp.assessments == expected_assessments
+    assert [
+        item.value for item in summary.items
+        if item.category == CATEGORY_ASSESSMENT
+    ] == [assessment.label for assessment in expected_assessments]
 
 
 def test_categories_are_explicit_and_bounded() -> None:
