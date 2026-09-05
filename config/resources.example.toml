@@ -41,6 +41,15 @@ access = "read_only"
 protected = true
 live = false
 
+# Python executable from BMDex's own environment. BMD Agent uses this only
+# to run fixed read-only producer modules from the configured checkout,
+# currently:
+#
+#   python -B -m tools.composition.context_producer
+#
+# from the configured checkout.
+capability_python = "/home/example/micromamba/envs/bmdex/bin/python"
+
 [clusters.powerslurm]
 name = "PowerSLURM"
 ssh_host = "powerslurm-bmdguest"
