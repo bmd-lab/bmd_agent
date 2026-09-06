@@ -80,7 +80,9 @@ A dirty working tree must be reported, not "fixed."
 
 ## 5. BMDex
 
-BMDex is authoritative for curated BMD scientific knowledge and data.
+BMDex is authoritative for curated supporting scientific data, reference
+evidence, and non-core scientific tools. It is not the authority for BMD
+Compute's core VASP data-generation implementation.
 
 BMD Agent v0 may read and search BMDex.
 

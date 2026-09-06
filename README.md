@@ -9,6 +9,10 @@ computational infrastructure, scientific knowledge, research data,
 documentation, and software while preserving clear boundaries between
 those systems.
 
+BMD Agent's canonical ecosystem role is the understanding and coordination
+layer. It consumes evidence and capabilities exposed by BMD Compute, BMDex, and
+infrastructure without duplicating their authority.
+
 BMD Agent is an independent project. It is not part of BMD Compute,
 BMDex, BMDwiki, or the BMD Lab website.
 
@@ -18,16 +22,19 @@ The BMD software and knowledge ecosystem has distinct components with
 different responsibilities:
 
 - **BMD Compute — generate**
-  - Browser-based computational interface.
+  - Core VASP data-generation pipeline.
+  - Owns the authoritative implementation of decisions required to construct,
+    validate, execute, and provenance BMD VASP calculations.
   - Generates new computational materials data.
   - Uses pymatgen, atomate2/jobflow, VASP, and the TAU PowerSLURM
     cluster.
 
 - **BMDex — preserve**
-  - Curated scientific knowledge and datasets that the group wants to
-    carry forward.
-  - Records computational standards, methodology, provenance,
-    validation, evidence, and limitations.
+  - BMD-curated supporting scientific data, reference evidence, and non-core
+    scientific tools outside the BMD Compute VASP data-generation pipeline.
+  - Records provenance, validation evidence, limitations, chemical/composition
+    resources, structure prototypes, literature/database tooling, and
+    non-core scientific utilities.
 
 - **BMDwiki — explain**
   - Human-oriented documentation.
@@ -47,6 +54,12 @@ different responsibilities:
 
 These systems remain independently version-controlled and authoritative
 for their respective responsibilities.
+
+If a capability determines how BMD generates a VASP calculation, its
+authoritative implementation belongs in BMD Compute. If it provides supporting
+scientific data or tooling but is not part of the core VASP data-generation
+pipeline, it belongs in BMDex. BMD Agent consumes and coordinates these
+capabilities without duplicating their authority.
 
 ## Scientific philosophy
 

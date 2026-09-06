@@ -25,8 +25,8 @@ These boundaries are architectural invariants.
 
 BMD Compute must function without BMD Agent.
 
-BMDex must remain independently authoritative for curated BMD
-scientific knowledge.
+BMDex must remain independently authoritative for curated supporting
+scientific data, reference evidence, and non-core scientific tools.
 
 BMDwiki must remain independently usable as human-oriented
 documentation.
@@ -35,6 +35,18 @@ The BMD website remains the public face of the group.
 
 BMD Agent may consume information from all of these systems without
 requiring them to become components of the agent.
+
+In this ecosystem, BMD Compute is the core VASP data-generation pipeline. It
+owns the authoritative implementation of decisions required to construct,
+validate, execute, and provenance BMD VASP calculations. BMDex contains
+BMD-curated supporting scientific data, reference evidence, and non-core
+scientific tools outside that pipeline. BMD Agent consumes and coordinates
+these capabilities without duplicating their authority.
+
+If a capability determines how BMD generates a VASP calculation, its
+authoritative implementation belongs in BMD Compute. If it provides supporting
+scientific data or tooling but is not part of the core VASP data-generation
+pipeline, it belongs in BMDex.
 
 ## 3. Scientific architecture
 
@@ -338,7 +350,7 @@ For example, conceptually:
 
     bmdex:
         type: git_repository
-        role: curated_knowledge
+        role: supporting_scientific_data_and_evidence
         access: read_only
 
     powerslurm:
