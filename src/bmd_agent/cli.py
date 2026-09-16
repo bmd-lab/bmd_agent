@@ -241,6 +241,12 @@ def print_lifecycle_analysis(analysis: LifecycleAnalysis) -> None:
                 print(f"  original producer run directory: {workflow.producer_root}")
         else:
             print(f"  workflow root: {workflow.workflow_root}")
+        if workflow.stage_evidence:
+            print("  workflow stages:")
+            for stage_evidence in workflow.stage_evidence:
+                index = stage_evidence.stage_index if stage_evidence.stage_index is not None else "?"
+                status = _local_stage_status(stage_evidence)
+                print(f"    {index}. {stage_evidence.label} - {status}")
         if workflow.current_stage is not None:
             stage = workflow.current_stage
             print(f"  current stage: {stage.label} ({stage.path})")
@@ -1465,6 +1471,16 @@ def _local_file_status(observation: object) -> str:
     if size == 0:
         return "present, empty"
     return f"present, {size} bytes"
+
+
+def _local_stage_status(stage_evidence: object) -> str:
+    if getattr(stage_evidence, "normal_completion", False):
+        return "completed"
+    if getattr(stage_evidence, "has_meaningful_execution", False):
+        return "partial"
+    if getattr(stage_evidence, "has_required_inputs", False):
+        return "inputs present"
+    return "unavailable"
 
 
 def _format_input_value(value: object) -> str:

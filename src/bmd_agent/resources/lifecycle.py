@@ -5,6 +5,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 import json
 from pathlib import Path
+from pathlib import PurePosixPath
+import posixpath
 from typing import Any
 import warnings
 
@@ -46,12 +48,24 @@ class LocalStageBinding:
 
 
 @dataclass(frozen=True)
+class LocalStageEvidence:
+    label: str
+    path: Path
+    stage_index: int | None
+    producer_path: str | None
+    has_required_inputs: bool
+    has_meaningful_execution: bool
+    normal_completion: bool
+
+
+@dataclass(frozen=True)
 class BmdWorkflowDiscovery:
     workflow_root: Path
     submission_path: Path
     submission: Mapping[str, Any]
     workflow_stages: tuple[Mapping[str, Any], ...]
     stage_bindings: tuple[LocalStageBinding, ...]
+    stage_evidence: tuple[LocalStageEvidence, ...] = ()
     current_stage: LocalStageBinding | None = None
     producer_root: str | None = None
     relocated: bool = False
@@ -151,6 +165,7 @@ def _analyze_bmd_workflow(
     else:
         scheduler, scheduler_error = _lookup_scheduler(workflow.job_id, scheduler_lookup)
     normal_completion = _detect_normal_completion(target)
+    workflow_complete = _all_required_stages_complete(workflow)
     producer_success = _producer_success(workflow.attempt_state)
     scientific = _derive_local_scientific(target, workflow.submission)
     structure = _structure_from_inputs(input_files)
@@ -175,12 +190,12 @@ def _analyze_bmd_workflow(
             evidence_gaps=tuple(gaps),
         )
 
-    if workflow.relocated and normal_completion:
+    if workflow_complete:
         return LifecycleAnalysis(
             state=LifecycleState.COMPLETED,
             directory=current,
             calculation_kind="BMD Compute",
-            message="Relocated BMD Compute snapshot has durable local VASP normal-completion evidence.",
+            message="All producer-declared stages have durable local VASP normal-completion evidence.",
             input_files=input_files,
             output_files=output_files | log_files,
             bmd_workflow=workflow,
@@ -193,7 +208,7 @@ def _analyze_bmd_workflow(
             evidence_gaps=tuple(gaps),
         )
 
-    if _scheduler_success(scheduler) and (normal_completion or producer_success):
+    if _scheduler_success(scheduler) and (normal_completion or producer_success or workflow_complete):
         return LifecycleAnalysis(
             state=LifecycleState.COMPLETED,
             directory=current,
@@ -426,21 +441,26 @@ def _workflow_from_submission(
         return None
     paths = _mapping(submission.get("paths"))
     stage_bindings = _stage_bindings(root, paths, stage_count=len(stages))
+    producer_root = _producer_root_text(paths)
+    relocated_stage_bindings = _relocated_stage_bindings(
+        root,
+        paths,
+        stage_count=len(stages),
+        producer_root=producer_root,
+    )
     relocated = _is_relocated_local_snapshot(
         root,
         current,
         stage_bindings,
+        relocated_stage_bindings,
     )
     if relocated:
-        stage_bindings = _relocated_stage_bindings(
-            root,
-            paths,
-            stage_count=len(stages),
-        )
+        stage_bindings = relocated_stage_bindings
     related = current == root or any(_is_relative_to(current, binding.path) for binding in stage_bindings)
     if not related:
         return None
     current_stage = _current_stage_binding(current, root, stage_bindings)
+    stage_evidence = _stage_evidence(stage_bindings)
     attempt_state_path = _optional_local_path(
         _mapping(submission.get("submission")).get("attempt_state")
         or paths.get("submission_attempt_state"),
@@ -453,8 +473,9 @@ def _workflow_from_submission(
         submission=submission,
         workflow_stages=stages,
         stage_bindings=stage_bindings,
+        stage_evidence=stage_evidence,
         current_stage=current_stage,
-        producer_root=_producer_root_text(paths),
+        producer_root=producer_root,
         relocated=relocated,
         job_id=_find_job_id(submission, attempt_state),
         attempt_state_path=attempt_state_path,
@@ -490,28 +511,91 @@ def _relocated_stage_bindings(
     paths: Mapping[str, Any],
     *,
     stage_count: int,
+    producer_root: str | None,
 ) -> tuple[LocalStageBinding, ...]:
-    stage_index = 1 if stage_count == 1 else stage_count
-    producer_path = _path_text(paths.get("result_dir"))
-    return (LocalStageBinding("result_dir", root, stage_index, producer_path),)
+    if producer_root is None:
+        return ()
+    bindings: list[LocalStageBinding] = []
+    seen: set[Path] = set()
+    seen_producer_paths: set[str] = set()
+    stage_dirs = paths.get("stage_dirs")
+    if isinstance(stage_dirs, Mapping):
+        for index, (label, value) in enumerate(stage_dirs.items(), start=1):
+            producer_path = _path_text(value)
+            local_path = _rebase_producer_path(producer_path, producer_root, root)
+            if local_path is None:
+                continue
+            bindings.append(LocalStageBinding(str(label), local_path, index, producer_path))
+            seen.add(local_path)
+            normalized = _normalize_posix_path_text(producer_path)
+            if normalized is not None:
+                seen_producer_paths.add(normalized)
+
+    result_producer_path = _path_text(paths.get("result_dir"))
+    normalized_result = _normalize_posix_path_text(result_producer_path)
+    result_path = _rebase_producer_path(result_producer_path, producer_root, root)
+    if (
+        result_path is not None
+        and result_path not in seen
+        and (normalized_result is None or normalized_result not in seen_producer_paths)
+    ):
+        stage_index = 1 if not bindings and stage_count == 1 else stage_count
+        bindings.append(LocalStageBinding("result_dir", result_path, stage_index, result_producer_path))
+    return tuple(bindings)
 
 
 def _is_relocated_local_snapshot(
     root: Path,
     current: Path,
     bindings: Sequence[LocalStageBinding],
+    relocated_bindings: Sequence[LocalStageBinding],
 ) -> bool:
-    if current != root:
+    if current != root and not _is_relative_to(current, root):
         return False
-    if not _has_recognizable_local_vasp_evidence(root):
+    if not relocated_bindings:
         return False
     if any(_has_recognizable_local_vasp_evidence(binding.path) for binding in bindings):
         return False
-    return not any(_is_relative_to(binding.path, root) for binding in bindings)
+    if not any(_has_recognizable_local_vasp_evidence(binding.path) for binding in relocated_bindings):
+        return False
+    if current == root:
+        return True
+    return any(_is_relative_to(current, binding.path) for binding in relocated_bindings)
 
 
 def _has_recognizable_local_vasp_evidence(directory: Path) -> bool:
     return _has_meaningful_files(_observe_files(directory, _INPUT_FILENAMES + _OUTPUT_FILENAMES))
+
+
+def _stage_evidence(bindings: Sequence[LocalStageBinding]) -> tuple[LocalStageEvidence, ...]:
+    evidence: list[LocalStageEvidence] = []
+    for binding in bindings:
+        input_files = _observe_files(binding.path, _INPUT_FILENAMES)
+        output_files = _observe_files(binding.path, _OUTPUT_FILENAMES)
+        evidence.append(
+            LocalStageEvidence(
+                label=binding.label,
+                path=binding.path,
+                stage_index=binding.stage_index,
+                producer_path=binding.producer_path,
+                has_required_inputs=_has_required_inputs(input_files),
+                has_meaningful_execution=_has_meaningful_files(output_files),
+                normal_completion=_detect_normal_completion(binding.path),
+            )
+        )
+    return tuple(evidence)
+
+
+def _all_required_stages_complete(workflow: BmdWorkflowDiscovery) -> bool:
+    if not workflow.workflow_stages:
+        return False
+    required = set(range(1, len(workflow.workflow_stages) + 1))
+    completed = {
+        evidence.stage_index
+        for evidence in workflow.stage_evidence
+        if evidence.stage_index is not None and evidence.normal_completion
+    }
+    return required.issubset(completed)
 
 
 def _current_stage_binding(
@@ -776,16 +860,67 @@ def _path_text(value: Any) -> str | None:
 
 
 def _producer_root_text(paths: Mapping[str, Any]) -> str | None:
+    for key in ("workflow_root", "flow_root", "run_root", "root_dir", "run_dir"):
+        path = _path_text(paths.get(key))
+        if path is not None:
+            return path
+    stage_dirs = paths.get("stage_dirs")
+    if isinstance(stage_dirs, Mapping):
+        stage_paths = [
+            normalized
+            for normalized in (_normalize_posix_path_text(value) for value in stage_dirs.values())
+            if normalized is not None
+        ]
+        if len(set(stage_paths)) > 1:
+            try:
+                return posixpath.commonpath(stage_paths)
+            except ValueError:
+                pass
     result_dir = _path_text(paths.get("result_dir"))
     if result_dir is not None:
         return result_dir
-    stage_dirs = paths.get("stage_dirs")
     if isinstance(stage_dirs, Mapping):
         for value in reversed(tuple(stage_dirs.values())):
             path = _path_text(value)
             if path is not None:
                 return path
     return None
+
+
+def _rebase_producer_path(
+    producer_path: str | None,
+    producer_root: str,
+    acquisition_root: Path,
+) -> Path | None:
+    normalized_root = _normalize_posix_path_text(producer_root)
+    normalized_path = _normalize_posix_path_text(producer_path)
+    if normalized_root is None or normalized_path is None:
+        return None
+    try:
+        relative = PurePosixPath(normalized_path).relative_to(PurePosixPath(normalized_root))
+    except ValueError:
+        return None
+    relative_parts = () if str(relative) == "." else relative.parts
+    local_path = acquisition_root.joinpath(*relative_parts)
+    try:
+        resolved = local_path.resolve()
+    except OSError:
+        resolved = local_path.absolute()
+    if not _is_relative_to(resolved, acquisition_root):
+        return None
+    if not resolved.exists():
+        return None
+    return resolved
+
+
+def _normalize_posix_path_text(value: Any) -> str | None:
+    path = _path_text(value)
+    if path is None:
+        return None
+    normalized = posixpath.normpath(path)
+    if not PurePosixPath(normalized).is_absolute():
+        return None
+    return normalized
 
 
 def _optional_local_path(value: Any, *, root: Path) -> Path | None:

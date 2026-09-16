@@ -141,6 +141,58 @@ def write_single_stage_submission(
     (root / "submission.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+def write_three_stage_submission(
+    root: Path,
+    *,
+    producer_root: str = "/bmd-db/guest/flows/vasp_run_custom_workflow-20260912-170926",
+    stage_paths: dict[str, str] | None = None,
+    result_dir: str | None = None,
+    job_id: str = "21153721",
+) -> None:
+    stage_paths = stage_paths or {
+        "stage_01": f"{producer_root}/stage_01",
+        "stage_02": f"{producer_root}/stage_02",
+        "stage_03": f"{producer_root}/stage_03",
+    }
+    result_dir = result_dir or stage_paths["stage_03"]
+    payload = {
+        "flow_spec": {
+            "workflow_spec": {
+                "stages": [
+                    {"stage_type": "relax", "theory": "pbe", "modifiers": [], "options": {}},
+                    {"stage_type": "static", "theory": "hse06", "modifiers": [], "options": {}},
+                    {"stage_type": "dos", "theory": "hse06", "modifiers": [], "options": {}},
+                ]
+            }
+        },
+        "submission": {"job_id": job_id},
+        "paths": {
+            "workflow_root": producer_root,
+            "stage_dirs": stage_paths,
+            "result_dir": result_dir,
+        },
+    }
+    (root / "submission.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def write_stage_inputs(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    write_inputs(directory)
+
+
+def write_stage_complete(directory: Path) -> None:
+    write_stage_inputs(directory)
+    (directory / "OUTCAR").write_text(NORMAL_OUTCAR, encoding="utf-8")
+    (directory / "OSZICAR").write_text(" 1 F= -.1 E0= -.1 d E =0\n", encoding="utf-8")
+    (directory / "vasprun.xml").write_text("<modeling></modeling>", encoding="utf-8")
+
+
+def write_stage_partial(directory: Path) -> None:
+    write_stage_inputs(directory)
+    (directory / "OUTCAR").write_text("partial", encoding="utf-8")
+    (directory / "OSZICAR").write_text(" 1 F= -.1 E0= -.1 d E =0\n", encoding="utf-8")
+
+
 def test_empty_directory_is_unknown_no_calculation(tmp_path: Path) -> None:
     analysis = analyze_calculation_directory(tmp_path)
 
@@ -428,6 +480,135 @@ def test_relocated_bmd_snapshot_does_not_write_calculation_directory(tmp_path: P
     assert after == before
 
 
+def test_relocated_three_stage_workflow_rebases_declared_paths_and_completes(tmp_path: Path) -> None:
+    producer_root = "/bmd-db/guest/flows/vasp_run_custom_workflow-20260912-170926"
+    write_three_stage_submission(tmp_path, producer_root=producer_root)
+    for label in ("stage_01", "stage_02", "stage_03"):
+        write_stage_complete(tmp_path / label)
+
+    analysis = analyze_calculation_directory(
+        tmp_path,
+        scheduler_lookup=lambda job_id: scheduler_record(job_id=job_id, state="RUNNING"),
+    )
+
+    assert analysis.state == LifecycleState.COMPLETED
+    assert analysis.calculation_kind == "BMD Compute"
+    assert analysis.bmd_workflow is not None
+    assert analysis.bmd_workflow.relocated is True
+    assert analysis.bmd_workflow.producer_root == producer_root
+    assert [binding.label for binding in analysis.bmd_workflow.stage_bindings] == [
+        "stage_01",
+        "stage_02",
+        "stage_03",
+    ]
+    assert [binding.path for binding in analysis.bmd_workflow.stage_bindings] == [
+        (tmp_path / "stage_01").resolve(),
+        (tmp_path / "stage_02").resolve(),
+        (tmp_path / "stage_03").resolve(),
+    ]
+    assert [binding.producer_path for binding in analysis.bmd_workflow.stage_bindings] == [
+        f"{producer_root}/stage_01",
+        f"{producer_root}/stage_02",
+        f"{producer_root}/stage_03",
+    ]
+    assert analysis.bmd_workflow.current_stage is not None
+    assert analysis.bmd_workflow.current_stage.label == "stage_03"
+    assert analysis.input_files["INCAR"].path == (tmp_path / "stage_03" / "INCAR").resolve()
+    assert analysis.scheduler is None
+
+
+def test_relocated_three_stage_invocation_from_declared_stage_directory(tmp_path: Path) -> None:
+    write_three_stage_submission(tmp_path)
+    for label in ("stage_01", "stage_02", "stage_03"):
+        write_stage_complete(tmp_path / label)
+
+    analysis = analyze_calculation_directory(tmp_path / "stage_03")
+
+    assert analysis.state == LifecycleState.COMPLETED
+    assert analysis.bmd_workflow is not None
+    assert analysis.bmd_workflow.relocated is True
+    assert analysis.bmd_workflow.workflow_root == tmp_path.resolve()
+    assert analysis.bmd_workflow.current_stage is not None
+    assert analysis.bmd_workflow.current_stage.label == "stage_03"
+    assert analysis.calculation_kind == "BMD Compute"
+
+
+def test_relocated_three_stage_partial_terminal_without_scheduler_is_unknown(tmp_path: Path) -> None:
+    write_three_stage_submission(tmp_path)
+    write_stage_complete(tmp_path / "stage_01")
+    write_stage_complete(tmp_path / "stage_02")
+    write_stage_partial(tmp_path / "stage_03")
+
+    analysis = analyze_calculation_directory(
+        tmp_path,
+        scheduler_lookup=lambda job_id: scheduler_record(job_id=job_id, state="RUNNING"),
+    )
+
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert analysis.bmd_workflow is not None
+    assert analysis.bmd_workflow.current_stage is not None
+    assert analysis.bmd_workflow.current_stage.label == "stage_03"
+    assert analysis.scheduler is None
+    assert analysis.normal_completion is False
+
+
+def test_relocated_cli_lists_multistage_acquisition_and_producer_provenance(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    producer_root = "/bmd-db/guest/flows/vasp_run_custom_workflow-20260912-170926"
+    write_three_stage_submission(tmp_path, producer_root=producer_root)
+    for label in ("stage_01", "stage_02", "stage_03"):
+        write_stage_complete(tmp_path / label)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_resources",
+        lambda: (_ for _ in ()).throw(ConfigurationError("missing config")),
+    )
+
+    exit_code = cli.main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Calculation state: COMPLETED" in captured.out
+    assert f"current acquisition directory: {tmp_path.resolve()}" in captured.out
+    assert f"original producer run directory: {producer_root}" in captured.out
+    assert "1. stage_01 - completed" in captured.out
+    assert "2. stage_02 - completed" in captured.out
+    assert "3. stage_03 - completed" in captured.out
+    assert f"current stage: stage_03 ({(tmp_path / 'stage_03').resolve()})" in captured.out
+
+
+def test_relocated_producer_path_traversal_is_not_rebased(tmp_path: Path) -> None:
+    producer_root = "/bmd-db/guest/flows/run123"
+    write_three_stage_submission(
+        tmp_path,
+        producer_root=producer_root,
+        stage_paths={
+            "stage_01": f"{producer_root}/stage_01",
+            "stage_02": f"{producer_root}/../outside/stage_02",
+            "stage_03": f"{producer_root}/stage_03",
+        },
+        result_dir=f"{producer_root}/stage_03",
+    )
+    write_stage_complete(tmp_path / "stage_01")
+    write_stage_complete(tmp_path / "stage_02")
+    write_stage_complete(tmp_path / "stage_03")
+
+    analysis = analyze_calculation_directory(tmp_path)
+
+    assert analysis.bmd_workflow is not None
+    assert analysis.bmd_workflow.relocated is True
+    assert [binding.label for binding in analysis.bmd_workflow.stage_bindings] == [
+        "stage_01",
+        "stage_03",
+    ]
+    assert all(binding.producer_path != f"{producer_root}/../outside/stage_02" for binding in analysis.bmd_workflow.stage_bindings)
+    assert analysis.state != LifecycleState.COMPLETED
+
+
 def test_valid_producer_stage_outside_root_is_not_treated_as_relocated(tmp_path: Path) -> None:
     root = tmp_path / "flow"
     root.mkdir()
@@ -447,6 +628,17 @@ def test_valid_producer_stage_outside_root_is_not_treated_as_relocated(tmp_path:
 
 def test_arbitrary_stage_named_directory_without_provenance_is_manual(tmp_path: Path) -> None:
     stage = tmp_path / "stage_01"
+    stage.mkdir()
+    write_inputs(stage)
+
+    analysis = analyze_calculation_directory(stage)
+
+    assert analysis.calculation_kind == "direct VASP"
+    assert analysis.bmd_workflow is None
+
+
+def test_arbitrary_stage_03_directory_without_provenance_is_manual(tmp_path: Path) -> None:
+    stage = tmp_path / "stage_03"
     stage.mkdir()
     write_inputs(stage)
 
