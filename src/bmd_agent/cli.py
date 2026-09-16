@@ -25,6 +25,7 @@ from bmd_agent.resources.input_check import (
 )
 from bmd_agent.resources.lifecycle import (
     LifecycleAnalysis,
+    LifecycleState,
     analyze_calculation_directory,
 )
 from bmd_agent.resources.run import (
@@ -282,6 +283,22 @@ def print_lifecycle_analysis(analysis: LifecycleAnalysis) -> None:
         print(f"  VASP normal completion marker: {_display_bool(analysis.normal_completion)}")
     print()
 
+    if analysis.diagnostics is not None:
+        print("Progress:")
+        print("  execution has started")
+        print(
+            "  normal VASP completion: "
+            f"{'observed' if analysis.normal_completion else 'not observed'}"
+        )
+        _print_trajectory_observations(analysis.diagnostics.trajectories)
+        print()
+        _print_lifecycle_diagnostic_evidence(analysis.diagnostics)
+        print()
+        _print_convergence_progress_assessment_values(analysis.diagnostics.assessments)
+        print()
+        _print_lifecycle_suggested_checks(analysis.diagnostics)
+        print()
+
     if analysis.structure is not None:
         print("Structure:")
         print(f"  formula: {analysis.structure.reduced_formula}")
@@ -295,9 +312,23 @@ def print_lifecycle_analysis(analysis: LifecycleAnalysis) -> None:
                 print(f"  {key}: {_format_input_value(analysis.incar_settings[key])}")
         print()
 
-    if analysis.scientific is not None:
+    summarize_scientific = (
+        analysis.scientific is not None
+        and analysis.diagnostics is not None
+        and analysis.state != LifecycleState.COMPLETED
+        and bool(analysis.scientific.error or analysis.scientific.unavailable)
+    )
+    if analysis.scientific is not None and not summarize_scientific:
         print("Scientific observations:")
         _print_scientific_result(analysis.scientific)
+        print()
+    elif analysis.scientific is not None and summarize_scientific:
+        print("Scientific observations:")
+        print("  final-result parsing incomplete; see progress and diagnostic evidence above")
+        if analysis.scientific.error:
+            print(f"  unavailable: {analysis.scientific.error}")
+        elif analysis.scientific.unavailable:
+            print(f"  unavailable: {analysis.scientific.unavailable[0]}")
         print()
 
     if analysis.evidence_gaps:
@@ -1481,6 +1512,51 @@ def _local_stage_status(stage_evidence: object) -> str:
     if getattr(stage_evidence, "has_required_inputs", False):
         return "inputs present"
     return "unavailable"
+
+
+def _print_lifecycle_diagnostic_evidence(diagnostics: object) -> None:
+    print("Diagnostic evidence:")
+    logs = getattr(diagnostics, "logs", ())
+    if logs:
+        print("  bounded log excerpts:")
+        for log in logs:
+            print(f"    {getattr(log, 'label', 'log')}: {getattr(log, 'path', '')}")
+            if getattr(log, "error", None):
+                print(f"      unavailable: {getattr(log, 'error')}")
+            elif getattr(log, "messages", ()):
+                for message in getattr(log, "messages", ()):
+                    print(f"      {message}")
+            else:
+                print("      no fatal/error excerpt found in bounded read")
+    custodian = getattr(diagnostics, "custodian", None)
+    if custodian is not None:
+        print("  custodian:")
+        print(f"    path: {getattr(custodian, 'path', '')}")
+        if getattr(custodian, "error", None):
+            print(f"    unavailable: {getattr(custodian, 'error')}")
+        elif getattr(custodian, "events", ()):
+            for event in getattr(custodian, "events", ()):
+                print(f"    {event}")
+        else:
+            print("    present; no compact correction/error summary extracted")
+    archives = getattr(diagnostics, "error_archives", ())
+    if archives:
+        print("  error archives:")
+        for archive in archives:
+            print(f"    {getattr(archive, 'name', 'archive')}: present ({getattr(archive, 'path', '')})")
+        print("    not unpacked by BMD Agent")
+    if not logs and custodian is None and not archives:
+        print("  unavailable: no local diagnostic logs, custodian.json, or error archives were found")
+
+
+def _print_lifecycle_suggested_checks(diagnostics: object) -> None:
+    suggestions = getattr(diagnostics, "suggested_checks", ())
+    print("Suggested checks:")
+    if not suggestions:
+        print("  No additional diagnostic checks were suggested from local evidence.")
+        return
+    for suggestion in suggestions:
+        print(f"  {suggestion}")
 
 
 def _format_input_value(value: object) -> str:

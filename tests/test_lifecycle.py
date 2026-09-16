@@ -45,6 +45,30 @@ NORMAL_OUTCAR = """\
  Voluntary context switches
 """
 
+OSZICAR_TWO_STEP = """\
+       N       E                     dE             d eps       ncg     rms          rms(c)
+DAV:   1   -1.000000000000E+01   -1.00000E+01   -1.00000E+01   10   1.000E+00   2.000E-01
+DAV:   2   -1.100000000000E+01   -1.00000E+00   -2.00000E-01   12   1.000E-01   2.000E-02
+   1 F= -.11000000E+02 E0= -.10950000E+02  d E =-.110000E+02
+       N       E                     dE             d eps       ncg     rms          rms(c)
+RMM:   1   -1.200000000000E+01   -1.00000E+00   -1.00000E-01   10   5.000E-02   1.000E-02
+RMM:   2   -1.210000000000E+01   -1.00000E-01   -1.00000E-02   12   4.000E-02   8.000E-03
+   2 F= -.12100000E+02 E0= -.12050000E+02  d E =-.110000E+01
+"""
+
+OUTCAR_TWO_FORCE_BLOCKS = """\
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000      3.00000000      4.00000000      0.00000000
+      0.50000000      0.50000000      0.50000000      0.00000000      0.00000000      1.00000000
+ -----------------------------------------------------------------------------------
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+      0.00000000      0.00000000      0.00000000      0.30000000      0.40000000      0.00000000
+      0.50000000      0.50000000      0.50000000      0.00000000      0.00000000      0.10000000
+ -----------------------------------------------------------------------------------
+"""
+
 
 def write_inputs(directory: Path, *, missing: str | None = None) -> None:
     values = {"POSCAR": POSCAR, "INCAR": INCAR, "KPOINTS": KPOINTS}
@@ -191,6 +215,28 @@ def write_stage_partial(directory: Path) -> None:
     write_stage_inputs(directory)
     (directory / "OUTCAR").write_text("partial", encoding="utf-8")
     (directory / "OSZICAR").write_text(" 1 F= -.1 E0= -.1 d E =0\n", encoding="utf-8")
+
+
+def write_partial_diagnostic_outputs(directory: Path) -> None:
+    write_inputs(directory)
+    (directory / "OSZICAR").write_text(OSZICAR_TWO_STEP, encoding="utf-8")
+    (directory / "OUTCAR").write_text(OUTCAR_TWO_FORCE_BLOCKS, encoding="utf-8")
+    (directory / "vasprun.xml").write_text("<modeling>", encoding="utf-8")
+    (directory / "std_err.txt").write_text("fatal: VASP exited with non-zero status\n", encoding="utf-8")
+    (directory / "vasp.out").write_text("ERROR: electronic minimization did not finish\n", encoding="utf-8")
+    (directory / "custodian.json").write_text(
+        json.dumps(
+            [
+                {
+                    "handler": "VaspErrorHandler",
+                    "errors": ["eddrmm"],
+                    "actions": [{"dict": "INCAR", "action": {"_set": {"ALGO": "Normal"}}}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (directory / "error.1.tar.gz").write_bytes(b"not-a-real-tar-for-test")
 
 
 def test_empty_directory_is_unknown_no_calculation(tmp_path: Path) -> None:
@@ -421,6 +467,74 @@ def test_relocated_partial_bmd_snapshot_without_current_scheduler_state_is_unkno
     assert "original producer location" in analysis.scheduler_error
 
 
+def test_unknown_relocated_partial_snapshot_gets_diagnostic_evidence(tmp_path: Path) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/hse06_soc_failed",
+    )
+    write_partial_diagnostic_outputs(tmp_path)
+    before = sorted(path.name for path in tmp_path.iterdir())
+
+    analysis = analyze_calculation_directory(
+        tmp_path,
+        scheduler_lookup=lambda job_id: scheduler_record(job_id=job_id, state="FAILED", exit_code="1:0"),
+    )
+
+    after = sorted(path.name for path in tmp_path.iterdir())
+    assert after == before
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert analysis.diagnostics is not None
+    assert analysis.diagnostics.trajectories
+    trajectory = analysis.diagnostics.trajectories[0]
+    assert trajectory.oszicar_present is True
+    assert trajectory.completed_ionic_steps == 2
+    assert trajectory.vasprun_present is True
+    assert trajectory.vasprun_error == "file could not be parsed completely"
+    assert trajectory.outcar_present is True
+    assert trajectory.outcar_complete_force_blocks == 2
+    assert analysis.diagnostics.logs
+    assert any("fatal" in " ".join(log.messages).lower() for log in analysis.diagnostics.logs)
+    assert analysis.diagnostics.custodian is not None
+    assert any("VaspErrorHandler" in event for event in analysis.diagnostics.custodian.events)
+    assert [archive.name for archive in analysis.diagnostics.error_archives] == ["error.1.tar.gz"]
+
+
+def test_incomplete_bmd_snapshot_uses_same_diagnostic_evidence(tmp_path: Path) -> None:
+    root = tmp_path / "flow"
+    stage = root / "stage_01"
+    stage.mkdir(parents=True)
+    write_partial_diagnostic_outputs(stage)
+    write_submission(root, stage_dir=stage)
+
+    analysis = analyze_calculation_directory(
+        root,
+        scheduler_lookup=lambda job_id: scheduler_record(job_id=job_id, state="FAILED", exit_code="1:0"),
+    )
+
+    assert analysis.state == LifecycleState.INCOMPLETE
+    assert analysis.diagnostics is not None
+    assert analysis.diagnostics.trajectories[0].oszicar_present is True
+    assert analysis.diagnostics.trajectories[0].vasprun_error == "file could not be parsed completely"
+
+
+def test_running_bmd_snapshot_reports_progress_without_failed_label(tmp_path: Path) -> None:
+    root = tmp_path / "flow"
+    stage = root / "stage_01"
+    stage.mkdir(parents=True)
+    write_partial_diagnostic_outputs(stage)
+    write_submission(root, stage_dir=stage)
+
+    analysis = analyze_calculation_directory(
+        root,
+        scheduler_lookup=lambda job_id: scheduler_record(job_id=job_id, state="RUNNING", exit_code="0:0"),
+    )
+
+    assert analysis.state == LifecycleState.RUNNING
+    assert analysis.message == "Active scheduler evidence indicates the calculation is running."
+    assert analysis.diagnostics is not None
+    assert analysis.diagnostics.trajectories[0].completed_ionic_steps == 2
+
+
 def test_relocated_completed_bmd_snapshot_uses_local_normal_completion(tmp_path: Path) -> None:
     write_single_stage_submission(
         tmp_path,
@@ -437,6 +551,34 @@ def test_relocated_completed_bmd_snapshot_uses_local_normal_completion(tmp_path:
     assert analysis.state == LifecycleState.COMPLETED
     assert analysis.normal_completion is True
     assert analysis.scheduler is None
+
+
+def test_completed_bmd_snapshot_does_not_run_incomplete_diagnostics(tmp_path: Path) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/vasp_run_hse_static-20260830",
+    )
+    write_inputs(tmp_path)
+    (tmp_path / "OUTCAR").write_text(NORMAL_OUTCAR, encoding="utf-8")
+    (tmp_path / "OSZICAR").write_text(OSZICAR_TWO_STEP, encoding="utf-8")
+
+    analysis = analyze_calculation_directory(tmp_path)
+
+    assert analysis.state == LifecycleState.COMPLETED
+    assert analysis.diagnostics is None
+
+
+def test_pre_run_bmd_snapshot_does_not_run_execution_diagnostics(tmp_path: Path) -> None:
+    root = tmp_path / "flow"
+    stage = root / "stage_01"
+    stage.mkdir(parents=True)
+    write_inputs(stage)
+    write_submission(root, stage_dir=stage)
+
+    analysis = analyze_calculation_directory(root)
+
+    assert analysis.state == LifecycleState.PRE_RUN
+    assert analysis.diagnostics is None
 
 
 def test_relocated_cli_prints_current_acquisition_and_original_producer_paths(
@@ -463,6 +605,44 @@ def test_relocated_cli_prints_current_acquisition_and_original_producer_paths(
     assert f"current acquisition directory: {tmp_path.resolve()}" in captured.out
     assert f"original producer run directory: {original}" in captured.out
     assert f"current stage: result_dir ({tmp_path.resolve()})" in captured.out
+
+
+def test_relocated_partial_cli_prints_diagnostics_without_vasprun_exception(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/hse06_soc_failed",
+    )
+    write_partial_diagnostic_outputs(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_resources",
+        lambda: (_ for _ in ()).throw(ConfigurationError("missing config")),
+    )
+
+    exit_code = cli.main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Calculation state: UNKNOWN" in captured.out
+    assert "Progress:" in captured.out
+    assert "execution has started" in captured.out
+    assert "Trajectory evidence (trajectory_observation):" in captured.out
+    assert "completed ionic steps: 2" in captured.out
+    assert "vasprun trajectory enrichment unavailable: file could not be parsed completely" in captured.out
+    assert "Diagnostic evidence:" in captured.out
+    assert "custodian:" in captured.out
+    assert "VaspErrorHandler" in captured.out
+    assert "error archives:" in captured.out
+    assert "not unpacked by BMD Agent" in captured.out
+    assert "Suggested checks:" in captured.out
+    assert "list index out of range" not in captured.out
+    assert "Scientific observations:" in captured.out
+    assert "final-result parsing incomplete" in captured.out
 
 
 def test_relocated_bmd_snapshot_does_not_write_calculation_directory(tmp_path: Path) -> None:

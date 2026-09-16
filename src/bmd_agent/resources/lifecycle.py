@@ -7,12 +7,21 @@ import json
 from pathlib import Path
 from pathlib import PurePosixPath
 import posixpath
+import re
 from typing import Any
 import warnings
 
 from bmd_agent.resources.run import (
+    ConvergenceProgressAssessment,
+    IncarObservation,
+    IonicStepObservation,
     ScientificResult,
+    StageTrajectoryObservation,
+    WorkflowStage,
+    assess_convergence_progress,
     parse_incar_contents,
+    parse_oszicar_trajectory,
+    parse_outcar_force_blocks,
     parse_vasp_output_files,
 )
 from bmd_agent.resources.slurm import SlurmAccountingRecord, normalize_job_id
@@ -89,6 +98,7 @@ class LifecycleAnalysis:
     structure: StructureInfo | None = None
     incar_settings: Mapping[str, Any] = field(default_factory=dict)
     scientific: ScientificResult | None = None
+    diagnostics: LocalExecutionDiagnostics | None = None
     evidence_gaps: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
 
@@ -98,6 +108,13 @@ SchedulerLookup = Callable[[str], SlurmAccountingRecord | None]
 _INPUT_FILENAMES = ("POSCAR", "INCAR", "KPOINTS")
 _OUTPUT_FILENAMES = ("OUTCAR", "OSZICAR", "vasprun.xml", "CONTCAR", "DOSCAR", "XDATCAR")
 _BMD_LOG_KEYS = ("log_out", "log_err", "slurm_out", "slurm_err")
+_LOCAL_DIAGNOSTIC_LOG_FILENAMES = ("std_err.txt", "vasp.out", "stdout.txt", "stderr.txt")
+_LOCAL_DIAGNOSTIC_RECENT_WINDOW = 5
+_LOCAL_VASPRUN_MAX_BYTES = 50_000_000
+_LOCAL_OUTCAR_DIAGNOSTIC_MAX_BYTES = 2_000_000
+_LOCAL_LOG_DIAGNOSTIC_MAX_BYTES = 128_000
+_LOCAL_CUSTODIAN_MAX_BYTES = 2_000_000
+_DIAGNOSTIC_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF")
 _ACTIVE_SCHEDULER_STATES = {
     "BOOT_FAIL_REQUEUE_FED",
     "CONFIGURING",
@@ -125,6 +142,37 @@ _NORMAL_COMPLETION_MARKERS = (
     "General timing and accounting informations for this job",
     "Voluntary context switches",
 )
+_LOG_DIAGNOSTIC_RE = re.compile(
+    r"\b(error|fatal|traceback|exception|zbrent|brmix|edddav|eddrmm|segmentation|forrtl|killed)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class LocalLogDiagnostic:
+    label: str
+    path: Path
+    present: bool
+    messages: tuple[str, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class LocalCustodianDiagnostic:
+    path: Path
+    present: bool
+    events: tuple[str, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class LocalExecutionDiagnostics:
+    trajectories: tuple[StageTrajectoryObservation, ...] = ()
+    assessments: tuple[ConvergenceProgressAssessment, ...] = ()
+    logs: tuple[LocalLogDiagnostic, ...] = ()
+    custodian: LocalCustodianDiagnostic | None = None
+    error_archives: tuple[LocalFileEvidence, ...] = ()
+    suggested_checks: tuple[str, ...] = ()
 
 
 def analyze_calculation_directory(
@@ -172,6 +220,11 @@ def _analyze_bmd_workflow(
     incar_settings = _incar_settings(input_files)
     gaps = _input_gaps(input_files)
     limitations: list[str] = []
+    diagnostics = (
+        _derive_bmd_execution_diagnostics(workflow)
+        if meaningful_execution
+        else None
+    )
 
     if scheduler is not None and _is_active_scheduler_state(scheduler.state):
         return LifecycleAnalysis(
@@ -187,6 +240,7 @@ def _analyze_bmd_workflow(
             structure=structure,
             incar_settings=incar_settings,
             scientific=scientific,
+            diagnostics=diagnostics,
             evidence_gaps=tuple(gaps),
         )
 
@@ -222,6 +276,7 @@ def _analyze_bmd_workflow(
             structure=structure,
             incar_settings=incar_settings,
             scientific=scientific,
+            diagnostics=diagnostics,
             evidence_gaps=tuple(gaps),
         )
 
@@ -239,6 +294,7 @@ def _analyze_bmd_workflow(
             structure=structure,
             incar_settings=incar_settings,
             scientific=scientific,
+            diagnostics=diagnostics,
             evidence_gaps=tuple(gaps),
         )
 
@@ -297,6 +353,7 @@ def _analyze_bmd_workflow(
             structure=structure,
             incar_settings=incar_settings,
             scientific=scientific,
+            diagnostics=diagnostics,
             evidence_gaps=tuple(gaps),
             limitations=tuple(limitations),
         )
@@ -315,6 +372,7 @@ def _analyze_bmd_workflow(
         structure=structure,
         incar_settings=incar_settings,
         scientific=scientific,
+        diagnostics=diagnostics,
         evidence_gaps=tuple(gaps),
     )
 
@@ -328,6 +386,11 @@ def _analyze_direct_vasp_directory(directory: Path) -> LifecycleAnalysis:
     incar_settings = _incar_settings(input_files)
     scientific = _derive_local_scientific(directory, None)
     gaps = _input_gaps(input_files)
+    diagnostics = (
+        _derive_direct_execution_diagnostics(directory)
+        if meaningful_execution
+        else None
+    )
 
     if normal_completion:
         return LifecycleAnalysis(
@@ -374,6 +437,7 @@ def _analyze_direct_vasp_directory(directory: Path) -> LifecycleAnalysis:
             structure=structure,
             incar_settings=incar_settings,
             scientific=scientific,
+            diagnostics=diagnostics,
             evidence_gaps=tuple(gaps),
             limitations=(
                 "manual VASP directory has no scheduler/provenance evidence for lifecycle status",
@@ -596,6 +660,595 @@ def _all_required_stages_complete(workflow: BmdWorkflowDiscovery) -> bool:
         if evidence.stage_index is not None and evidence.normal_completion
     }
     return required.issubset(completed)
+
+
+def _derive_bmd_execution_diagnostics(workflow: BmdWorkflowDiscovery) -> LocalExecutionDiagnostics:
+    stage_map = {
+        index: _workflow_stage_from_mapping(index, payload)
+        for index, payload in enumerate(workflow.workflow_stages, start=1)
+    }
+    bindings = tuple(
+        binding for binding in workflow.stage_bindings
+        if _has_meaningful_files(_observe_files(binding.path, _OUTPUT_FILENAMES))
+    )
+    if not bindings and workflow.current_stage is not None:
+        bindings = (workflow.current_stage,)
+    trajectories = tuple(
+        _observe_local_stage_trajectory(
+            binding,
+            stage_map.get(binding.stage_index),
+        )
+        for binding in bindings
+    )
+    return _local_execution_diagnostics(
+        workflow.workflow_root,
+        tuple(binding.path for binding in bindings),
+        trajectories,
+    )
+
+
+def _derive_direct_execution_diagnostics(directory: Path) -> LocalExecutionDiagnostics:
+    binding = LocalStageBinding("work_dir", directory, 1)
+    stage = WorkflowStage(
+        index=1,
+        stage_type="direct_vasp",
+        theory="unknown",
+        modifiers=(),
+        label=None,
+    )
+    trajectory = _observe_local_stage_trajectory(binding, stage)
+    return _local_execution_diagnostics(directory, (directory,), (trajectory,))
+
+
+def _local_execution_diagnostics(
+    root: Path,
+    directories: Sequence[Path],
+    trajectories: Sequence[StageTrajectoryObservation],
+) -> LocalExecutionDiagnostics:
+    unique_directories = _unique_paths((root, *directories))
+    logs = _observe_local_logs(unique_directories)
+    custodian = _observe_local_custodian(unique_directories)
+    archives = _observe_error_archives(unique_directories)
+    assessments = assess_convergence_progress(tuple(trajectories))
+    return LocalExecutionDiagnostics(
+        trajectories=tuple(trajectories),
+        assessments=assessments,
+        logs=logs,
+        custodian=custodian,
+        error_archives=archives,
+        suggested_checks=_suggested_diagnostic_checks(
+            trajectories,
+            logs,
+            custodian,
+            archives,
+        ),
+    )
+
+
+def _workflow_stage_from_mapping(index: int, payload: Mapping[str, Any]) -> WorkflowStage:
+    modifiers = payload.get("modifiers", ())
+    if not isinstance(modifiers, Sequence) or isinstance(modifiers, (str, bytes)):
+        modifiers = ()
+    return WorkflowStage(
+        index=index,
+        stage_type=str(payload.get("stage_type") or "unknown"),
+        theory=str(payload.get("theory") or "unknown"),
+        modifiers=tuple(str(item) for item in modifiers),
+        label=str(payload["label"]) if payload.get("label") is not None else None,
+        options=_mapping(payload.get("options")),
+    )
+
+
+def _observe_local_stage_trajectory(
+    binding: LocalStageBinding,
+    stage: WorkflowStage | None,
+) -> StageTrajectoryObservation:
+    directory = binding.path
+    unavailable: list[str] = []
+    oszicar_path = directory / "OSZICAR"
+    oszicar_present = oszicar_path.is_file()
+    oszicar_error = None
+    oszicar_trajectory = None
+    if oszicar_present:
+        try:
+            oszicar_trajectory = parse_oszicar_trajectory(_read_file_prefix(oszicar_path, limit=2_000_000))
+        except Exception as exc:
+            oszicar_error = str(exc)
+            unavailable.append(f"OSZICAR could not be parsed: {exc}")
+    else:
+        unavailable.append("OSZICAR is unavailable")
+
+    vasprun = _observe_local_vasprun_trajectory(directory)
+    if vasprun["skipped_reason"]:
+        unavailable.append(str(vasprun["skipped_reason"]))
+    if vasprun["error"]:
+        unavailable.append(f"vasprun trajectory enrichment unavailable: {vasprun['error']}")
+    if not vasprun["present"]:
+        unavailable.append("vasprun.xml is unavailable")
+
+    outcar = _observe_local_outcar_force_trajectory(directory)
+    if outcar["error"]:
+        unavailable.append(f"OUTCAR force trajectory unavailable: {outcar['error']}")
+    if not outcar["present"]:
+        unavailable.append("OUTCAR is unavailable")
+
+    ionic_steps = tuple(getattr(oszicar_trajectory, "ionic_steps", ()) if oszicar_trajectory else ())
+    outcar_blocks = tuple(outcar["blocks"])
+    outcar_complete = tuple(block for block in outcar_blocks if block.complete)
+    completed_steps = getattr(oszicar_trajectory, "completed_ionic_steps", None) if oszicar_trajectory else None
+    alignment_status = "unavailable"
+    alignment_reason = "OSZICAR completed ionic step count unavailable"
+    if outcar_complete and completed_steps is not None:
+        if len(outcar_complete) == completed_steps:
+            ionic_steps = _merge_local_outcar_forces(ionic_steps, outcar_complete)
+            alignment_status = "aligned"
+            alignment_reason = (
+                f"{len(outcar_complete)} OUTCAR force block(s) aligned with OSZICAR completed ionic steps"
+            )
+        else:
+            alignment_status = "discrepancy"
+            alignment_reason = (
+                f"OSZICAR completed ionic steps {completed_steps} did not align with "
+                f"OUTCAR complete force blocks {len(outcar_complete)}"
+            )
+            unavailable.append(f"OUTCAR force-block alignment discrepancy: {alignment_reason}")
+    elif outcar["present"] and not outcar_complete:
+        alignment_reason = "OUTCAR contained no complete validated force blocks"
+
+    criteria, source_values, discrepancies = _local_trajectory_criteria(
+        binding,
+        vasprun["parameters"],
+    )
+    return StageTrajectoryObservation(
+        stage_index=binding.stage_index,
+        stage_label=binding.label,
+        stage_type=stage.stage_type if stage else None,
+        theory=stage.theory if stage else None,
+        directory=str(directory),
+        oszicar_path=str(oszicar_path),
+        oszicar_present=oszicar_present,
+        oszicar_error=oszicar_error,
+        vasprun_path=str(directory / "vasprun.xml"),
+        vasprun_present=bool(vasprun["present"]),
+        vasprun_error=vasprun["error"],
+        vasprun_skipped_reason=vasprun["skipped_reason"],
+        outcar_path=str(directory / "OUTCAR"),
+        outcar_present=bool(outcar["present"]),
+        outcar_error=outcar["error"],
+        outcar_expected_site_count=outcar["expected_site_count"],
+        outcar_force_blocks=outcar_blocks,
+        outcar_complete_force_blocks=len(outcar_complete) if outcar["present"] and outcar["error"] is None else None,
+        outcar_force_alignment_status=alignment_status,
+        outcar_force_alignment_reason=alignment_reason,
+        criteria=criteria,
+        criteria_source_values=source_values,
+        criteria_discrepancies=discrepancies,
+        ionic_steps_observed=getattr(oszicar_trajectory, "ionic_steps_observed", None),
+        electronic_iterations_by_ionic_step=getattr(oszicar_trajectory, "electronic_iterations_by_ionic_step", ()),
+        electronic_cycles=getattr(oszicar_trajectory, "electronic_cycles", ()),
+        final_electronic_iteration_count=getattr(oszicar_trajectory, "final_electronic_iteration_count", None),
+        recent_electronic_iterations=getattr(oszicar_trajectory, "recent_electronic_iterations", ()),
+        completed_ionic_steps=completed_steps,
+        electronic_iterations_by_completed_ionic_step=getattr(
+            oszicar_trajectory,
+            "electronic_iterations_by_completed_ionic_step",
+            (),
+        ),
+        incomplete_electronic_iteration_count=getattr(
+            oszicar_trajectory,
+            "incomplete_electronic_iteration_count",
+            None,
+        ),
+        recent_incomplete_electronic_iterations=getattr(
+            oszicar_trajectory,
+            "recent_incomplete_electronic_iterations",
+            (),
+        ),
+        ionic_steps=ionic_steps,
+        recent_ionic_steps=tuple(ionic_steps[-_LOCAL_DIAGNOSTIC_RECENT_WINDOW:]),
+        vasprun_ionic_steps=vasprun["ionic_steps"],
+        converged_electronic=vasprun["converged_electronic"],
+        converged_ionic=vasprun["converged_ionic"],
+        unavailable=tuple(unavailable),
+    )
+
+
+def _observe_local_vasprun_trajectory(directory: Path) -> Mapping[str, Any]:
+    path = directory / "vasprun.xml"
+    if not path.is_file():
+        return _local_vasprun_result(present=False)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return _local_vasprun_result(present=True, error=str(exc))
+    if size > _LOCAL_VASPRUN_MAX_BYTES:
+        return _local_vasprun_result(
+            present=True,
+            skipped_reason=(
+                f"vasprun.xml skipped because size {size} bytes exceeds limit "
+                f"{_LOCAL_VASPRUN_MAX_BYTES}"
+            ),
+        )
+    try:
+        from pymatgen.io.vasp.outputs import Vasprun
+    except Exception as exc:
+        return _local_vasprun_result(present=True, error=str(exc))
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", UserWarning)
+            vasprun = Vasprun(str(path), parse_eigenvalues=False)
+        if _has_malformed_xml_warning(caught):
+            return _local_vasprun_result(present=True, error="file could not be parsed completely")
+        ionic_steps = tuple(getattr(vasprun, "ionic_steps", ()) or ())
+        return _local_vasprun_result(
+            present=True,
+            parameters=_vasp_parameter_values(getattr(vasprun, "parameters", None)),
+            ionic_steps=len(ionic_steps),
+            converged_electronic=_bool_or_none(getattr(vasprun, "converged_electronic", None)),
+            converged_ionic=_bool_or_none(getattr(vasprun, "converged_ionic", None)),
+        )
+    except Exception:
+        return _local_vasprun_result(present=True, error="file could not be parsed completely")
+
+
+def _local_vasprun_result(
+    *,
+    present: bool,
+    error: str | None = None,
+    skipped_reason: str | None = None,
+    parameters: Mapping[str, Any] | None = None,
+    ionic_steps: int | None = None,
+    converged_electronic: bool | None = None,
+    converged_ionic: bool | None = None,
+) -> Mapping[str, Any]:
+    return {
+        "present": present,
+        "error": error,
+        "skipped_reason": skipped_reason,
+        "parameters": parameters or {},
+        "ionic_steps": ionic_steps,
+        "converged_electronic": converged_electronic,
+        "converged_ionic": converged_ionic,
+    }
+
+
+def _observe_local_outcar_force_trajectory(directory: Path) -> Mapping[str, Any]:
+    path = directory / "OUTCAR"
+    if not path.is_file():
+        return {
+            "present": False,
+            "error": None,
+            "expected_site_count": None,
+            "blocks": (),
+        }
+    try:
+        contents = _read_file_tail(path, limit=_LOCAL_OUTCAR_DIAGNOSTIC_MAX_BYTES)
+    except OSError as exc:
+        return {
+            "present": True,
+            "error": str(exc),
+            "expected_site_count": None,
+            "blocks": (),
+        }
+    expected = _expected_local_site_count(directory)
+    try:
+        blocks = parse_outcar_force_blocks(
+            contents,
+            source_path=str(path),
+            expected_site_count=expected,
+        )
+    except Exception as exc:
+        return {
+            "present": True,
+            "error": str(exc),
+            "expected_site_count": expected,
+            "blocks": (),
+        }
+    return {
+        "present": True,
+        "error": None,
+        "expected_site_count": expected,
+        "blocks": blocks,
+    }
+
+
+def _expected_local_site_count(directory: Path) -> int | None:
+    for filename in ("POSCAR", "CONTCAR"):
+        path = directory / filename
+        if not path.is_file():
+            continue
+        try:
+            structure = parse_poscar(path.read_bytes(), source=str(path))
+        except Exception:
+            continue
+        return structure.sites
+    return None
+
+
+def _merge_local_outcar_forces(
+    ionic_steps: Sequence[IonicStepObservation],
+    complete_blocks: Sequence[Any],
+) -> tuple[IonicStepObservation, ...]:
+    by_step = {
+        index: block.max_force_eV_per_A
+        for index, block in enumerate(complete_blocks, start=1)
+        if block.max_force_eV_per_A is not None
+    }
+    merged: list[IonicStepObservation] = []
+    for step in ionic_steps:
+        incoming = by_step.get(step.step_index)
+        merged.append(
+            IonicStepObservation(
+                step_index=step.step_index,
+                electronic_iterations=step.electronic_iterations,
+                free_energy=step.free_energy,
+                energy_zero=step.energy_zero,
+                dE=step.dE,
+                max_force=incoming if step.max_force is None and incoming is not None else step.max_force,
+                max_force_source=(
+                    "OUTCAR"
+                    if step.max_force is None and incoming is not None
+                    else step.max_force_source
+                ),
+            )
+        )
+    return tuple(merged)
+
+
+def _local_trajectory_criteria(
+    binding: LocalStageBinding,
+    vasprun_parameters: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Mapping[str, Any]], tuple[str, ...]]:
+    sources: list[tuple[str, Mapping[str, Any]]] = []
+    incar = _local_incar_observation(binding)
+    if incar.present and not incar.error:
+        sources.append((f"retained_incar:{binding.label}", incar.values))
+    if vasprun_parameters:
+        sources.append(("diagnose_vasprun.parameters", vasprun_parameters))
+
+    criteria: dict[str, Any] = {}
+    source_values: dict[str, Mapping[str, Any]] = {}
+    discrepancies: list[str] = []
+    for key in _DIAGNOSTIC_CRITERIA_KEYS:
+        values = {
+            source: values[key]
+            for source, values in sources
+            if key in values
+        }
+        if not values:
+            continue
+        source_values[key] = values
+        observed = list(values.values())
+        criteria[key] = observed[0]
+        if not all(_json_equivalent(observed[0], value) for value in observed[1:]):
+            discrepancies.append(key)
+    return criteria, source_values, tuple(discrepancies)
+
+
+def _local_incar_observation(binding: LocalStageBinding) -> IncarObservation:
+    path = binding.path / "INCAR"
+    if not path.is_file():
+        return IncarObservation(
+            label=binding.label,
+            path=str(path),
+            present=False,
+            stage_index=binding.stage_index,
+        )
+    try:
+        settings, error = parse_incar_contents(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        return IncarObservation(
+            label=binding.label,
+            path=str(path),
+            present=True,
+            stage_index=binding.stage_index,
+            error=str(exc),
+        )
+    return IncarObservation(
+        label=binding.label,
+        path=str(path),
+        present=True,
+        stage_index=binding.stage_index,
+        values={} if error else dict(settings),
+        error=error,
+    )
+
+
+def _observe_local_logs(directories: Sequence[Path]) -> tuple[LocalLogDiagnostic, ...]:
+    diagnostics: list[LocalLogDiagnostic] = []
+    seen: set[Path] = set()
+    for directory in directories:
+        for filename in _LOCAL_DIAGNOSTIC_LOG_FILENAMES:
+            path = directory / filename
+            if path in seen or not path.exists():
+                continue
+            seen.add(path)
+            if not path.is_file():
+                continue
+            try:
+                text = _read_file_tail(path, limit=_LOCAL_LOG_DIAGNOSTIC_MAX_BYTES).decode("utf-8", "replace")
+            except OSError as exc:
+                diagnostics.append(LocalLogDiagnostic(filename, path, True, error=str(exc)))
+                continue
+            messages = _diagnostic_log_messages(text)
+            diagnostics.append(LocalLogDiagnostic(filename, path, True, messages=messages))
+    return tuple(diagnostics)
+
+
+def _diagnostic_log_messages(text: str) -> tuple[str, ...]:
+    messages: list[str] = []
+    for line in text.splitlines():
+        compact = " ".join(line.strip().split())
+        if not compact or not _LOG_DIAGNOSTIC_RE.search(compact):
+            continue
+        if compact not in messages:
+            messages.append(compact[:240])
+        if len(messages) >= 8:
+            break
+    return tuple(messages)
+
+
+def _observe_local_custodian(directories: Sequence[Path]) -> LocalCustodianDiagnostic | None:
+    for directory in directories:
+        path = directory / "custodian.json"
+        if not path.exists():
+            continue
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_size > _LOCAL_CUSTODIAN_MAX_BYTES:
+                return LocalCustodianDiagnostic(
+                    path=path,
+                    present=True,
+                    error=(
+                        f"custodian.json exceeds diagnostic read limit "
+                        f"{_LOCAL_CUSTODIAN_MAX_BYTES} bytes"
+                    ),
+                )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return LocalCustodianDiagnostic(path=path, present=True, error=str(exc))
+        return LocalCustodianDiagnostic(
+            path=path,
+            present=True,
+            events=_custodian_event_summaries(payload),
+        )
+    return None
+
+
+def _custodian_event_summaries(payload: Any) -> tuple[str, ...]:
+    events: list[str] = []
+    attempts = payload if isinstance(payload, list) else payload.get("jobs", ()) if isinstance(payload, Mapping) else ()
+    if isinstance(attempts, Sequence) and not isinstance(attempts, (str, bytes)):
+        events.append(f"custodian records: {len(attempts)} top-level attempt(s)")
+    _collect_custodian_events(payload, events, depth=0)
+    deduped: list[str] = []
+    for event in events:
+        if event not in deduped:
+            deduped.append(event)
+        if len(deduped) >= 12:
+            break
+    return tuple(deduped)
+
+
+def _collect_custodian_events(payload: Any, events: list[str], *, depth: int) -> None:
+    if depth > 4 or len(events) >= 16:
+        return
+    if isinstance(payload, Mapping):
+        for key in ("handler", "handler_name", "validator", "validator_name"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                events.append(f"{key}: {value}")
+        for key in ("errors", "actions", "corrections"):
+            value = payload.get(key)
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                events.append(f"{key}: {len(value)} item(s)")
+                for item in value[:3]:
+                    _collect_custodian_events(item, events, depth=depth + 1)
+            elif isinstance(value, str) and value:
+                events.append(f"{key}: {value[:160]}")
+        for key in ("error", "exception", "message"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                events.append(f"{key}: {' '.join(value.split())[:200]}")
+        for value in payload.values():
+            if isinstance(value, (Mapping, list, tuple)):
+                _collect_custodian_events(value, events, depth=depth + 1)
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        for item in payload[:8]:
+            _collect_custodian_events(item, events, depth=depth + 1)
+
+
+def _observe_error_archives(directories: Sequence[Path]) -> tuple[LocalFileEvidence, ...]:
+    observations: list[LocalFileEvidence] = []
+    seen: set[Path] = set()
+    for directory in directories:
+        for path in sorted(directory.glob("error.*.tar.gz")):
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                observations.append(LocalFileEvidence(path.name, path, path.is_file(), path.stat().st_size))
+            except OSError:
+                observations.append(LocalFileEvidence(path.name, path, path.is_file(), None))
+    return tuple(observations)
+
+
+def _suggested_diagnostic_checks(
+    trajectories: Sequence[StageTrajectoryObservation],
+    logs: Sequence[LocalLogDiagnostic],
+    custodian: LocalCustodianDiagnostic | None,
+    archives: Sequence[LocalFileEvidence],
+) -> tuple[str, ...]:
+    suggestions: list[str] = []
+    if any(trajectory.oszicar_present for trajectory in trajectories):
+        suggestions.append(
+            "Review the OSZICAR trajectory before interpreting unavailable final-result fields."
+        )
+    if any(trajectory.vasprun_error for trajectory in trajectories):
+        suggestions.append(
+            "Treat final-result parsing as incomplete because vasprun.xml trajectory enrichment was unavailable."
+        )
+    if custodian and custodian.present:
+        suggestions.append(
+            "Review custodian.json for correction attempts and unresolved handler errors."
+        )
+    if any(log.messages for log in logs):
+        suggestions.append(
+            "Inspect the bounded fatal/error log excerpts above in the original calculation context."
+        )
+    if archives:
+        suggestions.append(
+            "Error tarballs are present but were not unpacked by BMD Agent."
+        )
+    return tuple(suggestions)
+
+
+def _unique_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return tuple(unique)
+
+
+def _read_file_prefix(path: Path, *, limit: int) -> bytes:
+    with path.open("rb") as handle:
+        return handle.read(limit)
+
+
+def _vasp_parameter_values(parameters: Any) -> Mapping[str, Any]:
+    if parameters is None:
+        return {}
+    try:
+        items = dict(parameters).items()
+    except Exception:
+        try:
+            items = parameters.items()
+        except Exception:
+            return {}
+    return {str(key).upper(): _json_safe_value(value) for key, value in items}
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _json_equivalent(left: Any, right: Any) -> bool:
+    return _json_safe_value(left) == _json_safe_value(right)
 
 
 def _current_stage_binding(
