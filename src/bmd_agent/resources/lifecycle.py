@@ -42,6 +42,7 @@ class LocalStageBinding:
     label: str
     path: Path
     stage_index: int | None = None
+    producer_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,8 @@ class BmdWorkflowDiscovery:
     workflow_stages: tuple[Mapping[str, Any], ...]
     stage_bindings: tuple[LocalStageBinding, ...]
     current_stage: LocalStageBinding | None = None
+    producer_root: str | None = None
+    relocated: bool = False
     job_id: str | None = None
     attempt_state_path: Path | None = None
     attempt_state: Mapping[str, Any] | None = None
@@ -140,7 +143,13 @@ def _analyze_bmd_workflow(
     output_files = _observe_files(target, _OUTPUT_FILENAMES)
     log_files = _observe_bmd_logs(workflow)
     meaningful_execution = _has_meaningful_files(output_files) or _has_meaningful_files(log_files)
-    scheduler, scheduler_error = _lookup_scheduler(workflow.job_id, scheduler_lookup)
+    if workflow.relocated:
+        scheduler, scheduler_error = (
+            None,
+            "scheduler evidence belongs to the original producer location and was not used for relocated local snapshot",
+        )
+    else:
+        scheduler, scheduler_error = _lookup_scheduler(workflow.job_id, scheduler_lookup)
     normal_completion = _detect_normal_completion(target)
     producer_success = _producer_success(workflow.attempt_state)
     scientific = _derive_local_scientific(target, workflow.submission)
@@ -159,6 +168,24 @@ def _analyze_bmd_workflow(
             output_files=output_files | log_files,
             bmd_workflow=workflow,
             scheduler=scheduler,
+            normal_completion=normal_completion,
+            structure=structure,
+            incar_settings=incar_settings,
+            scientific=scientific,
+            evidence_gaps=tuple(gaps),
+        )
+
+    if workflow.relocated and normal_completion:
+        return LifecycleAnalysis(
+            state=LifecycleState.COMPLETED,
+            directory=current,
+            calculation_kind="BMD Compute",
+            message="Relocated BMD Compute snapshot has durable local VASP normal-completion evidence.",
+            input_files=input_files,
+            output_files=output_files | log_files,
+            bmd_workflow=workflow,
+            scheduler=scheduler,
+            scheduler_error=scheduler_error,
             normal_completion=normal_completion,
             structure=structure,
             incar_settings=incar_settings,
@@ -399,6 +426,17 @@ def _workflow_from_submission(
         return None
     paths = _mapping(submission.get("paths"))
     stage_bindings = _stage_bindings(root, paths, stage_count=len(stages))
+    relocated = _is_relocated_local_snapshot(
+        root,
+        current,
+        stage_bindings,
+    )
+    if relocated:
+        stage_bindings = _relocated_stage_bindings(
+            root,
+            paths,
+            stage_count=len(stages),
+        )
     related = current == root or any(_is_relative_to(current, binding.path) for binding in stage_bindings)
     if not related:
         return None
@@ -416,6 +454,8 @@ def _workflow_from_submission(
         workflow_stages=stages,
         stage_bindings=stage_bindings,
         current_stage=current_stage,
+        producer_root=_producer_root_text(paths),
+        relocated=relocated,
         job_id=_find_job_id(submission, attempt_state),
         attempt_state_path=attempt_state_path,
         attempt_state=attempt_state,
@@ -436,13 +476,42 @@ def _stage_bindings(
             path = _optional_local_path(value, root=root)
             if path is None:
                 continue
-            bindings.append(LocalStageBinding(str(label), path, index))
+            bindings.append(LocalStageBinding(str(label), path, index, _path_text(value)))
             seen.add(path)
     result_dir = _optional_local_path(paths.get("result_dir"), root=root)
     if result_dir is not None and result_dir not in seen:
         stage_index = 1 if not bindings and stage_count == 1 else stage_count
-        bindings.append(LocalStageBinding("result_dir", result_dir, stage_index))
+        bindings.append(LocalStageBinding("result_dir", result_dir, stage_index, _path_text(paths.get("result_dir"))))
     return tuple(bindings)
+
+
+def _relocated_stage_bindings(
+    root: Path,
+    paths: Mapping[str, Any],
+    *,
+    stage_count: int,
+) -> tuple[LocalStageBinding, ...]:
+    stage_index = 1 if stage_count == 1 else stage_count
+    producer_path = _path_text(paths.get("result_dir"))
+    return (LocalStageBinding("result_dir", root, stage_index, producer_path),)
+
+
+def _is_relocated_local_snapshot(
+    root: Path,
+    current: Path,
+    bindings: Sequence[LocalStageBinding],
+) -> bool:
+    if current != root:
+        return False
+    if not _has_recognizable_local_vasp_evidence(root):
+        return False
+    if any(_has_recognizable_local_vasp_evidence(binding.path) for binding in bindings):
+        return False
+    return not any(_is_relative_to(binding.path, root) for binding in bindings)
+
+
+def _has_recognizable_local_vasp_evidence(directory: Path) -> bool:
+    return _has_meaningful_files(_observe_files(directory, _INPUT_FILENAMES + _OUTPUT_FILENAMES))
 
 
 def _current_stage_binding(
@@ -700,6 +769,23 @@ def _read_json(path: Path) -> Mapping[str, Any]:
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _path_text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _producer_root_text(paths: Mapping[str, Any]) -> str | None:
+    result_dir = _path_text(paths.get("result_dir"))
+    if result_dir is not None:
+        return result_dir
+    stage_dirs = paths.get("stage_dirs")
+    if isinstance(stage_dirs, Mapping):
+        for value in reversed(tuple(stage_dirs.values())):
+            path = _path_text(value)
+            if path is not None:
+                return path
+    return None
 
 
 def _optional_local_path(value: Any, *, root: Path) -> Path | None:

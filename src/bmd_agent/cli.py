@@ -233,13 +233,21 @@ def print_lifecycle_analysis(analysis: LifecycleAnalysis) -> None:
         return
 
     if analysis.bmd_workflow is not None:
+        workflow = analysis.bmd_workflow
         print("BMD Compute provenance:")
-        print(f"  workflow root: {analysis.bmd_workflow.workflow_root}")
-        if analysis.bmd_workflow.current_stage is not None:
-            stage = analysis.bmd_workflow.current_stage
+        if workflow.relocated:
+            print(f"  current acquisition directory: {workflow.workflow_root}")
+            if workflow.producer_root:
+                print(f"  original producer run directory: {workflow.producer_root}")
+        else:
+            print(f"  workflow root: {workflow.workflow_root}")
+        if workflow.current_stage is not None:
+            stage = workflow.current_stage
             print(f"  current stage: {stage.label} ({stage.path})")
-        if analysis.bmd_workflow.job_id:
-            print(f"  job id: {analysis.bmd_workflow.job_id}")
+            if workflow.relocated and stage.producer_path:
+                print(f"  original stage path: {stage.producer_path}")
+        if workflow.job_id:
+            print(f"  job id: {workflow.job_id}")
         print()
 
     if analysis.scheduler is not None:

@@ -80,8 +80,8 @@ def write_submission(
     root: Path,
     *,
     job_id: str = "21153721",
-    stage_dir: Path | None = None,
-    result_dir: Path | None = None,
+    stage_dir: Path | str | None = None,
+    result_dir: Path | str | None = None,
     attempt_state: Path | None = None,
 ) -> None:
     stage_dir = stage_dir or root / "stage_01"
@@ -107,6 +107,35 @@ def write_submission(
         "paths": {
             "stage_dirs": {"stage_01": str(stage_dir)},
             "result_dir": str(result_dir),
+        },
+    }
+    (root / "submission.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def write_single_stage_submission(
+    root: Path,
+    *,
+    result_dir: str,
+    job_id: str = "21153721",
+) -> None:
+    payload = {
+        "flow_spec": {
+            "workflow_spec": {
+                "stages": [
+                    {
+                        "stage_type": "static",
+                        "theory": "hse06",
+                        "modifiers": [],
+                        "label": "hse06_static",
+                        "options": {},
+                    }
+                ]
+            }
+        },
+        "submission": {"job_id": job_id},
+        "paths": {
+            "stage_dirs": {},
+            "result_dir": result_dir,
         },
     }
     (root / "submission.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -277,6 +306,7 @@ def test_workflow_root_invocation_uses_submission_provenance(tmp_path: Path) -> 
 
     assert analysis.bmd_workflow is not None
     assert analysis.bmd_workflow.workflow_root == root.resolve()
+    assert analysis.bmd_workflow.relocated is False
     assert analysis.calculation_kind == "BMD Compute"
 
 
@@ -293,6 +323,126 @@ def test_stage_directory_invocation_binds_to_workflow_root(tmp_path: Path) -> No
     assert analysis.bmd_workflow.workflow_root == root.resolve()
     assert analysis.bmd_workflow.current_stage is not None
     assert analysis.bmd_workflow.current_stage.path == stage.resolve()
+    assert analysis.bmd_workflow.current_stage.producer_path == str(stage)
+    assert analysis.bmd_workflow.relocated is False
+
+
+def test_relocated_bmd_snapshot_reads_current_local_inputs(tmp_path: Path) -> None:
+    original = "/bmd-db/guest/flows/vasp_run_hse_static-20260830"
+    write_single_stage_submission(tmp_path, result_dir=original)
+    write_inputs(tmp_path)
+    (tmp_path / "OSZICAR").write_text(" 1 F= -.1 E0= -.1 d E =0\n", encoding="utf-8")
+
+    analysis = analyze_calculation_directory(
+        tmp_path,
+        scheduler_lookup=lambda job_id: scheduler_record(job_id=job_id, state="RUNNING"),
+    )
+
+    assert analysis.calculation_kind == "BMD Compute"
+    assert analysis.bmd_workflow is not None
+    assert analysis.bmd_workflow.relocated is True
+    assert analysis.bmd_workflow.producer_root == original
+    assert analysis.bmd_workflow.current_stage is not None
+    assert analysis.bmd_workflow.current_stage.path == tmp_path.resolve()
+    assert analysis.bmd_workflow.current_stage.producer_path == original
+    assert all(analysis.input_files[name].present for name in ("POSCAR", "INCAR", "KPOINTS"))
+    assert analysis.input_files["POSCAR"].path == tmp_path.resolve() / "POSCAR"
+    assert "POSCAR is missing" not in analysis.evidence_gaps
+
+
+def test_relocated_partial_bmd_snapshot_without_current_scheduler_state_is_unknown(tmp_path: Path) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/vasp_run_hse_static-20260830",
+    )
+    write_inputs(tmp_path)
+    (tmp_path / "OUTCAR").write_text("partial", encoding="utf-8")
+
+    analysis = analyze_calculation_directory(
+        tmp_path,
+        scheduler_lookup=lambda job_id: scheduler_record(job_id=job_id, state="RUNNING"),
+    )
+
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert analysis.scheduler is None
+    assert analysis.scheduler_error is not None
+    assert "original producer location" in analysis.scheduler_error
+
+
+def test_relocated_completed_bmd_snapshot_uses_local_normal_completion(tmp_path: Path) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/vasp_run_hse_static-20260830",
+    )
+    write_inputs(tmp_path)
+    (tmp_path / "OUTCAR").write_text(NORMAL_OUTCAR, encoding="utf-8")
+
+    analysis = analyze_calculation_directory(
+        tmp_path,
+        scheduler_lookup=lambda job_id: scheduler_record(job_id=job_id, state="RUNNING"),
+    )
+
+    assert analysis.state == LifecycleState.COMPLETED
+    assert analysis.normal_completion is True
+    assert analysis.scheduler is None
+
+
+def test_relocated_cli_prints_current_acquisition_and_original_producer_paths(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    original = "/bmd-db/guest/flows/vasp_run_hse_static-20260830"
+    write_single_stage_submission(tmp_path, result_dir=original)
+    write_inputs(tmp_path)
+    (tmp_path / "OSZICAR").write_text(" 1 F= -.1 E0= -.1 d E =0\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_resources",
+        lambda: (_ for _ in ()).throw(ConfigurationError("missing config")),
+    )
+
+    exit_code = cli.main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Calculation type: BMD Compute" in captured.out
+    assert f"current acquisition directory: {tmp_path.resolve()}" in captured.out
+    assert f"original producer run directory: {original}" in captured.out
+    assert f"current stage: result_dir ({tmp_path.resolve()})" in captured.out
+
+
+def test_relocated_bmd_snapshot_does_not_write_calculation_directory(tmp_path: Path) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/vasp_run_hse_static-20260830",
+    )
+    write_inputs(tmp_path)
+    (tmp_path / "OUTCAR").write_text("partial", encoding="utf-8")
+    before = sorted(path.name for path in tmp_path.iterdir())
+
+    analyze_calculation_directory(tmp_path)
+
+    after = sorted(path.name for path in tmp_path.iterdir())
+    assert after == before
+
+
+def test_valid_producer_stage_outside_root_is_not_treated_as_relocated(tmp_path: Path) -> None:
+    root = tmp_path / "flow"
+    root.mkdir()
+    producer_stage = tmp_path / "producer_stage"
+    producer_stage.mkdir()
+    write_inputs(root)
+    write_inputs(producer_stage)
+    write_submission(root, stage_dir=producer_stage)
+
+    analysis = analyze_calculation_directory(root)
+
+    assert analysis.bmd_workflow is not None
+    assert analysis.bmd_workflow.relocated is False
+    assert analysis.bmd_workflow.current_stage is not None
+    assert analysis.bmd_workflow.current_stage.path == producer_stage.resolve()
 
 
 def test_arbitrary_stage_named_directory_without_provenance_is_manual(tmp_path: Path) -> None:
