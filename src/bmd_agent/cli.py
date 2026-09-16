@@ -1,6 +1,7 @@
 from collections.abc import Iterable, Mapping
 import hashlib
 import json
+from pathlib import Path
 import subprocess
 import sys
 from typing import Any
@@ -22,6 +23,10 @@ from bmd_agent.resources.input_check import (
     InputCheckObservation,
     check_remote_input_directory,
 )
+from bmd_agent.resources.lifecycle import (
+    LifecycleAnalysis,
+    analyze_calculation_directory,
+)
 from bmd_agent.resources.run import (
     PRODUCER_REQUESTED,
     JobInspection,
@@ -36,7 +41,7 @@ from bmd_agent.resources.run import (
     inspect_remote_run,
     serialize_job_trajectory_evidence,
 )
-from bmd_agent.resources.slurm import get_queue
+from bmd_agent.resources.slurm import get_job_accounting, get_queue
 from bmd_agent.resources.vasp import RemotePathError, read_remote_structure
 
 
@@ -178,6 +183,120 @@ def show_queue(registry: ResourceRegistry | None = None) -> int:
         print(f"  {user}: {count}")
 
     return 0
+
+
+def show_current_directory(
+    directory: Path | None = None,
+    registry: ResourceRegistry | None = None,
+) -> int:
+    """Analyze the calculation associated with the current working directory."""
+
+    directory = directory or Path.cwd()
+    scheduler_lookup = None
+    if registry is None:
+        try:
+            registry = load_resources()
+        except ConfigurationError:
+            registry = None
+    if registry is not None:
+        try:
+            cluster = powerslurm_cluster(registry)
+        except ConfigurationError:
+            cluster = None
+        if cluster is not None:
+            scheduler_lookup = lambda job_id: get_job_accounting(
+                cluster.ssh_host,
+                job_id,
+            )
+
+    analysis = analyze_calculation_directory(
+        directory,
+        scheduler_lookup=scheduler_lookup,
+    )
+    print_lifecycle_analysis(analysis)
+    return 0
+
+
+def print_lifecycle_analysis(analysis: LifecycleAnalysis) -> None:
+    """Print a concise lifecycle-oriented calculation summary."""
+
+    print("BMD Agent")
+    print("=========")
+    print()
+    print(f"Calculation directory: {analysis.directory}")
+    print(f"Calculation state: {analysis.state.value}")
+    print(f"Calculation type: {analysis.calculation_kind}")
+    print(f"Summary: {analysis.message}")
+    print()
+
+    if analysis.calculation_kind == "none":
+        return
+
+    if analysis.bmd_workflow is not None:
+        print("BMD Compute provenance:")
+        print(f"  workflow root: {analysis.bmd_workflow.workflow_root}")
+        if analysis.bmd_workflow.current_stage is not None:
+            stage = analysis.bmd_workflow.current_stage
+            print(f"  current stage: {stage.label} ({stage.path})")
+        if analysis.bmd_workflow.job_id:
+            print(f"  job id: {analysis.bmd_workflow.job_id}")
+        print()
+
+    if analysis.scheduler is not None:
+        print("Scheduler observation:")
+        _print_optional_value("state", analysis.scheduler.state)
+        _print_optional_value("exit", analysis.scheduler.exit_code)
+        _print_optional_value("elapsed", analysis.scheduler.elapsed)
+        _print_optional_value("node", analysis.scheduler.node_list)
+        print()
+    elif analysis.scheduler_error and analysis.bmd_workflow is not None:
+        print("Scheduler observation:")
+        print(f"  unavailable: {analysis.scheduler_error}")
+        print()
+
+    print("Input evidence:")
+    for name in ("POSCAR", "INCAR", "KPOINTS"):
+        observation = analysis.input_files.get(name)
+        print(f"  {name}: {_local_file_status(observation)}")
+    print()
+
+    print("Execution evidence:")
+    for name in ("OUTCAR", "OSZICAR", "vasprun.xml", "CONTCAR"):
+        observation = analysis.output_files.get(name)
+        print(f"  {name}: {_local_file_status(observation)}")
+    if analysis.normal_completion is not None:
+        print(f"  VASP normal completion marker: {_display_bool(analysis.normal_completion)}")
+    print()
+
+    if analysis.structure is not None:
+        print("Structure:")
+        print(f"  formula: {analysis.structure.reduced_formula}")
+        print(f"  sites: {analysis.structure.sites}")
+        print()
+
+    if analysis.incar_settings:
+        print("Executed/input settings:")
+        for key in _EXECUTED_INPUT_DISPLAY_KEYS:
+            if key in analysis.incar_settings:
+                print(f"  {key}: {_format_input_value(analysis.incar_settings[key])}")
+        print()
+
+    if analysis.scientific is not None:
+        print("Scientific observations:")
+        _print_scientific_result(analysis.scientific)
+        print()
+
+    if analysis.evidence_gaps:
+        print("Evidence gaps:")
+        for gap in analysis.evidence_gaps:
+            print(f"  {gap}")
+        print()
+
+    if analysis.limitations:
+        print("Limitations:")
+        for limitation in analysis.limitations:
+            print(f"  {limitation}")
+        print()
 
 
 def show_compute(registry: ResourceRegistry | None = None) -> int:
@@ -1323,6 +1442,23 @@ def _display_value(value: object) -> str:
     return "unavailable" if value is None else str(value)
 
 
+def _display_bool(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def _local_file_status(observation: object) -> str:
+    if observation is None:
+        return "not checked"
+    if not getattr(observation, "present", False):
+        return "missing"
+    size = getattr(observation, "size", None)
+    if size is None:
+        return "present, size unavailable"
+    if size == 0:
+        return "present, empty"
+    return f"present, {size} bytes"
+
+
 def _format_input_value(value: object) -> str:
     if value is None:
         return "unavailable"
@@ -1365,7 +1501,10 @@ def main(argv: list[str] | None = None) -> int:
     """BMD Agent command-line entry point."""
 
     argv = list(sys.argv[1:] if argv is None else argv)
-    command = argv[0] if argv else "status"
+    if not argv:
+        return show_current_directory()
+
+    command = argv[0]
 
     try:
         if command == "status":
@@ -1422,6 +1561,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Unknown command: {command}")
     print()
     print("Available commands:")
+    print("  (no arguments) analyze the current calculation directory")
     print("  status")
     print("  queue")
     print("  job <SLURM_JOB_ID> [--trajectory-json]")
