@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import subprocess
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from bmd_agent.config import GitRepositoryResource, ResourceRegistry
 from bmd_agent.resources.context import EvidenceGap, ScientificContext
+
+if TYPE_CHECKING:
+    from bmd_agent.resources.lifecycle import LifecycleAnalysis
 
 
 SCHEMA_VERSION = 1
@@ -14,6 +17,11 @@ EVIDENCE_TYPE = "composition_context"
 PRODUCER_NAME = "BMDex"
 PRODUCER_MODULE = "tools.composition.context_producer"
 BMDEX_COMPOSITION_CONTEXT = "bmdex_composition_context"
+DOMAIN_CONTEXT_SCHEMA_VERSION = 1
+DOMAIN_CONTEXT_EVIDENCE_TYPE = "contextual_reference_evidence"
+DOMAIN_CONTEXT_SCHEMA = "bmdex.contextual_reference.v1"
+DOMAIN_CONTEXT_PRODUCER_MODULE = "tools.domain_context.query"
+BMDEX_DOMAIN_CONTEXT = "bmdex_domain_context"
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -75,6 +83,90 @@ class BmdexCompositionEvidence:
 
 
 @dataclass(frozen=True)
+class BmdexContextualReferenceRecord:
+    """One producer-owned contextual reference and its deterministic match evidence."""
+
+    record: Mapping[str, Any]
+    match: Mapping[str, Any]
+
+    @property
+    def record_id(self) -> str:
+        return str(self.record["id"])
+
+    @property
+    def title(self) -> str:
+        return str(self.record["title"])
+
+    @property
+    def contextual_statement(self) -> str:
+        return str(self.record["contextual_statement"])
+
+    @property
+    def applicability(self) -> Mapping[str, Any]:
+        return self.record["applicability"]
+
+    @property
+    def diagnostic_relevance(self) -> str:
+        return str(self.record["diagnostic_relevance"])
+
+    @property
+    def limitations(self) -> tuple[str, ...]:
+        return tuple(str(item) for item in self.record["limitations"])
+
+    @property
+    def sources(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(self.record["sources"])
+
+    @property
+    def record_provenance(self) -> Mapping[str, Any]:
+        return self.record["record_provenance"]
+
+
+@dataclass(frozen=True)
+class BmdexDomainContextEvidence:
+    """Validated BMDex contextual-reference schema-v1 response."""
+
+    payload: dict[str, Any]
+    records: tuple[BmdexContextualReferenceRecord, ...]
+
+    @property
+    def schema_version(self) -> int:
+        return int(self.payload["schema_version"])
+
+    @property
+    def evidence_type(self) -> str:
+        return str(self.payload["evidence_type"])
+
+    @property
+    def producer(self) -> Mapping[str, Any]:
+        return self.payload["producer"]
+
+    @property
+    def query(self) -> Mapping[str, Any]:
+        return self.payload["query"]
+
+
+@dataclass(frozen=True)
+class BmdexContextualAssessment:
+    """Qualified Agent assessment linked to producer-owned contextual evidence."""
+
+    basis: tuple[str, ...]
+    limitations: tuple[str, ...]
+    source_record_ids: tuple[str, ...]
+    evidence_type: str = "assessment"
+
+
+@dataclass(frozen=True)
+class BmdexDomainContextEnrichment:
+    """Optional contextual evidence acquired after lifecycle classification."""
+
+    query: Mapping[str, Any] | None = None
+    evidence: BmdexDomainContextEvidence | None = None
+    assessment: BmdexContextualAssessment | None = None
+    evidence_gaps: tuple[EvidenceGap, ...] = ()
+
+
+@dataclass(frozen=True)
 class EnrichedScientificContext:
     """ScientificContext plus optional external BMDex composition evidence."""
 
@@ -83,10 +175,512 @@ class EnrichedScientificContext:
     evidence_gaps: tuple[EvidenceGap, ...] = ()
 
 
+class BmdexDomainContextError(RuntimeError):
+    """Raised when optional BMDex contextual-reference evidence is unavailable."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "producer_failed",
+        returncode: int | None = None,
+        stderr_summary: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.returncode = returncode
+        self.stderr_summary = stderr_summary
+
+
 def bmdex_repository(registry: ResourceRegistry) -> GitRepositoryResource | None:
     """Return the explicitly configured BMDex repository, if present."""
 
     return registry.repositories.get("bmdex")
+
+
+def enrich_lifecycle_with_bmdex_domain_context(
+    analysis: LifecycleAnalysis,
+    repository: GitRepositoryResource | None,
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> BmdexDomainContextEnrichment:
+    """Acquire optional contextual references for an already classified calculation."""
+
+    query = build_bmdex_domain_query(analysis)
+    if query is None:
+        return BmdexDomainContextEnrichment()
+
+    if repository is None:
+        return BmdexDomainContextEnrichment(
+            query=query,
+            evidence_gaps=(
+                EvidenceGap(
+                    BMDEX_DOMAIN_CONTEXT,
+                    "missing_bmdex_repository",
+                    "BMDex repository configuration is unavailable.",
+                ),
+            ),
+        )
+
+    try:
+        evidence = inspect_bmdex_domain_context(
+            repository,
+            query,
+            runner=runner,
+            timeout=timeout,
+        )
+    except BmdexDomainContextError as exc:
+        reason = str(exc)
+        if exc.returncode is not None:
+            reason = f"{reason} exit {exc.returncode}."
+        if exc.stderr_summary:
+            reason = f"{reason} {exc.stderr_summary}"
+        return BmdexDomainContextEnrichment(
+            query=query,
+            evidence_gaps=(
+                EvidenceGap(
+                    BMDEX_DOMAIN_CONTEXT,
+                    exc.kind,
+                    _bounded_text(reason),
+                ),
+            ),
+        )
+    except Exception as exc:
+        return BmdexDomainContextEnrichment(
+            query=query,
+            evidence_gaps=(
+                EvidenceGap(
+                    BMDEX_DOMAIN_CONTEXT,
+                    "producer_failed",
+                    (
+                        "BMDex contextual-reference enrichment failed safely: "
+                        f"{type(exc).__name__}."
+                    ),
+                ),
+            ),
+        )
+
+    assessment = _domain_context_assessment(analysis, evidence)
+    return BmdexDomainContextEnrichment(
+        query=query,
+        evidence=evidence,
+        assessment=assessment,
+    )
+
+
+def build_bmdex_domain_query(
+    analysis: LifecycleAnalysis,
+) -> Mapping[str, Any] | None:
+    """Build a factual contextual-reference query from existing lifecycle evidence."""
+
+    diagnostics = analysis.diagnostics
+    if diagnostics is None or not diagnostics.trajectories:
+        return None
+    if not _bool_value(analysis.incar_settings.get("LHFCALC")):
+        return None
+
+    trajectory = next(
+        (
+            item
+            for item in diagnostics.trajectories
+            if item.completed_ionic_steps == 0
+            and item.incomplete_electronic_iteration_count is not None
+            and item.incomplete_electronic_iteration_count > 0
+        ),
+        None,
+    )
+    if trajectory is None:
+        return None
+
+    query: dict[str, Any] = {
+        "code": "VASP",
+        "calculation_family": "hybrid_functional",
+        "topic": "electronic_iteration_behavior",
+    }
+    theory = _observed_stage_theory(analysis, trajectory.stage_index)
+    if theory and theory.lower() != "unknown":
+        query["functional"] = theory
+
+    algorithm = analysis.incar_settings.get("ALGO")
+    if isinstance(algorithm, str) and algorithm.strip():
+        query["electronic_algorithm"] = algorithm.strip()
+
+    observed_algorithms = {
+        str(item.algorithm).upper()
+        for item in trajectory.recent_incomplete_electronic_iterations
+        if item.algorithm
+    }
+    observed_patterns = ["incomplete_first_electronic_cycle"]
+    if "DAV" in observed_algorithms:
+        observed_patterns.append("initial_DAV_iterations_observed")
+        observed_patterns.append(
+            f"{trajectory.incomplete_electronic_iteration_count}_initial_DAV_iterations_observed"
+        )
+    query["observed_patterns"] = observed_patterns
+
+    input_tags = {
+        key: analysis.incar_settings[key]
+        for key in ("LHFCALC", "HFSCREEN", "AEXX", "ALGO", "NELMDL", "LSORBIT")
+        if key in analysis.incar_settings
+    }
+    if input_tags:
+        query["input_tags"] = input_tags
+    return query
+
+
+def inspect_bmdex_domain_context(
+    repository: GitRepositoryResource,
+    query: Mapping[str, Any],
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> BmdexDomainContextEvidence:
+    """Invoke BMDex's fixed read-only contextual-reference producer."""
+
+    if not repository.path.is_dir():
+        raise BmdexDomainContextError(
+            f"Configured BMDex checkout does not exist: {repository.path}",
+            kind="missing_checkout",
+        )
+    if repository.capability_python is None:
+        raise BmdexDomainContextError(
+            "BMDex repository configuration is missing capability_python.",
+            kind="missing_interpreter",
+        )
+    if not repository.capability_python.is_file():
+        raise BmdexDomainContextError(
+            f"Configured BMDex capability Python does not exist: {repository.capability_python}",
+            kind="missing_interpreter",
+        )
+
+    command = [
+        str(repository.capability_python),
+        "-B",
+        "-m",
+        DOMAIN_CONTEXT_PRODUCER_MODULE,
+    ]
+    request_text = json.dumps({"query": dict(query)}, sort_keys=True)
+    try:
+        completed = runner(
+            command,
+            cwd=repository.path,
+            input=request_text,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference producer timed out.",
+            kind="timeout",
+        ) from exc
+    except OSError as exc:
+        raise BmdexDomainContextError(
+            f"Could not execute BMDex contextual-reference producer: {exc}",
+            kind="producer_failed",
+        ) from exc
+
+    try:
+        evidence = parse_bmdex_domain_context_payload(
+            completed.stdout,
+            requested_query=query,
+        )
+    except BmdexDomainContextError as exc:
+        if completed.returncode != 0 and exc.kind in {"malformed_json", "malformed_payload"}:
+            raise BmdexDomainContextError(
+                "BMDex contextual-reference producer failed without a valid contract response.",
+                kind="producer_failed",
+                returncode=completed.returncode,
+                stderr_summary=_stderr_summary(completed.stderr),
+            ) from exc
+        raise
+
+    if completed.returncode != 0:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference producer returned a successful payload with a nonzero exit.",
+            kind="producer_failed",
+            returncode=completed.returncode,
+            stderr_summary=_stderr_summary(completed.stderr),
+        )
+    return evidence
+
+
+def parse_bmdex_domain_context_payload(
+    output: str,
+    *,
+    requested_query: Mapping[str, Any] | None = None,
+) -> BmdexDomainContextEvidence:
+    """Parse and validate BMDex contextual-reference schema v1."""
+
+    try:
+        raw_payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference producer emitted malformed JSON.",
+            kind="malformed_json",
+        ) from exc
+    if not isinstance(raw_payload, dict):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference payload must be a JSON object.",
+            kind="malformed_payload",
+        )
+
+    payload = dict(raw_payload)
+    _validate_domain_context_payload(payload, requested_query=requested_query)
+    if payload["status"] == "error":
+        raise _domain_context_structured_error(payload)
+
+    records = tuple(
+        BmdexContextualReferenceRecord(
+            record=dict(item["record"]),
+            match=dict(item["match"]),
+        )
+        for item in payload["records"]
+    )
+    return BmdexDomainContextEvidence(payload=payload, records=records)
+
+
+def _validate_domain_context_payload(
+    payload: Mapping[str, Any],
+    *,
+    requested_query: Mapping[str, Any] | None,
+) -> None:
+    if payload.get("schema_version") != DOMAIN_CONTEXT_SCHEMA_VERSION:
+        raise BmdexDomainContextError(
+            "Unsupported BMDex contextual-reference schema_version: "
+            f"{payload.get('schema_version')!r}",
+            kind="unsupported_schema",
+        )
+    if payload.get("evidence_type") != DOMAIN_CONTEXT_EVIDENCE_TYPE:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference payload has an unexpected evidence_type.",
+            kind="malformed_payload",
+        )
+    status = payload.get("status")
+    if status not in {"ok", "error"}:
+        raise BmdexDomainContextError(
+            f"BMDex contextual-reference payload has unexpected status: {status!r}",
+            kind="malformed_payload",
+        )
+    producer = _domain_required_mapping(payload, "producer")
+    if producer.get("name") != PRODUCER_NAME:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference producer.name was not BMDex.",
+            kind="malformed_payload",
+        )
+    if status == "error":
+        _domain_required_mapping(payload, "error")
+        return
+
+    query = _domain_required_mapping(payload, "query")
+    if requested_query is not None and dict(query) != dict(requested_query):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference response query did not match the request.",
+            kind="malformed_payload",
+        )
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference payload missing list field: records",
+            kind="malformed_payload",
+        )
+    result_count = payload.get("result_count")
+    if not isinstance(result_count, int) or isinstance(result_count, bool):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference result_count must be an integer.",
+            kind="malformed_payload",
+        )
+    if result_count != len(records):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference result_count did not match records.",
+            kind="malformed_payload",
+        )
+    for item in records:
+        _validate_domain_context_match(item)
+
+
+def _validate_domain_context_match(item: Any) -> None:
+    if not isinstance(item, Mapping):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference match must be an object.",
+            kind="malformed_payload",
+        )
+    record = _domain_required_mapping(item, "record")
+    match = _domain_required_mapping(item, "match")
+    required_strings = (
+        "id",
+        "title",
+        "evidence_type",
+        "status",
+        "contextual_statement",
+        "diagnostic_relevance",
+    )
+    for key in required_strings:
+        if not isinstance(record.get(key), str) or not record[key]:
+            raise BmdexDomainContextError(
+                f"BMDex contextual-reference record missing string field: {key}",
+                kind="malformed_payload",
+            )
+    if record.get("schema_version") != DOMAIN_CONTEXT_SCHEMA_VERSION:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference record has unsupported schema_version.",
+            kind="unsupported_schema",
+        )
+    if record.get("evidence_type") != DOMAIN_CONTEXT_EVIDENCE_TYPE:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference record has an unexpected evidence_type.",
+            kind="malformed_payload",
+        )
+    _domain_required_mapping(record, "domain")
+    _domain_required_mapping(record, "applicability")
+    provenance = _domain_required_mapping(record, "record_provenance")
+    if provenance.get("machine_readable_schema") != DOMAIN_CONTEXT_SCHEMA:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference record has an unsupported machine-readable schema.",
+            kind="unsupported_schema",
+        )
+    if not isinstance(provenance.get("record_version"), int):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference record_version must be an integer.",
+            kind="malformed_payload",
+        )
+    limitations = record.get("limitations")
+    if not isinstance(limitations, list) or not all(
+        isinstance(item, str) and item for item in limitations
+    ):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference record limitations must be non-empty strings.",
+            kind="malformed_payload",
+        )
+    sources = record.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference record must preserve source provenance.",
+            kind="malformed_payload",
+        )
+    for source in sources:
+        if not isinstance(source, Mapping) or not all(
+            isinstance(source.get(key), str) and source[key]
+            for key in (
+                "source_type",
+                "title",
+                "authority",
+                "url",
+                "retrieved_on",
+                "applicability_note",
+            )
+        ):
+            raise BmdexDomainContextError(
+                "BMDex contextual-reference source provenance is malformed.",
+                kind="malformed_payload",
+            )
+    matched_fields = match.get("matched_fields")
+    if not isinstance(matched_fields, list) or not all(
+        isinstance(field, str) and field for field in matched_fields
+    ):
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference match.matched_fields is malformed.",
+            kind="malformed_payload",
+        )
+    if not isinstance(match.get("match_type"), str) or not match["match_type"]:
+        raise BmdexDomainContextError(
+            "BMDex contextual-reference match.match_type is malformed.",
+            kind="malformed_payload",
+        )
+
+
+def _domain_required_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, Mapping):
+        raise BmdexDomainContextError(
+            f"BMDex contextual-reference payload missing object field: {key}",
+            kind="malformed_payload",
+        )
+    return value
+
+
+def _domain_context_structured_error(
+    payload: Mapping[str, Any],
+) -> BmdexDomainContextError:
+    error = payload.get("error")
+    code = error.get("code") if isinstance(error, Mapping) else None
+    message = error.get("message") if isinstance(error, Mapping) else None
+    details = [
+        _bounded_text(str(item))
+        for item in (code, message)
+        if isinstance(item, str) and item
+    ]
+    suffix = f": {' - '.join(details)}" if details else "."
+    return BmdexDomainContextError(
+        f"BMDex contextual-reference producer returned a structured error{suffix}",
+        kind="structured_producer_error",
+    )
+
+
+def _observed_stage_theory(
+    analysis: LifecycleAnalysis,
+    stage_index: int | None,
+) -> str | None:
+    workflow = analysis.bmd_workflow
+    if workflow is None or not workflow.workflow_stages:
+        return None
+    index = stage_index
+    if index is None and workflow.current_stage is not None:
+        index = workflow.current_stage.stage_index
+    if index is None or not 1 <= index <= len(workflow.workflow_stages):
+        return None
+    theory = workflow.workflow_stages[index - 1].get("theory")
+    return str(theory) if theory is not None else None
+
+
+def _domain_context_assessment(
+    analysis: LifecycleAnalysis,
+    evidence: BmdexDomainContextEvidence,
+) -> BmdexContextualAssessment | None:
+    if not evidence.records:
+        return None
+    basis = tuple(
+        (
+            "Observed VASP input and electronic-trajectory context are consistent with the "
+            f"applicability of cited BMDex reference {record.record_id}: {record.title}."
+        )
+        for record in evidence.records
+    )
+    limitations = [
+        "Contextual-reference applicability does not establish the cause of the calculation's termination.",
+        "Contextual reference evidence does not establish a hang or a method incompatibility by itself.",
+    ]
+    if _analysis_mentions_sigterm(analysis):
+        limitations.append("The available evidence does not establish why SIGTERM was issued.")
+    return BmdexContextualAssessment(
+        basis=basis,
+        limitations=tuple(limitations),
+        source_record_ids=tuple(record.record_id for record in evidence.records),
+    )
+
+
+def _analysis_mentions_sigterm(analysis: LifecycleAnalysis) -> bool:
+    diagnostics = analysis.diagnostics
+    if diagnostics is None:
+        return False
+    return any(
+        "sigterm" in message.lower()
+        for log in diagnostics.logs
+        for message in log.messages
+    )
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", ".true.", "t", "1", "yes"}
+    return False
 
 
 def enrich_scientific_context_with_bmdex(

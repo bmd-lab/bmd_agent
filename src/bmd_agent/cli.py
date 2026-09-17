@@ -1,6 +1,7 @@
 from collections.abc import Iterable, Mapping
 import hashlib
 import json
+from pathlib import Path
 import subprocess
 import sys
 from typing import Any
@@ -12,6 +13,11 @@ from bmd_agent.config import (
     SlurmClusterResource,
     load_resources,
 )
+from bmd_agent.resources.bmdex import (
+    BmdexDomainContextEnrichment,
+    bmdex_repository,
+    enrich_lifecycle_with_bmdex_domain_context,
+)
 from bmd_agent.resources.compute import (
     ComputeCapabilities,
     ComputeCapabilityError,
@@ -21,6 +27,11 @@ from bmd_agent.resources.git import GitInspection, inspect_repository
 from bmd_agent.resources.input_check import (
     InputCheckObservation,
     check_remote_input_directory,
+)
+from bmd_agent.resources.lifecycle import (
+    LifecycleAnalysis,
+    LifecycleState,
+    analyze_calculation_directory,
 )
 from bmd_agent.resources.run import (
     PRODUCER_REQUESTED,
@@ -36,7 +47,7 @@ from bmd_agent.resources.run import (
     inspect_remote_run,
     serialize_job_trajectory_evidence,
 )
-from bmd_agent.resources.slurm import get_queue
+from bmd_agent.resources.slurm import get_job_accounting, get_queue
 from bmd_agent.resources.vasp import RemotePathError, read_remote_structure
 
 
@@ -178,6 +189,250 @@ def show_queue(registry: ResourceRegistry | None = None) -> int:
         print(f"  {user}: {count}")
 
     return 0
+
+
+def show_current_directory(
+    directory: Path | None = None,
+    registry: ResourceRegistry | None = None,
+) -> int:
+    """Analyze the calculation associated with the current working directory."""
+
+    directory = directory or Path.cwd()
+    scheduler_lookup = None
+    if registry is None:
+        try:
+            registry = load_resources()
+        except ConfigurationError:
+            registry = None
+    if registry is not None:
+        try:
+            cluster = powerslurm_cluster(registry)
+        except ConfigurationError:
+            cluster = None
+        if cluster is not None:
+            scheduler_lookup = lambda job_id: get_job_accounting(
+                cluster.ssh_host,
+                job_id,
+            )
+
+    analysis = analyze_calculation_directory(
+        directory,
+        scheduler_lookup=scheduler_lookup,
+    )
+    contextual_enrichment = enrich_lifecycle_with_bmdex_domain_context(
+        analysis,
+        bmdex_repository(registry) if registry is not None else None,
+    )
+    print_lifecycle_analysis(analysis, contextual_enrichment=contextual_enrichment)
+    return 0
+
+
+def print_lifecycle_analysis(
+    analysis: LifecycleAnalysis,
+    *,
+    contextual_enrichment: BmdexDomainContextEnrichment | None = None,
+) -> None:
+    """Print a concise lifecycle-oriented calculation summary."""
+
+    print("BMD Agent")
+    print("=========")
+    print()
+    print(f"Calculation directory: {analysis.directory}")
+    print(f"Calculation state: {analysis.state.value}")
+    print(f"Calculation type: {analysis.calculation_kind}")
+    print(f"Summary: {analysis.message}")
+    print()
+
+    if analysis.calculation_kind == "none":
+        return
+
+    if analysis.bmd_workflow is not None:
+        workflow = analysis.bmd_workflow
+        print("BMD Compute provenance:")
+        if workflow.relocated:
+            print(f"  current acquisition directory: {workflow.workflow_root}")
+            if workflow.producer_root:
+                print(f"  original producer run directory: {workflow.producer_root}")
+        else:
+            print(f"  workflow root: {workflow.workflow_root}")
+        if workflow.stage_evidence:
+            print("  workflow stages:")
+            for stage_evidence in workflow.stage_evidence:
+                index = stage_evidence.stage_index if stage_evidence.stage_index is not None else "?"
+                status = _local_stage_status(stage_evidence)
+                print(f"    {index}. {stage_evidence.label} - {status}")
+        if workflow.current_stage is not None:
+            stage = workflow.current_stage
+            print(f"  current stage: {stage.label} ({stage.path})")
+            if workflow.relocated and stage.producer_path:
+                print(f"  original stage path: {stage.producer_path}")
+        if workflow.job_id:
+            print(f"  job id: {workflow.job_id}")
+        print()
+
+    if analysis.scheduler is not None:
+        print("Scheduler observation:")
+        _print_optional_value("state", analysis.scheduler.state)
+        _print_optional_value("exit", analysis.scheduler.exit_code)
+        _print_optional_value("elapsed", analysis.scheduler.elapsed)
+        _print_optional_value("node", analysis.scheduler.node_list)
+        print()
+    elif analysis.scheduler_error and analysis.bmd_workflow is not None:
+        print("Scheduler observation:")
+        print(f"  unavailable: {analysis.scheduler_error}")
+        print()
+
+    print("Input evidence:")
+    for name in ("POSCAR", "INCAR", "KPOINTS"):
+        observation = analysis.input_files.get(name)
+        print(f"  {name}: {_local_file_status(observation)}")
+    print()
+
+    print("Execution evidence:")
+    for name in ("OUTCAR", "OSZICAR", "vasprun.xml", "CONTCAR"):
+        observation = analysis.output_files.get(name)
+        print(f"  {name}: {_local_file_status(observation)}")
+    if analysis.normal_completion is not None:
+        print(f"  VASP normal completion marker: {_display_bool(analysis.normal_completion)}")
+    print()
+
+    if analysis.diagnostics is not None:
+        print("Progress:")
+        print("  execution has started")
+        print(
+            "  normal VASP completion: "
+            f"{'observed' if analysis.normal_completion else 'not observed'}"
+        )
+        _print_trajectory_observations(analysis.diagnostics.trajectories)
+        print()
+        _print_lifecycle_diagnostic_evidence(analysis.diagnostics)
+        print()
+        _print_convergence_progress_assessment_values(analysis.diagnostics.assessments)
+        print()
+        _print_lifecycle_suggested_checks(analysis.diagnostics)
+        print()
+
+    if analysis.structure is not None:
+        print("Structure:")
+        print(f"  formula: {analysis.structure.reduced_formula}")
+        print(f"  sites: {analysis.structure.sites}")
+        print()
+
+    if analysis.incar_settings:
+        print("Executed/input settings:")
+        for key in _EXECUTED_INPUT_DISPLAY_KEYS:
+            if key in analysis.incar_settings:
+                print(f"  {key}: {_format_input_value(analysis.incar_settings[key])}")
+        print()
+
+    summarize_scientific = (
+        analysis.scientific is not None
+        and analysis.diagnostics is not None
+        and analysis.state != LifecycleState.COMPLETED
+        and bool(analysis.scientific.error or analysis.scientific.unavailable)
+    )
+    if analysis.scientific is not None and not summarize_scientific:
+        print("Scientific observations:")
+        _print_scientific_result(analysis.scientific)
+        print()
+    elif analysis.scientific is not None and summarize_scientific:
+        print("Scientific observations:")
+        print("  final-result parsing incomplete; see progress and diagnostic evidence above")
+        if analysis.scientific.error:
+            print(f"  unavailable: {analysis.scientific.error}")
+        elif analysis.scientific.unavailable:
+            print(f"  unavailable: {analysis.scientific.unavailable[0]}")
+        print()
+
+    if analysis.evidence_gaps:
+        print("Evidence gaps:")
+        for gap in analysis.evidence_gaps:
+            print(f"  {gap}")
+        print()
+
+    if analysis.limitations:
+        print("Limitations:")
+        for limitation in analysis.limitations:
+            print(f"  {limitation}")
+        print()
+
+    if contextual_enrichment is not None:
+        _print_bmdex_contextual_enrichment(contextual_enrichment)
+
+
+def _print_bmdex_contextual_enrichment(
+    enrichment: BmdexDomainContextEnrichment,
+) -> None:
+    if enrichment.query is None:
+        return
+
+    if enrichment.evidence_gaps:
+        print("Contextual reference evidence (contextual_reference_evidence):")
+        for gap in enrichment.evidence_gaps:
+            print(f"  unavailable: {gap.reason}")
+        print()
+        return
+
+    evidence = enrichment.evidence
+    if evidence is None:
+        return
+    if not evidence.records:
+        print("Contextual reference evidence (contextual_reference_evidence):")
+        print("  no matching BMDex contextual references")
+        print()
+        return
+
+    producer = evidence.producer
+    git = producer.get("git") if isinstance(producer, Mapping) else None
+    print("Contextual reference evidence (contextual_reference_evidence):")
+    print("  producer: BMDex")
+    if isinstance(git, Mapping):
+        print(f"  producer commit: {_display_commit(git.get('commit'))}")
+        print(f"  producer state: {git.get('state') or 'unavailable'}")
+    for record in evidence.records:
+        provenance = record.record_provenance
+        print(f"  record: {record.record_id}")
+        print(f"    title: {record.title}")
+        print(
+            "    version: "
+            f"{provenance.get('record_version', 'unknown')} "
+            f"({provenance.get('machine_readable_schema', 'unknown')})"
+        )
+        print(f"    contextual statement: {record.contextual_statement}")
+        print(f"    diagnostic relevance: {record.diagnostic_relevance}")
+        matched = record.match.get("matched_fields", ())
+        if isinstance(matched, list) and matched:
+            print(f"    matched fields: {', '.join(str(item) for item in matched)}")
+        print(f"    source provenance: {_compact_reference_sources(record.sources)}")
+        print(f"    producer-supplied limitations retained: {len(record.limitations)}")
+    print()
+
+    assessment = enrichment.assessment
+    if assessment is None:
+        return
+    print("Contextual assessment (assessment):")
+    for basis in assessment.basis:
+        print(f"  {basis}")
+    for limitation in assessment.limitations:
+        print(f"  limitation: {limitation}")
+    print()
+
+
+def _compact_reference_sources(sources: tuple[Mapping[str, Any], ...]) -> str:
+    by_authority: dict[str, tuple[int, str | None]] = {}
+    for source in sources:
+        authority = str(source.get("authority") or source.get("source_type") or "unknown")
+        count, first_url = by_authority.get(authority, (0, None))
+        url = source.get("url")
+        by_authority[authority] = (
+            count + 1,
+            first_url or (str(url) if isinstance(url, str) and url else None),
+        )
+    entries = []
+    for authority, (count, url) in by_authority.items():
+        label = f"{authority} ({count})"
+        entries.append(f"{label}: {url}" if url else label)
+    return "; ".join(entries)
 
 
 def show_compute(registry: ResourceRegistry | None = None) -> int:
@@ -1323,6 +1578,78 @@ def _display_value(value: object) -> str:
     return "unavailable" if value is None else str(value)
 
 
+def _display_bool(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def _local_file_status(observation: object) -> str:
+    if observation is None:
+        return "not checked"
+    if not getattr(observation, "present", False):
+        return "missing"
+    size = getattr(observation, "size", None)
+    if size is None:
+        return "present, size unavailable"
+    if size == 0:
+        return "present, empty"
+    return f"present, {size} bytes"
+
+
+def _local_stage_status(stage_evidence: object) -> str:
+    if getattr(stage_evidence, "normal_completion", False):
+        return "completed"
+    if getattr(stage_evidence, "has_meaningful_execution", False):
+        return "partial"
+    if getattr(stage_evidence, "has_required_inputs", False):
+        return "inputs present"
+    return "unavailable"
+
+
+def _print_lifecycle_diagnostic_evidence(diagnostics: object) -> None:
+    print("Diagnostic evidence:")
+    logs = getattr(diagnostics, "logs", ())
+    if logs:
+        print("  bounded log excerpts:")
+        for log in logs:
+            print(f"    {getattr(log, 'label', 'log')}: {getattr(log, 'path', '')}")
+            if getattr(log, "error", None):
+                print(f"      unavailable: {getattr(log, 'error')}")
+            elif getattr(log, "messages", ()):
+                for message in getattr(log, "messages", ()):
+                    print(f"      {message}")
+            else:
+                print("      no fatal/error excerpt found in bounded read")
+    custodian = getattr(diagnostics, "custodian", None)
+    if custodian is not None:
+        print("  custodian:")
+        print(f"    path: {getattr(custodian, 'path', '')}")
+        if getattr(custodian, "error", None):
+            print(f"    unavailable: {getattr(custodian, 'error')}")
+        elif getattr(custodian, "events", ()):
+            for event in getattr(custodian, "events", ()):
+                print(f"    {event}")
+        else:
+            print("    present; no compact correction/error summary extracted")
+    archives = getattr(diagnostics, "error_archives", ())
+    if archives:
+        print("  error archives:")
+        for archive in archives:
+            print(f"    {getattr(archive, 'name', 'archive')}: present ({getattr(archive, 'path', '')})")
+        print("    not unpacked by BMD Agent")
+    if not logs and custodian is None and not archives:
+        print("  unavailable: no local diagnostic logs, custodian.json, or error archives were found")
+
+
+def _print_lifecycle_suggested_checks(diagnostics: object) -> None:
+    suggestions = getattr(diagnostics, "suggested_checks", ())
+    print("Suggested checks:")
+    if not suggestions:
+        print("  No additional diagnostic checks were suggested from local evidence.")
+        return
+    for suggestion in suggestions:
+        print(f"  {suggestion}")
+
+
 def _format_input_value(value: object) -> str:
     if value is None:
         return "unavailable"
@@ -1365,7 +1692,10 @@ def main(argv: list[str] | None = None) -> int:
     """BMD Agent command-line entry point."""
 
     argv = list(sys.argv[1:] if argv is None else argv)
-    command = argv[0] if argv else "status"
+    if not argv:
+        return show_current_directory()
+
+    command = argv[0]
 
     try:
         if command == "status":
@@ -1422,6 +1752,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Unknown command: {command}")
     print()
     print("Available commands:")
+    print("  (no arguments) analyze the current calculation directory")
     print("  status")
     print("  queue")
     print("  job <SLURM_JOB_ID> [--trajectory-json]")

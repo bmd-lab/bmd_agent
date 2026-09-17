@@ -11,14 +11,21 @@ from bmd_agent.config import GitRepositoryResource, ResourceRegistry, parse_reso
 from bmd_agent.resources import run as run_resource
 from bmd_agent.resources.bmdex import (
     BMDEX_COMPOSITION_CONTEXT,
+    DOMAIN_CONTEXT_EVIDENCE_TYPE,
+    DOMAIN_CONTEXT_PRODUCER_MODULE,
     EVIDENCE_TYPE,
     PRODUCER_MODULE,
     BmdexCompositionError,
     BmdexCompositionEvidence,
+    BmdexDomainContextError,
     EnrichedScientificContext,
     bmdex_repository,
+    build_bmdex_domain_query,
+    enrich_lifecycle_with_bmdex_domain_context,
     enrich_scientific_context_with_bmdex,
+    inspect_bmdex_domain_context,
     inspect_bmdex_composition_context,
+    parse_bmdex_domain_context_payload,
     parse_bmdex_composition_payload,
 )
 from bmd_agent.resources.context import (
@@ -27,7 +34,19 @@ from bmd_agent.resources.context import (
     ScientificIdentitySummary,
     build_scientific_context,
 )
-from bmd_agent.resources.run import JobInspection
+from bmd_agent.resources.lifecycle import (
+    BmdWorkflowDiscovery,
+    LifecycleAnalysis,
+    LifecycleState,
+    LocalExecutionDiagnostics,
+    LocalLogDiagnostic,
+    LocalStageBinding,
+)
+from bmd_agent.resources.run import (
+    ElectronicIterationObservation,
+    JobInspection,
+    StageTrajectoryObservation,
+)
 
 
 def base_context(
@@ -90,6 +109,129 @@ def repository(
         live=False,
         capability_python=python if capability_python else None,
     )
+
+
+def domain_analysis(*, hybrid: bool = True) -> LifecycleAnalysis:
+    directory = Path("/relocated/calculation")
+    trajectory = StageTrajectoryObservation(
+        stage_index=1,
+        stage_label="result_dir",
+        stage_type="static",
+        theory="hse06" if hybrid else "pbe",
+        directory=str(directory),
+        completed_ionic_steps=0,
+        incomplete_electronic_iteration_count=4,
+        recent_incomplete_electronic_iterations=tuple(
+            ElectronicIterationObservation(iteration=index, algorithm="DAV")
+            for index in range(1, 5)
+        ),
+    )
+    workflow = BmdWorkflowDiscovery(
+        workflow_root=directory,
+        submission_path=directory / "submission.json",
+        submission={},
+        workflow_stages=(
+            {
+                "stage_type": "static",
+                "theory": "hse06" if hybrid else "pbe",
+                "modifiers": ["soc"] if hybrid else [],
+            },
+        ),
+        stage_bindings=(LocalStageBinding("result_dir", directory, 1),),
+        current_stage=LocalStageBinding("result_dir", directory, 1),
+        relocated=True,
+    )
+    settings = {
+        "LHFCALC": hybrid,
+        "HFSCREEN": 0.2,
+        "AEXX": 0.25,
+        "ALGO": "Damped",
+        "LSORBIT": hybrid,
+    }
+    return LifecycleAnalysis(
+        state=LifecycleState.UNKNOWN,
+        directory=directory,
+        calculation_kind="BMD Compute",
+        message="partial local snapshot",
+        bmd_workflow=workflow,
+        incar_settings=settings,
+        diagnostics=LocalExecutionDiagnostics(
+            trajectories=(trajectory,),
+            logs=(
+                LocalLogDiagnostic(
+                    label="std_err.txt",
+                    path=directory / "std_err.txt",
+                    present=True,
+                    messages=("SIGTERM received",),
+                ),
+            ),
+        ),
+    )
+
+
+def domain_payload(query: dict, *, include_record: bool = True) -> dict:
+    records = []
+    if include_record:
+        records.append(
+            {
+                "record": {
+                    "schema_version": 1,
+                    "id": "vasp.test.context",
+                    "title": "Producer-owned test context",
+                    "evidence_type": "contextual_reference_evidence",
+                    "status": "active",
+                    "domain": {"code": "VASP"},
+                    "topics": ["electronic_iteration_behavior"],
+                    "applicability": {"code": "VASP"},
+                    "contextual_statement": "Producer-supplied contextual statement.",
+                    "diagnostic_relevance": (
+                        "This context is relevant but does not diagnose a specific run."
+                    ),
+                    "limitations": [
+                        "This record is contextual reference evidence only.",
+                        "It does not recommend changing calculation inputs.",
+                    ],
+                    "sources": [
+                        {
+                            "source_type": "VASP Wiki",
+                            "title": "Test reference",
+                            "authority": "VASP Software GmbH / VASP Wiki",
+                            "url": "https://vasp.at/wiki/Test",
+                            "retrieved_on": "2026-09-16",
+                            "applicability_note": "Supports the bounded test statement.",
+                        }
+                    ],
+                    "record_provenance": {
+                        "record_version": 3,
+                        "machine_readable_schema": "bmdex.contextual_reference.v1",
+                    },
+                    "record_path": "vasp/contextual_reference/records/test.json",
+                },
+                "match": {
+                    "matched_fields": [
+                        "code",
+                        "calculation_family",
+                        "functional",
+                        "electronic_algorithm",
+                        "input_tags",
+                    ],
+                    "match_type": "deterministic_structured_field_overlap",
+                },
+            }
+        )
+    return {
+        "schema_version": 1,
+        "status": "ok",
+        "evidence_type": "contextual_reference_evidence",
+        "producer": {
+            "name": "BMDex",
+            "contract_module": "tools.domain_context.query",
+            "git": {"commit": "b" * 40, "dirty": False, "state": "clean"},
+        },
+        "query": query,
+        "records": records,
+        "result_count": len(records),
+    }
 
 
 def mncu5_payload() -> dict:
@@ -596,3 +738,237 @@ def test_agent_adapter_has_no_network_scheduler_or_write_paths() -> None:
         "mkdir",
     )
     assert not [token for token in forbidden if token in source]
+
+
+def test_domain_query_uses_only_observed_hybrid_input_and_trajectory_context() -> None:
+    query = build_bmdex_domain_query(domain_analysis())
+
+    assert query == {
+        "code": "VASP",
+        "calculation_family": "hybrid_functional",
+        "functional": "hse06",
+        "electronic_algorithm": "Damped",
+        "topic": "electronic_iteration_behavior",
+        "observed_patterns": [
+            "incomplete_first_electronic_cycle",
+            "initial_DAV_iterations_observed",
+            "4_initial_DAV_iterations_observed",
+        ],
+        "input_tags": {
+            "LHFCALC": True,
+            "HFSCREEN": 0.2,
+            "AEXX": 0.25,
+            "ALGO": "Damped",
+            "LSORBIT": True,
+        },
+    }
+    assert "hung" not in json.dumps(query).lower()
+    assert "failure" not in json.dumps(query).lower()
+
+
+def test_unrelated_semilocal_context_does_not_query_bmdex() -> None:
+    assert build_bmdex_domain_query(domain_analysis(hybrid=False)) is None
+
+
+def test_domain_context_invokes_fixed_external_producer_and_preserves_contract(
+    tmp_path: Path,
+) -> None:
+    query = dict(build_bmdex_domain_query(domain_analysis()) or {})
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        return completed(domain_payload(query))
+
+    configured_repository = repository(tmp_path)
+    evidence = inspect_bmdex_domain_context(
+        configured_repository,
+        query,
+        runner=runner,
+        timeout=9,
+    )
+
+    command, kwargs = calls[0]
+    assert command[-3:] == ["-B", "-m", DOMAIN_CONTEXT_PRODUCER_MODULE]
+    assert kwargs["cwd"] == configured_repository.path
+    assert json.loads(kwargs["input"]) == {"query": query}
+    assert kwargs["shell"] is False
+    assert kwargs["timeout"] == 9
+    assert evidence.evidence_type == DOMAIN_CONTEXT_EVIDENCE_TYPE
+    assert evidence.query == query
+    record = evidence.records[0]
+    assert record.record_id == "vasp.test.context"
+    assert record.contextual_statement == "Producer-supplied contextual statement."
+    assert record.applicability == {"code": "VASP"}
+    assert record.diagnostic_relevance.startswith("This context is relevant")
+    assert record.limitations == (
+        "This record is contextual reference evidence only.",
+        "It does not recommend changing calculation inputs.",
+    )
+    assert record.sources[0]["authority"] == "VASP Software GmbH / VASP Wiki"
+    assert record.record_provenance["record_version"] == 3
+    assert (
+        record.record_provenance["machine_readable_schema"]
+        == "bmdex.contextual_reference.v1"
+    )
+
+
+def test_domain_context_zero_matches_is_valid_optional_evidence() -> None:
+    query = dict(build_bmdex_domain_query(domain_analysis()) or {})
+    evidence = parse_bmdex_domain_context_payload(
+        json.dumps(domain_payload(query, include_record=False)),
+        requested_query=query,
+    )
+
+    assert evidence.records == ()
+
+
+@pytest.mark.parametrize(
+    ("output", "kind"),
+    [
+        ("{not-json", "malformed_json"),
+        (
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "status": "ok",
+                    "evidence_type": "contextual_reference_evidence",
+                }
+            ),
+            "unsupported_schema",
+        ),
+    ],
+)
+def test_domain_context_malformed_or_unknown_schema_is_typed(
+    output: str,
+    kind: str,
+) -> None:
+    with pytest.raises(BmdexDomainContextError) as exc_info:
+        parse_bmdex_domain_context_payload(output)
+
+    assert exc_info.value.kind == kind
+
+
+def test_domain_context_unavailability_is_nonfatal_and_does_not_change_lifecycle() -> None:
+    analysis = domain_analysis()
+
+    enriched = enrich_lifecycle_with_bmdex_domain_context(analysis, None)
+
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert enriched.evidence is None
+    assert enriched.evidence_gaps[0].scope == "missing_bmdex_repository"
+
+
+def test_domain_context_malformed_producer_output_becomes_nonfatal_gap(
+    tmp_path: Path,
+) -> None:
+    analysis = domain_analysis()
+    enriched = enrich_lifecycle_with_bmdex_domain_context(
+        analysis,
+        repository(tmp_path),
+        runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout="{not-json",
+            stderr="",
+        ),
+    )
+
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert enriched.evidence is None
+    assert enriched.evidence_gaps[0].scope == "malformed_json"
+
+
+def test_domain_context_producer_failure_is_nonfatal_and_bounded(tmp_path: Path) -> None:
+    analysis = domain_analysis()
+    enriched = enrich_lifecycle_with_bmdex_domain_context(
+        analysis,
+        repository(tmp_path),
+        runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["python"],
+            returncode=1,
+            stdout="",
+            stderr="producer failed safely\nprivate traceback detail\n",
+        ),
+    )
+
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert enriched.evidence is None
+    gap = enriched.evidence_gaps[0]
+    assert gap.scope == "producer_failed"
+    assert "exit 1" in gap.reason
+    assert "producer failed safely" in gap.reason
+    assert "private traceback detail" not in gap.reason
+
+
+def test_domain_context_assessment_is_qualified_and_source_linked(tmp_path: Path) -> None:
+    analysis = domain_analysis()
+    query = dict(build_bmdex_domain_query(analysis) or {})
+    enriched = enrich_lifecycle_with_bmdex_domain_context(
+        analysis,
+        repository(tmp_path),
+        runner=lambda *_args, **_kwargs: completed(domain_payload(query)),
+    )
+
+    assert enriched.assessment is not None
+    assessment_text = " ".join(
+        (*enriched.assessment.basis, *enriched.assessment.limitations)
+    ).lower()
+    assert enriched.assessment.source_record_ids == ("vasp.test.context",)
+    assert "consistent with the applicability" in assessment_text
+    assert "does not establish" in assessment_text
+    assert "does not establish why sigterm was issued" in assessment_text
+    assert "definitely" not in assessment_text
+    assert "restart" not in assessment_text
+
+
+def test_lifecycle_cli_renders_contextual_evidence_with_compact_provenance(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    analysis = domain_analysis()
+    query = dict(build_bmdex_domain_query(analysis) or {})
+    enriched = enrich_lifecycle_with_bmdex_domain_context(
+        analysis,
+        repository(tmp_path),
+        runner=lambda *_args, **_kwargs: completed(domain_payload(query)),
+    )
+
+    cli.print_lifecycle_analysis(analysis, contextual_enrichment=enriched)
+
+    output = capsys.readouterr().out
+    assert "Calculation state: UNKNOWN" in output
+    assert "Contextual reference evidence (contextual_reference_evidence):" in output
+    assert "record: vasp.test.context" in output
+    assert "bmdex.contextual_reference.v1" in output
+    assert "Producer-supplied contextual statement." in output
+    assert "VASP Software GmbH / VASP Wiki" in output
+    assert "https://vasp.at/wiki/Test" in output
+    assert "Contextual assessment (assessment):" in output
+    assert "does not establish why SIGTERM was issued" in output
+    assert "HSE definitely" not in output
+
+
+def test_completed_unrelated_calculation_has_no_contextual_output(capsys) -> None:
+    analysis = LifecycleAnalysis(
+        state=LifecycleState.COMPLETED,
+        directory=Path("/calculation"),
+        calculation_kind="direct VASP",
+        message="complete",
+        incar_settings={"LHFCALC": False, "ALGO": "Normal"},
+    )
+    enriched = enrich_lifecycle_with_bmdex_domain_context(analysis, None)
+
+    cli.print_lifecycle_analysis(analysis, contextual_enrichment=enriched)
+
+    assert "Contextual reference evidence" not in capsys.readouterr().out
+
+
+def test_agent_does_not_copy_the_bmdex_record_or_add_action_paths() -> None:
+    source = Path("src/bmd_agent/resources/bmdex.py").read_text(encoding="utf-8")
+
+    assert "vasp.hybrid.exact_exchange_iteration_cost" not in source
+    assert "HSE starts at the fifth step" not in source
+    assert "sbatch" not in source
+    assert "scancel" not in source
+    assert "scontrol" not in source
