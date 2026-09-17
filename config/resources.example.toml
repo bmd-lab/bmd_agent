@@ -46,6 +46,7 @@ live = false
 # currently:
 #
 #   python -B -m tools.composition.context_producer
+#   python -B -m tools.domain_context.query
 #
 # from the configured checkout.
 capability_python = "/home/example/micromamba/envs/bmdex/bin/python"

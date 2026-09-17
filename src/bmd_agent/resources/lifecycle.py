@@ -143,7 +143,7 @@ _NORMAL_COMPLETION_MARKERS = (
     "Voluntary context switches",
 )
 _LOG_DIAGNOSTIC_RE = re.compile(
-    r"\b(error|fatal|traceback|exception|zbrent|brmix|edddav|eddrmm|segmentation|forrtl|killed)\b",
+    r"\b(error|fatal|traceback|exception|zbrent|brmix|edddav|eddrmm|segmentation|forrtl|killed|sigterm)\b",
     re.IGNORECASE,
 )
 

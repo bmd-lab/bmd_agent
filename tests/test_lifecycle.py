@@ -5,6 +5,7 @@ from pathlib import Path
 
 from bmd_agent import cli
 from bmd_agent.config import ConfigurationError
+from bmd_agent.resources.bmdex import build_bmdex_domain_query
 from bmd_agent.resources.lifecycle import (
     LifecycleState,
     analyze_calculation_directory,
@@ -67,6 +68,14 @@ OUTCAR_TWO_FORCE_BLOCKS = """\
       0.00000000      0.00000000      0.00000000      0.30000000      0.40000000      0.00000000
       0.50000000      0.50000000      0.50000000      0.00000000      0.00000000      0.10000000
  -----------------------------------------------------------------------------------
+"""
+
+OSZICAR_INCOMPLETE_FOUR_DAV = """\
+       N       E                     dE             d eps       ncg     rms          rms(c)
+DAV:   1   -1.000000000000E+01   -1.00000E+01   -1.00000E+01   10   1.000E+00   2.000E-01
+DAV:   2   -1.100000000000E+01   -1.00000E+00   -2.00000E-01   12   1.000E-01   2.000E-02
+DAV:   3   -1.110000000000E+01   -1.00000E-01   -2.00000E-02   12   8.000E-02   1.000E-02
+DAV:   4   -1.111000000000E+01   -1.00000E-02   -2.00000E-03   12   7.000E-02   9.000E-03
 """
 
 
@@ -497,6 +506,52 @@ def test_unknown_relocated_partial_snapshot_gets_diagnostic_evidence(tmp_path: P
     assert analysis.diagnostics.custodian is not None
     assert any("VaspErrorHandler" in event for event in analysis.diagnostics.custodian.events)
     assert [archive.name for archive in analysis.diagnostics.error_archives] == ["error.1.tar.gz"]
+
+
+def test_relocated_failed_hybrid_snapshot_builds_factual_domain_context_query(
+    tmp_path: Path,
+) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/hse06_soc_failed",
+    )
+    write_inputs(tmp_path)
+    (tmp_path / "INCAR").write_text(
+        "\n".join(
+            (
+                "LHFCALC = .TRUE.",
+                "HFSCREEN = 0.2",
+                "AEXX = 0.25",
+                "ALGO = Damped",
+                "LSORBIT = .TRUE.",
+            )
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "OSZICAR").write_text(OSZICAR_INCOMPLETE_FOUR_DAV, encoding="utf-8")
+    (tmp_path / "OUTCAR").write_text("partial", encoding="utf-8")
+    (tmp_path / "std_err.txt").write_text("SIGTERM received by VASP\n", encoding="utf-8")
+
+    analysis = analyze_calculation_directory(tmp_path)
+    query = build_bmdex_domain_query(analysis)
+
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert analysis.diagnostics is not None
+    trajectory = analysis.diagnostics.trajectories[0]
+    assert trajectory.completed_ionic_steps == 0
+    assert trajectory.incomplete_electronic_iteration_count == 4
+    assert analysis.diagnostics.logs[0].messages == ("SIGTERM received by VASP",)
+    assert query is not None
+    assert query["functional"] == "hse06"
+    assert query["electronic_algorithm"] == "Damped"
+    assert query["input_tags"] == {
+        "LHFCALC": True,
+        "HFSCREEN": 0.2,
+        "AEXX": 0.25,
+        "ALGO": "Damped",
+        "LSORBIT": True,
+    }
+    assert "4_initial_DAV_iterations_observed" in query["observed_patterns"]
 
 
 def test_incomplete_bmd_snapshot_uses_same_diagnostic_evidence(tmp_path: Path) -> None:

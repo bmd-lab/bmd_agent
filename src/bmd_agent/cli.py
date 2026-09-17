@@ -13,6 +13,11 @@ from bmd_agent.config import (
     SlurmClusterResource,
     load_resources,
 )
+from bmd_agent.resources.bmdex import (
+    BmdexDomainContextEnrichment,
+    bmdex_repository,
+    enrich_lifecycle_with_bmdex_domain_context,
+)
 from bmd_agent.resources.compute import (
     ComputeCapabilities,
     ComputeCapabilityError,
@@ -214,11 +219,19 @@ def show_current_directory(
         directory,
         scheduler_lookup=scheduler_lookup,
     )
-    print_lifecycle_analysis(analysis)
+    contextual_enrichment = enrich_lifecycle_with_bmdex_domain_context(
+        analysis,
+        bmdex_repository(registry) if registry is not None else None,
+    )
+    print_lifecycle_analysis(analysis, contextual_enrichment=contextual_enrichment)
     return 0
 
 
-def print_lifecycle_analysis(analysis: LifecycleAnalysis) -> None:
+def print_lifecycle_analysis(
+    analysis: LifecycleAnalysis,
+    *,
+    contextual_enrichment: BmdexDomainContextEnrichment | None = None,
+) -> None:
     """Print a concise lifecycle-oriented calculation summary."""
 
     print("BMD Agent")
@@ -342,6 +355,84 @@ def print_lifecycle_analysis(analysis: LifecycleAnalysis) -> None:
         for limitation in analysis.limitations:
             print(f"  {limitation}")
         print()
+
+    if contextual_enrichment is not None:
+        _print_bmdex_contextual_enrichment(contextual_enrichment)
+
+
+def _print_bmdex_contextual_enrichment(
+    enrichment: BmdexDomainContextEnrichment,
+) -> None:
+    if enrichment.query is None:
+        return
+
+    if enrichment.evidence_gaps:
+        print("Contextual reference evidence (contextual_reference_evidence):")
+        for gap in enrichment.evidence_gaps:
+            print(f"  unavailable: {gap.reason}")
+        print()
+        return
+
+    evidence = enrichment.evidence
+    if evidence is None:
+        return
+    if not evidence.records:
+        print("Contextual reference evidence (contextual_reference_evidence):")
+        print("  no matching BMDex contextual references")
+        print()
+        return
+
+    producer = evidence.producer
+    git = producer.get("git") if isinstance(producer, Mapping) else None
+    print("Contextual reference evidence (contextual_reference_evidence):")
+    print("  producer: BMDex")
+    if isinstance(git, Mapping):
+        print(f"  producer commit: {_display_commit(git.get('commit'))}")
+        print(f"  producer state: {git.get('state') or 'unavailable'}")
+    for record in evidence.records:
+        provenance = record.record_provenance
+        print(f"  record: {record.record_id}")
+        print(f"    title: {record.title}")
+        print(
+            "    version: "
+            f"{provenance.get('record_version', 'unknown')} "
+            f"({provenance.get('machine_readable_schema', 'unknown')})"
+        )
+        print(f"    contextual statement: {record.contextual_statement}")
+        print(f"    diagnostic relevance: {record.diagnostic_relevance}")
+        matched = record.match.get("matched_fields", ())
+        if isinstance(matched, list) and matched:
+            print(f"    matched fields: {', '.join(str(item) for item in matched)}")
+        print(f"    source provenance: {_compact_reference_sources(record.sources)}")
+        print(f"    producer-supplied limitations retained: {len(record.limitations)}")
+    print()
+
+    assessment = enrichment.assessment
+    if assessment is None:
+        return
+    print("Contextual assessment (assessment):")
+    for basis in assessment.basis:
+        print(f"  {basis}")
+    for limitation in assessment.limitations:
+        print(f"  limitation: {limitation}")
+    print()
+
+
+def _compact_reference_sources(sources: tuple[Mapping[str, Any], ...]) -> str:
+    by_authority: dict[str, tuple[int, str | None]] = {}
+    for source in sources:
+        authority = str(source.get("authority") or source.get("source_type") or "unknown")
+        count, first_url = by_authority.get(authority, (0, None))
+        url = source.get("url")
+        by_authority[authority] = (
+            count + 1,
+            first_url or (str(url) if isinstance(url, str) and url else None),
+        )
+    entries = []
+    for authority, (count, url) in by_authority.items():
+        label = f"{authority} ({count})"
+        entries.append(f"{label}: {url}" if url else label)
+    return "; ".join(entries)
 
 
 def show_compute(registry: ResourceRegistry | None = None) -> int:
