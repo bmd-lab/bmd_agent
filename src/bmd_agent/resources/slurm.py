@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import shlex
 import subprocess
@@ -7,8 +7,11 @@ from typing import Callable
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
+DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS = 60
+
 _PARTITION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-_JOB_ID_RE = re.compile(r"^\d+(?:_\d+)?(?:\.(?:batch|extern))?$")
+_JOB_ID_RE = re.compile(r"^\d+(?:_\d+)?(?:\.(?:batch|extern|\d+))?$")
 _SQUEUE_FORMAT = "%i|%u|%j|%t|%M|%R"
 _SACCT_FIELDS = (
     "JobIDRaw",
@@ -17,6 +20,7 @@ _SACCT_FIELDS = (
     "Account%30",
     "State",
     "ExitCode",
+    "Reason%40",
     "Elapsed",
     "ElapsedRaw",
     "Start",
@@ -32,6 +36,11 @@ _SACCT_FIELDS = (
     "AllocTRES%120",
     "TotalCPU",
     "CPUTimeRAW",
+    "MaxRSS",
+    "MaxVMSize",
+    "AveRSS",
+    "StdOut%160",
+    "StdErr%160",
     "WorkDir%160",
 )
 _SACCT_FORMAT = ",".join(_SACCT_FIELDS)
@@ -57,6 +66,7 @@ class SlurmAccountingRecord:
     end: str
     partition: str
     exit_code: str
+    reason: str | None = None
     timelimit: str | None = None
     user: str | None = None
     account: str | None = None
@@ -70,7 +80,38 @@ class SlurmAccountingRecord:
     alloc_tres: str | None = None
     total_cpu: str | None = None
     cpu_time_raw: int | None = None
+    max_rss: str | None = None
+    max_vm_size: str | None = None
+    ave_rss: str | None = None
+    stdout_path: str | None = None
+    stderr_path: str | None = None
     work_dir: str | None = None
+    steps: tuple["SlurmStepAccountingRecord", ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class SlurmStepAccountingRecord:
+    job_id_raw: str
+    name: str
+    state: str
+    exit_code: str
+    reason: str | None = None
+    elapsed: str | None = None
+    elapsed_raw: int | None = None
+    node_list: str | None = None
+    node_count: int | None = None
+    allocated_cpus: int | None = None
+    task_count: int | None = None
+    req_mem: str | None = None
+    req_tres: str | None = None
+    alloc_tres: str | None = None
+    total_cpu: str | None = None
+    cpu_time_raw: int | None = None
+    max_rss: str | None = None
+    max_vm_size: str | None = None
+    ave_rss: str | None = None
+    stdout_path: str | None = None
+    stderr_path: str | None = None
 
 
 def get_queue(
@@ -104,12 +145,18 @@ def get_job_accounting(
     job_id: str,
     *,
     runner: Runner = subprocess.run,
-    timeout: float = 20,
+    timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    ssh_connect_timeout: int = DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
 ) -> SlurmAccountingRecord | None:
     """Return completed-job accounting visible for one SLURM job ID."""
 
+    if ssh_connect_timeout <= 0:
+        raise ValueError("SSH connection timeout must be positive")
+
     command = [
         "ssh",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout}",
         ssh_host,
         build_sacct_command(job_id),
     ]
@@ -150,7 +197,6 @@ def build_sacct_command(job_id: str) -> str:
     return " ".join(
         [
             "sacct",
-            "-X",
             "-P",
             "-n",
             "-j",
@@ -192,29 +238,36 @@ def parse_sacct_output(job_id: str, output: str) -> SlurmAccountingRecord | None
     """Parse pipe-delimited sacct output for one requested job."""
 
     normalized_job_id = normalize_job_id(job_id)
-    wanted = {
-        normalized_job_id,
-        f"{normalized_job_id}.batch",
-        f"{normalized_job_id}.extern",
-    }
+    parent: SlurmAccountingRecord | None = None
     fallback: SlurmAccountingRecord | None = None
+    steps: list[SlurmStepAccountingRecord] = []
 
     for line in output.splitlines():
         if not line.strip():
             continue
 
         parts = line.split("|")
-        if len(parts) < 8 or parts[0].strip() not in wanted:
+        raw_job_id = parts[0].strip()
+        if len(parts) < 8 or not (
+            raw_job_id == normalized_job_id
+            or raw_job_id.startswith(f"{normalized_job_id}.")
+        ):
             continue
 
         record = _parse_sacct_record(parts)
 
-        if parts[0].strip() == normalized_job_id:
-            return record
+        if raw_job_id == normalized_job_id:
+            parent = record
+            continue
 
         fallback = fallback or record
+        if len(parts) >= len(_SACCT_FIELDS):
+            steps.append(_parse_sacct_step(parts))
 
-    return fallback
+    selected = parent or fallback
+    if selected is not None:
+        selected.steps = tuple(steps)
+    return selected
 
 
 def _parse_sacct_record(parts: list[str]) -> SlurmAccountingRecord:
@@ -226,22 +279,28 @@ def _parse_sacct_record(parts: list[str]) -> SlurmAccountingRecord:
             account=_optional_part(parts, 3),
             state=_optional_part(parts, 4) or "",
             exit_code=_optional_part(parts, 5) or "",
-            elapsed=_optional_part(parts, 6) or "",
-            elapsed_raw=_optional_int(parts, 7),
-            start=_optional_part(parts, 8) or "",
-            end=_optional_part(parts, 9) or "",
-            partition=_optional_part(parts, 10) or "",
-            timelimit=_optional_part(parts, 11),
-            node_list=_optional_part(parts, 12),
-            node_count=_optional_int(parts, 13),
-            allocated_cpus=_optional_int(parts, 14),
-            task_count=_optional_int(parts, 15),
-            req_mem=_optional_part(parts, 16),
-            req_tres=_optional_part(parts, 17),
-            alloc_tres=_optional_part(parts, 18),
-            total_cpu=_optional_part(parts, 19),
-            cpu_time_raw=_optional_int(parts, 20),
-            work_dir=_optional_part(parts, 21),
+            reason=_optional_part(parts, 6),
+            elapsed=_optional_part(parts, 7) or "",
+            elapsed_raw=_optional_int(parts, 8),
+            start=_optional_part(parts, 9) or "",
+            end=_optional_part(parts, 10) or "",
+            partition=_optional_part(parts, 11) or "",
+            timelimit=_optional_part(parts, 12),
+            node_list=_optional_part(parts, 13),
+            node_count=_optional_int(parts, 14),
+            allocated_cpus=_optional_int(parts, 15),
+            task_count=_optional_int(parts, 16),
+            req_mem=_optional_part(parts, 17),
+            req_tres=_optional_part(parts, 18),
+            alloc_tres=_optional_part(parts, 19),
+            total_cpu=_optional_part(parts, 20),
+            cpu_time_raw=_optional_int(parts, 21),
+            max_rss=_optional_part(parts, 22),
+            max_vm_size=_optional_part(parts, 23),
+            ave_rss=_optional_part(parts, 24),
+            stdout_path=_optional_part(parts, 25),
+            stderr_path=_optional_part(parts, 26),
+            work_dir=_optional_part(parts, 27),
         )
 
     return SlurmAccountingRecord(
@@ -254,6 +313,32 @@ def _parse_sacct_record(parts: list[str]) -> SlurmAccountingRecord:
         partition=parts[6].strip(),
         exit_code=parts[7].strip(),
         timelimit=parts[8].strip() if len(parts) > 8 and parts[8].strip() else None,
+    )
+
+
+def _parse_sacct_step(parts: list[str]) -> SlurmStepAccountingRecord:
+    return SlurmStepAccountingRecord(
+        job_id_raw=parts[0].strip(),
+        name=_optional_part(parts, 1) or "",
+        state=_optional_part(parts, 4) or "",
+        exit_code=_optional_part(parts, 5) or "",
+        reason=_optional_part(parts, 6),
+        elapsed=_optional_part(parts, 7),
+        elapsed_raw=_optional_int(parts, 8),
+        node_list=_optional_part(parts, 13),
+        node_count=_optional_int(parts, 14),
+        allocated_cpus=_optional_int(parts, 15),
+        task_count=_optional_int(parts, 16),
+        req_mem=_optional_part(parts, 17),
+        req_tres=_optional_part(parts, 18),
+        alloc_tres=_optional_part(parts, 19),
+        total_cpu=_optional_part(parts, 20),
+        cpu_time_raw=_optional_int(parts, 21),
+        max_rss=_optional_part(parts, 22),
+        max_vm_size=_optional_part(parts, 23),
+        ave_rss=_optional_part(parts, 24),
+        stdout_path=_optional_part(parts, 25),
+        stderr_path=_optional_part(parts, 26),
     )
 
 
@@ -281,5 +366,7 @@ def normalize_job_id(job_id: str) -> str:
 
     if not _JOB_ID_RE.fullmatch(candidate):
         raise ValueError("SLURM job ID contains unsafe characters")
+    if int(re.split(r"[_.]", candidate, maxsplit=1)[0]) <= 0:
+        raise ValueError("SLURM job ID must be a positive decimal integer")
 
-    return re.sub(r"\.(?:batch|extern)$", "", candidate)
+    return re.sub(r"\.(?:batch|extern|\d+)$", "", candidate)

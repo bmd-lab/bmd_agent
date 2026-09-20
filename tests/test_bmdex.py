@@ -711,7 +711,7 @@ def test_no_cli_command_was_added(capsys) -> None:
 
     captured = capsys.readouterr()
     assert exit_code == 2
-    assert "Unknown command: bmdex" in captured.out
+    assert "Target was not recognized as a SLURM job ID" in captured.out
 
 
 def test_agent_adapter_does_not_import_bmdex_or_parse_datasets() -> None:

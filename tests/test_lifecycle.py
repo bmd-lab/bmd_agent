@@ -10,6 +10,7 @@ from bmd_agent.resources.lifecycle import (
     LifecycleState,
     analyze_calculation_directory,
 )
+from bmd_agent.resources.oom import INSUFFICIENT_OOM_EVIDENCE, OOM_ESTABLISHED
 from bmd_agent.resources.slurm import SlurmAccountingRecord
 
 
@@ -541,6 +542,8 @@ def test_relocated_failed_hybrid_snapshot_builds_factual_domain_context_query(
     assert trajectory.completed_ionic_steps == 0
     assert trajectory.incomplete_electronic_iteration_count == 4
     assert analysis.diagnostics.logs[0].messages == ("SIGTERM received by VASP",)
+    assert analysis.diagnostics.oom is not None
+    assert analysis.diagnostics.oom.assessment == INSUFFICIENT_OOM_EVIDENCE
     assert query is not None
     assert query["functional"] == "hse06"
     assert query["electronic_algorithm"] == "Damped"
@@ -552,6 +555,37 @@ def test_relocated_failed_hybrid_snapshot_builds_factual_domain_context_query(
         "LSORBIT": True,
     }
     assert "4_initial_DAV_iterations_observed" in query["observed_patterns"]
+
+
+def test_relocated_snapshot_uses_local_cgroup_marker_without_scheduler_state(
+    tmp_path: Path,
+) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/hse06_soc_failed",
+    )
+    write_inputs(tmp_path)
+    (tmp_path / "OUTCAR").write_text("partial", encoding="utf-8")
+    (tmp_path / "std_err.txt").write_text(
+        "slurmstepd: error: Detected 1 oom-kill event(s) in step\n",
+        encoding="utf-8",
+    )
+
+    analysis = analyze_calculation_directory(
+        tmp_path,
+        scheduler_lookup=lambda job_id: scheduler_record(
+            job_id=job_id,
+            state="OUT_OF_MEMORY",
+            exit_code="0:125",
+        ),
+    )
+
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert analysis.scheduler is None
+    assert analysis.diagnostics is not None
+    assert analysis.diagnostics.oom is not None
+    assert analysis.diagnostics.oom.assessment == OOM_ESTABLISHED
+    assert analysis.diagnostics.oom.scheduler_oom_state is False
 
 
 def test_incomplete_bmd_snapshot_uses_same_diagnostic_evidence(tmp_path: Path) -> None:
@@ -948,6 +982,28 @@ def test_bare_cli_routes_to_cwd_lifecycle_analysis(
     assert exit_code == 0
     assert "Calculation state: PRE_RUN" in captured.out
     assert "BMD Agent" in captured.out
+
+
+def test_explicit_path_and_cwd_produce_equivalent_lifecycle_output(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    write_inputs(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_resources",
+        lambda: (_ for _ in ()).throw(ConfigurationError("missing config")),
+    )
+
+    assert cli.main([str(tmp_path)]) == 0
+    explicit_output = capsys.readouterr().out
+
+    monkeypatch.chdir(tmp_path)
+    assert cli.main([]) == 0
+    cwd_output = capsys.readouterr().out
+
+    assert explicit_output == cwd_output
 
 
 def test_existing_explicit_cli_commands_remain_available(capsys) -> None:
