@@ -10,6 +10,7 @@ from bmd_agent.resources.slurm import SlurmAccountingRecord, SlurmStepAccounting
 OOM_ESTABLISHED = "OOM ESTABLISHED"
 OOM_POSSIBLE = "OOM POSSIBLE / MEMORY PRESSURE"
 NO_OOM_EVIDENCE = "NO OOM EVIDENCE FOUND"
+INSUFFICIENT_OOM_EVIDENCE = "INSUFFICIENT EVIDENCE"
 OOM_DIAGNOSTIC_EVIDENCE = "oom_diagnostic_evidence"
 
 _MEMORY_PRESSURE_RATIO = 0.90
@@ -139,6 +140,14 @@ def assess_oom_evidence(
         limitations.append("maximum RSS accounting was unavailable")
 
     scheduler_oom_state = any(marker.kind == "scheduler_oom_state" for marker in explicit)
+    has_negative_evidence_basis = (
+        scheduler is not None
+        and (
+            (maximum_rss is not None and maximum_rss.bytes_value is not None)
+            or bool(inspected_logs)
+            or log_count > 0
+        )
+    )
     if explicit:
         assessment = OOM_ESTABLISHED
         sufficiency = "positive_explicit_evidence"
@@ -165,6 +174,12 @@ def assess_oom_evidence(
         sufficiency = "suggestive_evidence"
         guidance = (
             "Memory pressure is possible, but the available evidence does not establish OOM termination.",
+        )
+    elif not has_negative_evidence_basis:
+        assessment = INSUFFICIENT_OOM_EVIDENCE
+        sufficiency = "insufficient_evidence"
+        guidance = (
+            "Available scheduler and execution evidence was insufficient to assess OOM.",
         )
     else:
         assessment = NO_OOM_EVIDENCE

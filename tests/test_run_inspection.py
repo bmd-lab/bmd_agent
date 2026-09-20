@@ -64,8 +64,14 @@ from bmd_agent.resources.run import (
     serialize_job_trajectory_evidence,
     vasp_reported_parameter_observations,
 )
-from bmd_agent.resources.oom import NO_OOM_EVIDENCE, OOM_ESTABLISHED
-from bmd_agent.resources.slurm import SlurmAccountingRecord
+from bmd_agent.resources.oom import (
+    INSUFFICIENT_OOM_EVIDENCE,
+    OOM_ESTABLISHED,
+)
+from bmd_agent.resources.slurm import (
+    DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    SlurmAccountingRecord,
+)
 from bmd_agent.resources.vasp import RemotePathError
 
 
@@ -672,6 +678,8 @@ def legacy_static_files() -> dict[str, bytes]:
 def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
     assert command == [
         "ssh",
+        "-o",
+        "ConnectTimeout=10",
         "powerslurm-bmdguest",
         (
             "sacct -P -n -j 20893681 "
@@ -681,6 +689,7 @@ def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedPr
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
     assert kwargs["check"] is True
+    assert kwargs["timeout"] == DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS
     return subprocess.CompletedProcess(
         command,
         0,
@@ -787,12 +796,15 @@ def job_slurm_runner(
     def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         assert command == [
             "ssh",
+            "-o",
+            "ConnectTimeout=10",
             "powerslurm-bmdguest",
             f"sacct -P -n -j {job_id} {SACCT_FORMAT}",
         ]
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
         assert kwargs["check"] is True
+        assert kwargs["timeout"] == DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS
         return subprocess.CompletedProcess(
             command,
             0,
@@ -830,6 +842,39 @@ def test_inspect_slurm_job_rejects_invalid_job_id_without_scheduler_or_remote_re
 
     assert slurm_calls == 0
     assert remote.commands == []
+
+
+def test_inspect_slurm_job_scheduler_timeout_is_finite_and_oom_is_insufficient() -> None:
+    remote_calls: list[list[str]] = []
+
+    def fail_remote(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        remote_calls.append(command)
+        raise AssertionError("calculation artifacts must not be read without scheduler accounting")
+
+    def slow_scheduler(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        assert command[:4] == ["ssh", "-o", "ConnectTimeout=10", "powerslurm-bmdguest"]
+        assert "sacct -P -n -j 21906221" in command[4]
+        assert kwargs["timeout"] == 45
+        raise subprocess.TimeoutExpired(command, 45)
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "21906221",
+        remote_runner=fail_remote,
+        slurm_runner=slow_scheduler,
+        scheduler_timeout=45,
+    )
+
+    assert inspection.scheduler is None
+    assert inspection.scheduler_error is not None
+    assert "timed out after 45 seconds" in inspection.scheduler_error
+    assert inspection.oom is not None
+    assert inspection.oom.assessment == INSUFFICIENT_OOM_EVIDENCE
+    assert "scheduler accounting was unavailable" in inspection.oom.limitations
+    assert remote_calls == []
 
 
 def test_inspect_slurm_job_reports_missing_workdir_without_remote_reads() -> None:
@@ -1978,7 +2023,7 @@ def test_serialize_job_trajectory_evidence_completed_direct_vasp_job() -> None:
     assert payload["job"]["timelimit"] == "06:00:00"
     assert payload["job"]["allocated_cpus"] == 24
     assert payload["job"]["work_dir"] == DIRECT_DIR
-    assert payload["oom_diagnostic_evidence"]["assessment"] == NO_OOM_EVIDENCE
+    assert payload["oom_diagnostic_evidence"]["assessment"] == INSUFFICIENT_OOM_EVIDENCE
     assert payload["calculation"]["calculation_type"] == "direct VASP"
     assert payload["calculation"]["producer_provenance"]["status"] == "unavailable"
 

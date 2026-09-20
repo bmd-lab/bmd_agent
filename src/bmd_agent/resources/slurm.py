@@ -7,8 +7,11 @@ from typing import Callable
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
+DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS = 60
+
 _PARTITION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-_JOB_ID_RE = re.compile(r"^\d+(?:_\d+)?(?:\.(?:batch|extern))?$")
+_JOB_ID_RE = re.compile(r"^\d+(?:_\d+)?(?:\.(?:batch|extern|\d+))?$")
 _SQUEUE_FORMAT = "%i|%u|%j|%t|%M|%R"
 _SACCT_FIELDS = (
     "JobIDRaw",
@@ -142,12 +145,18 @@ def get_job_accounting(
     job_id: str,
     *,
     runner: Runner = subprocess.run,
-    timeout: float = 20,
+    timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    ssh_connect_timeout: int = DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
 ) -> SlurmAccountingRecord | None:
     """Return completed-job accounting visible for one SLURM job ID."""
 
+    if ssh_connect_timeout <= 0:
+        raise ValueError("SSH connection timeout must be positive")
+
     command = [
         "ssh",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout}",
         ssh_host,
         build_sacct_command(job_id),
     ]
@@ -357,5 +366,7 @@ def normalize_job_id(job_id: str) -> str:
 
     if not _JOB_ID_RE.fullmatch(candidate):
         raise ValueError("SLURM job ID contains unsafe characters")
+    if int(re.split(r"[_.]", candidate, maxsplit=1)[0]) <= 0:
+        raise ValueError("SLURM job ID must be a positive decimal integer")
 
-    return re.sub(r"\.(?:batch|extern)$", "", candidate)
+    return re.sub(r"\.(?:batch|extern|\d+)$", "", candidate)

@@ -3,6 +3,8 @@ import subprocess
 import pytest
 
 from bmd_agent.resources.slurm import (
+    DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
     build_sacct_command,
     build_squeue_command,
     get_job_accounting,
@@ -70,11 +72,18 @@ def test_get_queue_uses_mocked_ssh_transport() -> None:
 
 
 def test_job_id_validation_strips_safe_slurm_suffixes() -> None:
+    assert normalize_job_id("21853598") == "21853598"
     assert normalize_job_id("20893681") == "20893681"
     assert normalize_job_id("20893681.batch") == "20893681"
+    assert normalize_job_id("20893681.extern") == "20893681"
+    assert normalize_job_id("20893681.0") == "20893681"
 
     with pytest.raises(ValueError, match="unsafe"):
         normalize_job_id("20893681;scancel 1")
+    with pytest.raises(ValueError, match="unsafe"):
+        normalize_job_id("20893681.0;id")
+    with pytest.raises(ValueError, match="positive"):
+        normalize_job_id("0")
 
 
 def test_build_sacct_command_is_fixed_and_read_only() -> None:
@@ -178,19 +187,28 @@ def test_parse_sacct_output_preserves_parent_and_job_step_memory_evidence() -> N
         "20893681.extern|extern|guest|acct|COMPLETED|0:0||01:00:00|3600|start|"
         "end|pool|02:00:00|node-a|1|24|24||||00:01:00|1440|20M|30M|10M|||"
     )
+    vasp_step = (
+        "20893681.0|vasp_std|guest|acct|FAILED|1:0||01:00:00|3600|start|end|pool|"
+        "02:00:00|node-a|1|24|24||||20:00:00|86400|28.80G|32G|27G|||"
+    )
 
-    record = parse_sacct_output("20893681", "\n".join((batch, parent, extern)))
+    record = parse_sacct_output(
+        "20893681",
+        "\n".join((batch, parent, extern, vasp_step)),
+    )
 
     assert record is not None
     assert record.state == "FAILED"
     assert [step.job_id_raw for step in record.steps] == [
         "20893681.batch",
         "20893681.extern",
+        "20893681.0",
     ]
     assert record.steps[0].state == "OUT_OF_MEMORY"
     assert record.steps[0].reason == "OutOfMemory"
     assert record.steps[0].max_rss == "94G"
     assert record.steps[1].max_rss == "20M"
+    assert record.steps[2].max_rss == "28.80G"
 
 
 def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
@@ -201,7 +219,7 @@ def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
         assert kwargs["check"] is True
-        assert kwargs["timeout"] == 20
+        assert kwargs["timeout"] == DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS
         return subprocess.CompletedProcess(
             command,
             0,
@@ -219,6 +237,8 @@ def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
     assert calls == [
         [
             "ssh",
+            "-o",
+            f"ConnectTimeout={DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS}",
             "powerslurm-bmdguest",
             (
                 "sacct -P -n -j 20893681 "
@@ -226,3 +246,24 @@ def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
             ),
         ]
     ]
+
+
+def test_get_job_accounting_uses_explicit_finite_scheduler_timeout() -> None:
+    observed: dict[str, object] = {}
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["command"] = command
+        observed["timeout"] = kwargs["timeout"]
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    get_job_accounting(
+        "powerslurm-bmdguest",
+        "21853598.0",
+        runner=runner,
+        timeout=45,
+        ssh_connect_timeout=7,
+    )
+
+    assert observed["timeout"] == 45
+    assert observed["command"][:4] == ["ssh", "-o", "ConnectTimeout=7", "powerslurm-bmdguest"]
+    assert "-j 21853598" in observed["command"][4]

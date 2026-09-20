@@ -10,7 +10,7 @@ from bmd_agent.resources.lifecycle import (
     LifecycleState,
     analyze_calculation_directory,
 )
-from bmd_agent.resources.oom import NO_OOM_EVIDENCE, OOM_ESTABLISHED
+from bmd_agent.resources.oom import INSUFFICIENT_OOM_EVIDENCE, OOM_ESTABLISHED
 from bmd_agent.resources.slurm import SlurmAccountingRecord
 
 
@@ -543,7 +543,7 @@ def test_relocated_failed_hybrid_snapshot_builds_factual_domain_context_query(
     assert trajectory.incomplete_electronic_iteration_count == 4
     assert analysis.diagnostics.logs[0].messages == ("SIGTERM received by VASP",)
     assert analysis.diagnostics.oom is not None
-    assert analysis.diagnostics.oom.assessment == NO_OOM_EVIDENCE
+    assert analysis.diagnostics.oom.assessment == INSUFFICIENT_OOM_EVIDENCE
     assert query is not None
     assert query["functional"] == "hse06"
     assert query["electronic_algorithm"] == "Damped"

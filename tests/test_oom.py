@@ -4,6 +4,7 @@ import pytest
 
 from bmd_agent import cli
 from bmd_agent.resources.oom import (
+    INSUFFICIENT_OOM_EVIDENCE,
     NO_OOM_EVIDENCE,
     OOM_ESTABLISHED,
     OOM_POSSIBLE,
@@ -120,7 +121,7 @@ def test_signal_alone_does_not_establish_oom(message: str) -> None:
 def test_failed_exit_alone_does_not_establish_oom() -> None:
     evidence = assess_oom_evidence(accounting(state="FAILED", exit_code="1:0"))
 
-    assert evidence.assessment == NO_OOM_EVIDENCE
+    assert evidence.assessment == INSUFFICIENT_OOM_EVIDENCE
     assert evidence.scheduler_oom_state is False
 
 
@@ -158,7 +159,7 @@ def test_low_max_rss_has_no_positive_oom_evidence() -> None:
 def test_missing_max_rss_is_explicitly_limited() -> None:
     evidence = assess_oom_evidence(accounting(max_rss=None))
 
-    assert evidence.assessment == NO_OOM_EVIDENCE
+    assert evidence.assessment == INSUFFICIENT_OOM_EVIDENCE
     assert evidence.maximum_rss is None
     assert "maximum RSS accounting was unavailable" in evidence.limitations
 
@@ -204,6 +205,40 @@ def test_job_step_max_rss_is_preserved_without_incompatible_percentage() -> None
     assert ".batch" in evidence.maximum_rss.source
     assert evidence.memory_utilization_percent is None
     assert any("not compared" in item for item in evidence.limitations)
+
+
+def test_low_numeric_job_step_max_rss_supports_no_positive_oom_evidence() -> None:
+    scheduler = accounting(
+        steps=(
+            step(
+                job_id_raw="21853598.0",
+                name="vasp_std",
+                max_rss="28.80G",
+                task_count=24,
+                allocated_cpus=24,
+            ),
+        )
+    )
+
+    evidence = assess_oom_evidence(scheduler)
+
+    assert evidence.assessment == NO_OOM_EVIDENCE
+    assert evidence.maximum_rss is not None
+    assert evidence.maximum_rss.raw_value == "28.80G"
+    assert evidence.maximum_rss.source == "SLURM step 21853598.0 maximum RSS"
+    assert evidence.memory_utilization_percent is None
+
+
+def test_accounting_acquisition_failure_is_insufficient_evidence() -> None:
+    evidence = assess_oom_evidence(
+        None,
+        source_limitations=("scheduler accounting timed out after 60 seconds",),
+    )
+
+    assert evidence.assessment == INSUFFICIENT_OOM_EVIDENCE
+    assert evidence.sufficiency == "insufficient_evidence"
+    assert "scheduler accounting was unavailable" in evidence.limitations
+    assert "scheduler accounting timed out after 60 seconds" in evidence.limitations
 
 
 def test_oom_evidence_is_json_safe_and_does_not_prescribe_memory_value() -> None:

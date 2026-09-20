@@ -20,6 +20,7 @@ from bmd_agent.resources.oom import (
     serialize_oom_evidence,
 )
 from bmd_agent.resources.slurm import (
+    DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
     SlurmAccountingRecord,
     get_job_accounting,
     normalize_job_id,
@@ -544,6 +545,7 @@ def inspect_remote_run(
     derive_scientific: bool = True,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
     timeout: float = 20,
+    scheduler_timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
 ) -> RunInspection:
     """Inspect a BMD Compute run through configured read-only resources."""
 
@@ -626,7 +628,7 @@ def inspect_remote_run(
         cluster.ssh_host,
         job_id,
         runner=slurm_runner,
-        timeout=timeout,
+        timeout=scheduler_timeout,
     )
     runtime = _parse_runtime_logs(
         cluster.ssh_host,
@@ -637,6 +639,7 @@ def inspect_remote_run(
     oom = _assess_remote_oom_evidence(
         cluster,
         scheduler,
+        scheduler_error=scheduler_error,
         remote_runner=remote_runner,
         timeout=timeout,
         existing_log_sources=runtime.sources,
@@ -699,6 +702,7 @@ def compare_remote_runs(
     scientific_parser: ScientificParser | None = None,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
     timeout: float = 20,
+    scheduler_timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
 ) -> RunComparison:
     """Inspect and compare multiple remote runs through the read-only boundary."""
 
@@ -715,6 +719,7 @@ def compare_remote_runs(
             scientific_parser=scientific_parser,
             modifier_policies=policy_tuple,
             timeout=timeout,
+            scheduler_timeout=scheduler_timeout,
         )
         for flow_root in flow_roots
     )
@@ -729,6 +734,7 @@ def diagnose_remote_run(
     slurm_runner: SlurmRunner = subprocess.run,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
     timeout: float = 20,
+    scheduler_timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
     max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
 ) -> RunDiagnosis:
     """Describe termination and convergence trajectory evidence for one run."""
@@ -741,6 +747,7 @@ def diagnose_remote_run(
         derive_scientific=False,
         modifier_policies=modifier_policies,
         timeout=timeout,
+        scheduler_timeout=scheduler_timeout,
     )
     trajectories = _observe_stage_trajectories(
         cluster.ssh_host,
@@ -767,6 +774,7 @@ def inspect_slurm_job(
     scientific_parser: ScientificParser | None = None,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
     timeout: float = 20,
+    scheduler_timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
     max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
 ) -> JobInspection:
     """Inspect one scheduler job and supported calculation evidence read-only."""
@@ -776,7 +784,7 @@ def inspect_slurm_job(
         cluster.ssh_host,
         normalized_job_id,
         runner=slurm_runner,
-        timeout=timeout,
+        timeout=scheduler_timeout,
     )
     if scheduler is None:
         return JobInspection(
@@ -787,7 +795,10 @@ def inspect_slurm_job(
             calculation_directory=None,
             calculation_type="unknown",
             calculation_reason="scheduler accounting was unavailable",
-            oom=assess_oom_evidence(None),
+            oom=assess_oom_evidence(
+                None,
+                source_limitations=(scheduler_error or "scheduler accounting was unavailable",),
+            ),
         )
 
     scheduler_only_oom = assess_oom_evidence(scheduler)
@@ -858,6 +869,7 @@ def inspect_slurm_job(
                 slurm_runner=slurm_runner,
                 modifier_policies=modifier_policies,
                 timeout=timeout,
+                scheduler_timeout=scheduler_timeout,
                 max_vasprun_bytes=max_vasprun_bytes,
             )
         except (RunInspectionError, RemotePathError, subprocess.SubprocessError) as exc:
@@ -4010,6 +4022,7 @@ def _assess_remote_oom_evidence(
     cluster: SlurmClusterResource,
     scheduler: SlurmAccountingRecord | None,
     *,
+    scheduler_error: str | None = None,
     remote_runner: RemoteRunner,
     timeout: float,
     existing_log_sources: Iterable[str] = (),
@@ -4017,7 +4030,7 @@ def _assess_remote_oom_evidence(
 ) -> OomDiagnosticEvidence:
     observations = list(existing_log_observations)
     inspected_sources = list(existing_log_sources)
-    limitations: list[str] = []
+    limitations: list[str] = [scheduler_error] if scheduler_error else []
     seen = set(inspected_sources)
 
     if scheduler is not None:
