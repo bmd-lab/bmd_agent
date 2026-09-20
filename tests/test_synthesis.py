@@ -526,4 +526,4 @@ def test_no_cli_synthesis_surface_is_exposed(capsys) -> None:
 
     captured = capsys.readouterr()
     assert exit_code == 2
-    assert "Unknown command: evidence-summary" in captured.out
+    assert "Target was not recognized as a SLURM job ID" in captured.out

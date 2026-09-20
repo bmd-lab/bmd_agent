@@ -196,7 +196,7 @@ def show_current_directory(
     directory: Path | None = None,
     registry: ResourceRegistry | None = None,
 ) -> int:
-    """Analyze the calculation associated with the current working directory."""
+    """Analyze the calculation associated with one local directory."""
 
     directory = directory or Path.cwd()
     scheduler_lookup = None
@@ -1817,14 +1817,32 @@ def main(argv: list[str] | None = None) -> int:
 
             return show_diagnose_run(argv[1])
 
+        if len(argv) == 1:
+            if _is_positive_decimal_job_id(command):
+                return show_job(command)
+
+            target = _existing_target_path(command)
+            if target is not None:
+                return show_current_directory(target)
+
+            print(
+                "Target was not recognized as a SLURM job ID or existing "
+                "calculation path."
+            )
+            return 2
+
     except ConfigurationError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    print(f"Unknown command: {command}")
+    print("Target was not recognized as a SLURM job ID or existing calculation path.")
     print()
-    print("Available commands:")
-    print("  (no arguments) analyze the current calculation directory")
+    print("Usage: bmd-agent [TARGET]")
+    print("  no target: analyze the current calculation directory")
+    print("  positive decimal integer: analyze that SLURM job")
+    print("  existing filesystem path: analyze that calculation directory")
+    print()
+    print("Expert commands:")
     print("  status")
     print("  queue")
     print("  job <SLURM_JOB_ID> [--trajectory-json]")
@@ -1835,6 +1853,18 @@ def main(argv: list[str] | None = None) -> int:
     print("  compare-runs <flow-a> <flow-b> [<flow-c> ...]")
     print("  diagnose-run <remote-flow-root>")
     return 2
+
+
+def _is_positive_decimal_job_id(target: str) -> bool:
+    return target.isascii() and target.isdecimal() and int(target) > 0
+
+
+def _existing_target_path(target: str) -> Path | None:
+    try:
+        path = Path(target).expanduser()
+        return path if path.exists() else None
+    except (OSError, RuntimeError):
+        return None
 
 
 def modifier_policies_from_compute(

@@ -984,6 +984,28 @@ def test_bare_cli_routes_to_cwd_lifecycle_analysis(
     assert "BMD Agent" in captured.out
 
 
+def test_explicit_path_and_cwd_produce_equivalent_lifecycle_output(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    write_inputs(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_resources",
+        lambda: (_ for _ in ()).throw(ConfigurationError("missing config")),
+    )
+
+    assert cli.main([str(tmp_path)]) == 0
+    explicit_output = capsys.readouterr().out
+
+    monkeypatch.chdir(tmp_path)
+    assert cli.main([]) == 0
+    cwd_output = capsys.readouterr().out
+
+    assert explicit_output == cwd_output
+
+
 def test_existing_explicit_cli_commands_remain_available(capsys) -> None:
     exit_code = cli.main(["job"])
 

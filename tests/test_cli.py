@@ -1,5 +1,7 @@
-import pytest
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from bmd_agent import cli
 from bmd_agent.config import ConfigurationError, ResourceRegistry, SlurmClusterResource
@@ -10,12 +12,93 @@ from bmd_agent.resources.run import (
 )
 
 
-def test_cli_unknown_command(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_nonexistent_nonnumeric_target_is_clean_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     exit_code = cli.main(["frobnicate"])
 
     captured = capsys.readouterr()
     assert exit_code == 2
-    assert "Unknown command: frobnicate" in captured.out
+    assert (
+        "Target was not recognized as a SLURM job ID or existing calculation path."
+        in captured.out
+    )
+    assert "Traceback" not in captured.out
+
+
+def test_bare_numeric_target_and_explicit_job_use_same_job_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def fake_show_job(
+        job_id: str,
+        registry: ResourceRegistry | None = None,
+        *,
+        trajectory_json: bool = False,
+    ) -> int:
+        calls.append((job_id, trajectory_json))
+        return 0
+
+    monkeypatch.setattr(cli, "show_job", fake_show_job)
+
+    assert cli.main(["21853598"]) == 0
+    assert cli.main(["job", "21853598"]) == 0
+    assert calls == [("21853598", False), ("21853598", False)]
+
+
+def test_bare_numeric_target_wins_over_same_named_local_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "21853598").mkdir()
+    monkeypatch.chdir(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "show_job", lambda job_id, **kwargs: calls.append(job_id) or 0)
+    monkeypatch.setattr(
+        cli,
+        "show_current_directory",
+        lambda *args, **kwargs: pytest.fail("bare numeric target must not dispatch as a path"),
+    )
+
+    assert cli.main(["21853598"]) == 0
+    assert calls == ["21853598"]
+
+
+@pytest.mark.parametrize("target_kind", ("relative", "absolute", "numeric_relative"))
+def test_existing_path_target_uses_lifecycle_analysis(
+    target_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "21853598" if target_kind == "numeric_relative" else "calculation"
+    calculation = tmp_path / name
+    calculation.mkdir()
+    monkeypatch.chdir(tmp_path)
+    targets = {
+        "relative": "./calculation",
+        "absolute": str(calculation.resolve()),
+        "numeric_relative": "./21853598",
+    }
+    analyzed: list[Path] = []
+
+    def fake_show_current_directory(
+        directory: Path | None = None,
+        registry: ResourceRegistry | None = None,
+    ) -> int:
+        assert directory is not None
+        analyzed.append(directory.resolve())
+        return 0
+
+    monkeypatch.setattr(cli, "show_current_directory", fake_show_current_directory)
+    monkeypatch.setattr(
+        cli,
+        "show_job",
+        lambda *args, **kwargs: pytest.fail("explicit path syntax must not dispatch as a job"),
+    )
+
+    assert cli.main([targets[target_kind]]) == 0
+    assert analyzed == [calculation.resolve()]
 
 
 def test_cli_structure_requires_directory(capsys: pytest.CaptureFixture[str]) -> None:
