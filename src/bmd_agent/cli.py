@@ -33,6 +33,7 @@ from bmd_agent.resources.lifecycle import (
     LifecycleState,
     analyze_calculation_directory,
 )
+from bmd_agent.resources.oom import MemoryObservation, OomDiagnosticEvidence
 from bmd_agent.resources.run import (
     PRODUCER_REQUESTED,
     JobInspection,
@@ -306,6 +307,8 @@ def print_lifecycle_analysis(
         _print_trajectory_observations(analysis.diagnostics.trajectories)
         print()
         _print_lifecycle_diagnostic_evidence(analysis.diagnostics)
+        print()
+        _print_oom_evidence(analysis.diagnostics.oom)
         print()
         _print_convergence_progress_assessment_values(analysis.diagnostics.assessments)
         print()
@@ -863,6 +866,9 @@ def print_job_inspection(inspection: JobInspection) -> None:
         print_run_diagnosis(inspection.bmd_compute)
         return
 
+    _print_oom_evidence(inspection.oom)
+    print()
+
     if inspection.direct_vasp is None:
         print("Producer provenance (producer_provenance):")
         print("  unavailable")
@@ -899,6 +905,7 @@ def _print_job_record(record: object) -> None:
         ("account", "account"),
         ("state", "state"),
         ("exit", "exit_code"),
+        ("reason", "reason"),
         ("node", "node_list"),
         ("elapsed", "elapsed"),
         ("elapsed raw seconds", "elapsed_raw"),
@@ -916,8 +923,21 @@ def _print_job_record(record: object) -> None:
         ("AllocTRES", "alloc_tres"),
         ("total CPU", "total_cpu"),
         ("CPUTimeRAW", "cpu_time_raw"),
+        ("MaxRSS", "max_rss"),
+        ("MaxVMSize", "max_vm_size"),
+        ("AveRSS", "ave_rss"),
     ):
         print(f"    {label}: {_diagnosis_value(getattr(record, attribute, None))}")
+    steps = getattr(record, "steps", ())
+    if steps:
+        print("  job steps:")
+        for step in steps:
+            print(
+                f"    {getattr(step, 'job_id_raw', 'step')}: "
+                f"state={_diagnosis_value(getattr(step, 'state', None))}, "
+                f"exit={_diagnosis_value(getattr(step, 'exit_code', None))}, "
+                f"MaxRSS={_diagnosis_value(getattr(step, 'max_rss', None))}"
+            )
 
 
 def print_run_inspection(inspection: RunInspection) -> None:
@@ -969,6 +989,9 @@ def print_run_inspection(inspection: RunInspection) -> None:
         print(f"  start:     {record.start}")
         print(f"  end:       {record.end}")
         print(f"  partition: {record.partition}")
+    print()
+
+    _print_oom_evidence(inspection.oom)
     print()
 
     print("Logs (log_observation):")
@@ -1065,6 +1088,9 @@ def print_run_diagnosis(diagnosis: RunDiagnosis) -> None:
             print(f"    {event}")
     for item in termination.unavailable:
         print(f"  unavailable: {item}")
+    print()
+
+    _print_oom_evidence(inspection.oom)
     print()
 
     if not _print_trajectory_observations(diagnosis.trajectories):
@@ -1648,6 +1674,52 @@ def _print_lifecycle_suggested_checks(diagnostics: object) -> None:
         return
     for suggestion in suggestions:
         print(f"  {suggestion}")
+
+
+def _print_oom_evidence(evidence: OomDiagnosticEvidence | None) -> None:
+    print("Memory / OOM evidence (oom_diagnostic_evidence):")
+    if evidence is None:
+        print("  unavailable: OOM diagnostic evidence was not derived")
+        return
+    print(f"  assessment: {evidence.assessment}")
+    _print_memory_observation("requested memory", evidence.requested_memory)
+    _print_memory_observation("allocated memory", evidence.allocated_memory)
+    _print_memory_observation("maximum RSS", evidence.maximum_rss)
+    _print_memory_observation("maximum VM size", evidence.maximum_vm_size)
+    _print_memory_observation("average RSS", evidence.average_rss)
+    if evidence.memory_utilization_percent is not None:
+        print(f"  scheduler-derived memory utilization: {evidence.memory_utilization_percent:.1f}%")
+    print(
+        "  scheduler OOM state: "
+        f"{'observed' if evidence.scheduler_oom_state else 'not observed'}"
+    )
+    if evidence.explicit_evidence:
+        print("  explicit evidence:")
+        for marker in evidence.explicit_evidence:
+            print(f"    {marker.source}: {marker.text}")
+    elif evidence.suggestive_evidence:
+        print("  suggestive evidence:")
+        for marker in evidence.suggestive_evidence:
+            print(f"    {marker.source}: {marker.text}")
+    else:
+        print("  positive OOM markers: none observed in inspected sources")
+    for limitation in evidence.limitations:
+        print(f"  limitation: {limitation}")
+    for guidance in evidence.guidance:
+        print(f"  guidance: {guidance}")
+
+
+def _print_memory_observation(
+    label: str,
+    observation: MemoryObservation | None,
+) -> None:
+    if observation is None:
+        print(f"  {label}: unavailable")
+        return
+    print(
+        f"  {label}: {observation.raw_value} "
+        f"[{observation.scope}; {observation.source}]"
+    )
 
 
 def _format_input_value(value: object) -> str:

@@ -18,10 +18,10 @@ SQUEUE_OUTPUT = """\
 124|bob|static_Si|PD|00:00|Priority
 """
 SACCT_FORMAT = (
-    "--format=JobIDRaw,JobName%30,User%20,Account%30,State,ExitCode,Elapsed,"
+    "--format=JobIDRaw,JobName%30,User%20,Account%30,State,ExitCode,Reason%40,Elapsed,"
     "ElapsedRaw,Start,End,Partition%20,Timelimit%20,NodeList%80,NNodes,"
     "AllocCPUS,NTasks,ReqMem,ReqTRES%120,AllocTRES%120,TotalCPU,CPUTimeRAW,"
-    "WorkDir%160"
+    "MaxRSS,MaxVMSize,AveRSS,StdOut%160,StdErr%160,WorkDir%160"
 )
 
 
@@ -81,7 +81,7 @@ def test_build_sacct_command_is_fixed_and_read_only() -> None:
     command = build_sacct_command("20893681")
 
     assert command == (
-        "sacct -X -P -n -j 20893681 "
+        "sacct -P -n -j 20893681 "
         f"{SACCT_FORMAT}"
     )
     assert "sbatch" not in command
@@ -110,10 +110,11 @@ def test_parse_sacct_output_prefers_primary_job_row() -> None:
 
 def test_parse_sacct_output_preserves_workdir_and_resource_fields() -> None:
     output = (
-        "20893681|vasp|guest|power-leeburton-users_v2|TIMEOUT|0:0|06:00:20|21620|"
+        "20893681|vasp|guest|power-leeburton-users_v2|TIMEOUT|0:0|TimeLimit|06:00:20|21620|"
         "2026-08-30T00:00:00|2026-08-30T06:00:20|leeburton-pool|06:00:00|"
         "compute-0-269|1|24|24|128G|billing=24,cpu=24,mem=128G,node=1|"
         "billing=24,cpu=24,mem=128G,node=1|120:00:00|518880|"
+        "120000M|140000M|110000M|/logs/job.out|/logs/job.err|"
         "/bmd-db/guest/flows/direct-vasp\n"
     )
 
@@ -126,6 +127,7 @@ def test_parse_sacct_output_preserves_workdir_and_resource_fields() -> None:
     assert record.account == "power-leeburton-users_v2"
     assert record.state == "TIMEOUT"
     assert record.exit_code == "0:0"
+    assert record.reason == "TimeLimit"
     assert record.elapsed == "06:00:20"
     assert record.elapsed_raw == 21620
     assert record.timelimit == "06:00:00"
@@ -138,13 +140,18 @@ def test_parse_sacct_output_preserves_workdir_and_resource_fields() -> None:
     assert record.alloc_tres == "billing=24,cpu=24,mem=128G,node=1"
     assert record.total_cpu == "120:00:00"
     assert record.cpu_time_raw == 518880
+    assert record.max_rss == "120000M"
+    assert record.max_vm_size == "140000M"
+    assert record.ave_rss == "110000M"
+    assert record.stdout_path == "/logs/job.out"
+    assert record.stderr_path == "/logs/job.err"
     assert record.work_dir == "/bmd-db/guest/flows/direct-vasp"
 
 
 def test_parse_sacct_output_allows_missing_optional_job_fields() -> None:
     output = (
-        "20893681|vasp|||COMPLETED|0:0|00:10:00||2026-08-30T00:00:00|"
-        "2026-08-30T00:10:00|leeburton-pool|||||||||||"
+        "20893681|vasp|||COMPLETED|0:0||00:10:00||2026-08-30T00:00:00|"
+        "2026-08-30T00:10:00|leeburton-pool||||||||||||||||"
     )
 
     record = parse_sacct_output("20893681", output)
@@ -154,6 +161,36 @@ def test_parse_sacct_output_allows_missing_optional_job_fields() -> None:
     assert record.work_dir is None
     assert record.allocated_cpus is None
     assert record.elapsed_raw is None
+
+
+def test_parse_sacct_output_preserves_parent_and_job_step_memory_evidence() -> None:
+    parent = (
+        "20893681|vasp|guest|acct|FAILED|1:0|NonZeroExitCode|01:00:00|3600|"
+        "start|end|pool|02:00:00|node-a|1|24|24|4Gc|cpu=24,mem=96G|"
+        "cpu=24,mem=96G|20:00:00|86400||||/logs/out|/logs/err|/work"
+    )
+    batch = (
+        "20893681.batch|batch|guest|acct|OUT_OF_MEMORY|0:125|OutOfMemory|01:00:00|"
+        "3600|start|end|pool|02:00:00|node-a|1|1|1|96Gn|cpu=1,mem=96G|"
+        "cpu=1,mem=96G|00:59:00|3540|94G|100G|90G|/logs/out|/logs/err|"
+    )
+    extern = (
+        "20893681.extern|extern|guest|acct|COMPLETED|0:0||01:00:00|3600|start|"
+        "end|pool|02:00:00|node-a|1|24|24||||00:01:00|1440|20M|30M|10M|||"
+    )
+
+    record = parse_sacct_output("20893681", "\n".join((batch, parent, extern)))
+
+    assert record is not None
+    assert record.state == "FAILED"
+    assert [step.job_id_raw for step in record.steps] == [
+        "20893681.batch",
+        "20893681.extern",
+    ]
+    assert record.steps[0].state == "OUT_OF_MEMORY"
+    assert record.steps[0].reason == "OutOfMemory"
+    assert record.steps[0].max_rss == "94G"
+    assert record.steps[1].max_rss == "20M"
 
 
 def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
@@ -184,7 +221,7 @@ def test_get_job_accounting_uses_mocked_ssh_transport() -> None:
             "ssh",
             "powerslurm-bmdguest",
             (
-                "sacct -X -P -n -j 20893681 "
+                "sacct -P -n -j 20893681 "
                 f"{SACCT_FORMAT}"
             ),
         ]

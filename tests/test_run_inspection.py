@@ -64,6 +64,7 @@ from bmd_agent.resources.run import (
     serialize_job_trajectory_evidence,
     vasp_reported_parameter_observations,
 )
+from bmd_agent.resources.oom import NO_OOM_EVIDENCE, OOM_ESTABLISHED
 from bmd_agent.resources.slurm import SlurmAccountingRecord
 from bmd_agent.resources.vasp import RemotePathError
 
@@ -73,10 +74,10 @@ DIRECT_DIR = "/bmd-db/guest/flows/direct-vasp"
 LOG_ROOT = "/bmd-db/guest/logs"
 RESULT_DIR = f"{FLOW_ROOT}/producer-delta"
 SACCT_FORMAT = (
-    "--format=JobIDRaw,JobName%30,User%20,Account%30,State,ExitCode,Elapsed,"
+    "--format=JobIDRaw,JobName%30,User%20,Account%30,State,ExitCode,Reason%40,Elapsed,"
     "ElapsedRaw,Start,End,Partition%20,Timelimit%20,NodeList%80,NNodes,"
     "AllocCPUS,NTasks,ReqMem,ReqTRES%120,AllocTRES%120,TotalCPU,CPUTimeRAW,"
-    "WorkDir%160"
+    "MaxRSS,MaxVMSize,AveRSS,StdOut%160,StdErr%160,WorkDir%160"
 )
 OSZICAR_TWO_STEP = b"""\
        N       E                     dE             d eps       ncg     rms          rms(c)
@@ -332,6 +333,20 @@ class RemoteFixture:
             if path not in self.files:
                 raise subprocess.CalledProcessError(1, command, stderr=b"missing")
             return subprocess.CompletedProcess(command, 0, stdout=self.files[path], stderr=b"")
+
+        if parts[:2] == ["tail", "-c"]:
+            assert kwargs["check"] is True
+            limit = int(parts[2])
+            assert parts[3] == "--"
+            path = parts[4]
+            if path not in self.files:
+                raise subprocess.CalledProcessError(1, command, stderr=b"missing")
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=self.files[path][-limit:],
+                stderr=b"",
+            )
 
         if parts[:2] == ["test", "-f"]:
             assert kwargs["check"] is False
@@ -659,7 +674,7 @@ def slurm_runner(command: list[str], **kwargs: object) -> subprocess.CompletedPr
         "ssh",
         "powerslurm-bmdguest",
         (
-            "sacct -X -P -n -j 20893681 "
+            "sacct -P -n -j 20893681 "
             f"{SACCT_FORMAT}"
         ),
     ]
@@ -747,13 +762,16 @@ def job_sacct_output(
     job_id: str = "20893681",
     state: str = "COMPLETED",
     work_dir: str | None = DIRECT_DIR,
+    max_rss: str | None = None,
+    stdout_path: str | None = None,
+    stderr_path: str | None = None,
 ) -> str:
     return (
-        f"{job_id}|direct-vasp|guest|power-leeburton-users_v2|{state}|0:0|06:00:20|"
+        f"{job_id}|direct-vasp|guest|power-leeburton-users_v2|{state}|0:0||06:00:20|"
         "21620|2026-08-30T00:00:00|2026-08-30T06:00:20|leeburton-pool|"
         "06:00:00|compute-0-269|1|24|24|128G|billing=24,cpu=24,mem=128G,node=1|"
         "billing=24,cpu=24,mem=128G,node=1|120:00:00|518880|"
-        f"{work_dir or ''}\n"
+        f"{max_rss or ''}|||{stdout_path or ''}|{stderr_path or ''}|{work_dir or ''}\n"
     )
 
 
@@ -762,12 +780,15 @@ def job_slurm_runner(
     job_id: str = "20893681",
     state: str = "COMPLETED",
     work_dir: str | None = DIRECT_DIR,
+    max_rss: str | None = None,
+    stdout_path: str | None = None,
+    stderr_path: str | None = None,
 ) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
     def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         assert command == [
             "ssh",
             "powerslurm-bmdguest",
-            f"sacct -X -P -n -j {job_id} {SACCT_FORMAT}",
+            f"sacct -P -n -j {job_id} {SACCT_FORMAT}",
         ]
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
@@ -775,7 +796,14 @@ def job_slurm_runner(
         return subprocess.CompletedProcess(
             command,
             0,
-            stdout=job_sacct_output(job_id=job_id, state=state, work_dir=work_dir),
+            stdout=job_sacct_output(
+                job_id=job_id,
+                state=state,
+                work_dir=work_dir,
+                max_rss=max_rss,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            ),
             stderr="",
         )
 
@@ -903,6 +931,56 @@ def test_inspect_slurm_job_identifies_direct_vasp_without_submission_json() -> N
     assert "find " not in remote_commands
     assert "ls " not in remote_commands
     assert "POTCAR" not in remote_commands
+
+
+def test_inspect_slurm_job_reads_bounded_scheduler_stderr_for_explicit_oom() -> None:
+    stderr_path = f"{LOG_ROOT}/slurm-20893681.err"
+    files = direct_vasp_files()
+    files[stderr_path] = b"slurmstepd: error: Detected 1 oom-kill event(s) in step\n"
+    remote = RemoteFixture(files=files, directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(state="FAILED", stderr_path=stderr_path),
+        scientific_parser=fake_direct_scientific_parser,
+    )
+
+    assert inspection.oom is not None
+    assert inspection.oom.assessment == OOM_ESTABLISHED
+    assert any(marker.source.startswith("SLURM stderr") for marker in inspection.oom.explicit_evidence)
+    assert [command[2] for command in remote.commands if command[2].startswith("tail ")] == [
+        f"tail -c 128000 -- {stderr_path}"
+    ]
+    assert not any(
+        token in command[2]
+        for command in remote.commands
+        for token in ("sbatch", "scancel", "scontrol")
+    )
+
+
+def test_inspect_remote_run_reuses_producer_logs_for_oom_evidence() -> None:
+    files = default_files()
+    files[f"{LOG_ROOT}/validation-run.slurm.err"] = (
+        b"slurmstepd: error: Detected 1 oom-kill event(s) in step\n"
+    )
+    remote = RemoteFixture(files=files, directories=default_directories())
+
+    inspection = inspect_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=slurm_runner,
+        scientific_parser=fake_scientific_parser,
+    )
+
+    assert inspection.oom is not None
+    assert inspection.oom.assessment == OOM_ESTABLISHED
+    assert any(
+        marker.source == f"{LOG_ROOT}/validation-run.slurm.err"
+        for marker in inspection.oom.explicit_evidence
+    )
 
 
 def test_inspect_slurm_job_can_identify_direct_vasp_with_invalid_submission_json() -> None:
@@ -1900,6 +1978,7 @@ def test_serialize_job_trajectory_evidence_completed_direct_vasp_job() -> None:
     assert payload["job"]["timelimit"] == "06:00:00"
     assert payload["job"]["allocated_cpus"] == 24
     assert payload["job"]["work_dir"] == DIRECT_DIR
+    assert payload["oom_diagnostic_evidence"]["assessment"] == NO_OOM_EVIDENCE
     assert payload["calculation"]["calculation_type"] == "direct VASP"
     assert payload["calculation"]["producer_provenance"]["status"] == "unavailable"
 

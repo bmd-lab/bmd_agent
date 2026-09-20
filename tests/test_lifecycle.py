@@ -10,6 +10,7 @@ from bmd_agent.resources.lifecycle import (
     LifecycleState,
     analyze_calculation_directory,
 )
+from bmd_agent.resources.oom import NO_OOM_EVIDENCE, OOM_ESTABLISHED
 from bmd_agent.resources.slurm import SlurmAccountingRecord
 
 
@@ -541,6 +542,8 @@ def test_relocated_failed_hybrid_snapshot_builds_factual_domain_context_query(
     assert trajectory.completed_ionic_steps == 0
     assert trajectory.incomplete_electronic_iteration_count == 4
     assert analysis.diagnostics.logs[0].messages == ("SIGTERM received by VASP",)
+    assert analysis.diagnostics.oom is not None
+    assert analysis.diagnostics.oom.assessment == NO_OOM_EVIDENCE
     assert query is not None
     assert query["functional"] == "hse06"
     assert query["electronic_algorithm"] == "Damped"
@@ -552,6 +555,37 @@ def test_relocated_failed_hybrid_snapshot_builds_factual_domain_context_query(
         "LSORBIT": True,
     }
     assert "4_initial_DAV_iterations_observed" in query["observed_patterns"]
+
+
+def test_relocated_snapshot_uses_local_cgroup_marker_without_scheduler_state(
+    tmp_path: Path,
+) -> None:
+    write_single_stage_submission(
+        tmp_path,
+        result_dir="/bmd-db/guest/flows/hse06_soc_failed",
+    )
+    write_inputs(tmp_path)
+    (tmp_path / "OUTCAR").write_text("partial", encoding="utf-8")
+    (tmp_path / "std_err.txt").write_text(
+        "slurmstepd: error: Detected 1 oom-kill event(s) in step\n",
+        encoding="utf-8",
+    )
+
+    analysis = analyze_calculation_directory(
+        tmp_path,
+        scheduler_lookup=lambda job_id: scheduler_record(
+            job_id=job_id,
+            state="OUT_OF_MEMORY",
+            exit_code="0:125",
+        ),
+    )
+
+    assert analysis.state == LifecycleState.UNKNOWN
+    assert analysis.scheduler is None
+    assert analysis.diagnostics is not None
+    assert analysis.diagnostics.oom is not None
+    assert analysis.diagnostics.oom.assessment == OOM_ESTABLISHED
+    assert analysis.diagnostics.oom.scheduler_oom_state is False
 
 
 def test_incomplete_bmd_snapshot_uses_same_diagnostic_evidence(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ import re
 from typing import Any
 import warnings
 
+from bmd_agent.resources.oom import OomDiagnosticEvidence, assess_oom_evidence
 from bmd_agent.resources.run import (
     ConvergenceProgressAssessment,
     IncarObservation,
@@ -108,7 +109,13 @@ SchedulerLookup = Callable[[str], SlurmAccountingRecord | None]
 _INPUT_FILENAMES = ("POSCAR", "INCAR", "KPOINTS")
 _OUTPUT_FILENAMES = ("OUTCAR", "OSZICAR", "vasprun.xml", "CONTCAR", "DOSCAR", "XDATCAR")
 _BMD_LOG_KEYS = ("log_out", "log_err", "slurm_out", "slurm_err")
-_LOCAL_DIAGNOSTIC_LOG_FILENAMES = ("std_err.txt", "vasp.out", "stdout.txt", "stderr.txt")
+_LOCAL_DIAGNOSTIC_LOG_FILENAMES = (
+    "std_err.txt",
+    "vasp.out",
+    "stdout.txt",
+    "stderr.txt",
+    "OUTCAR",
+)
 _LOCAL_DIAGNOSTIC_RECENT_WINDOW = 5
 _LOCAL_VASPRUN_MAX_BYTES = 50_000_000
 _LOCAL_OUTCAR_DIAGNOSTIC_MAX_BYTES = 2_000_000
@@ -143,7 +150,9 @@ _NORMAL_COMPLETION_MARKERS = (
     "Voluntary context switches",
 )
 _LOG_DIAGNOSTIC_RE = re.compile(
-    r"\b(error|fatal|traceback|exception|zbrent|brmix|edddav|eddrmm|segmentation|forrtl|killed|sigterm)\b",
+    r"\b(error|fatal|traceback|exception|zbrent|brmix|edddav|eddrmm|segmentation|forrtl|"
+    r"killed|sigterm|sigkill|oom|out of memory|memory limit|cannot allocate memory|"
+    r"bad_alloc|allocation failed|insufficient memory)\b",
     re.IGNORECASE,
 )
 
@@ -173,6 +182,7 @@ class LocalExecutionDiagnostics:
     custodian: LocalCustodianDiagnostic | None = None
     error_archives: tuple[LocalFileEvidence, ...] = ()
     suggested_checks: tuple[str, ...] = ()
+    oom: OomDiagnosticEvidence | None = None
 
 
 def analyze_calculation_directory(
@@ -221,7 +231,7 @@ def _analyze_bmd_workflow(
     gaps = _input_gaps(input_files)
     limitations: list[str] = []
     diagnostics = (
-        _derive_bmd_execution_diagnostics(workflow)
+        _derive_bmd_execution_diagnostics(workflow, scheduler=scheduler)
         if meaningful_execution
         else None
     )
@@ -662,7 +672,11 @@ def _all_required_stages_complete(workflow: BmdWorkflowDiscovery) -> bool:
     return required.issubset(completed)
 
 
-def _derive_bmd_execution_diagnostics(workflow: BmdWorkflowDiscovery) -> LocalExecutionDiagnostics:
+def _derive_bmd_execution_diagnostics(
+    workflow: BmdWorkflowDiscovery,
+    *,
+    scheduler: SlurmAccountingRecord | None,
+) -> LocalExecutionDiagnostics:
     stage_map = {
         index: _workflow_stage_from_mapping(index, payload)
         for index, payload in enumerate(workflow.workflow_stages, start=1)
@@ -680,10 +694,17 @@ def _derive_bmd_execution_diagnostics(workflow: BmdWorkflowDiscovery) -> LocalEx
         )
         for binding in bindings
     )
+    declared_logs = tuple(
+        observation.path
+        for observation in _observe_bmd_logs(workflow).values()
+        if observation.present
+    )
     return _local_execution_diagnostics(
         workflow.workflow_root,
         tuple(binding.path for binding in bindings),
         trajectories,
+        scheduler=scheduler,
+        explicit_log_paths=declared_logs,
     )
 
 
@@ -704,12 +725,39 @@ def _local_execution_diagnostics(
     root: Path,
     directories: Sequence[Path],
     trajectories: Sequence[StageTrajectoryObservation],
+    *,
+    scheduler: SlurmAccountingRecord | None = None,
+    explicit_log_paths: Sequence[Path] = (),
 ) -> LocalExecutionDiagnostics:
     unique_directories = _unique_paths((root, *directories))
-    logs = _observe_local_logs(unique_directories)
+    logs = _observe_local_logs(unique_directories, explicit_paths=explicit_log_paths)
     custodian = _observe_local_custodian(unique_directories)
     archives = _observe_error_archives(unique_directories)
     assessments = assess_convergence_progress(tuple(trajectories))
+    log_observations = [
+        (f"{log.label} ({log.path})", message)
+        for log in logs
+        for message in log.messages
+    ]
+    if custodian is not None:
+        log_observations.extend(
+            (f"custodian.json ({custodian.path})", event)
+            for event in custodian.events
+        )
+    inspected_log_sources = [
+        f"{log.label} ({log.path})"
+        for log in logs
+        if log.error is None
+    ]
+    source_limitations = [
+        f"{log.label} could not be read through the bounded diagnostic path"
+        for log in logs
+        if log.error is not None
+    ]
+    if custodian is not None and custodian.error is None:
+        inspected_log_sources.append(f"custodian.json ({custodian.path})")
+    elif custodian is not None:
+        source_limitations.append("custodian.json could not be parsed for diagnostic evidence")
     return LocalExecutionDiagnostics(
         trajectories=tuple(trajectories),
         assessments=assessments,
@@ -721,6 +769,12 @@ def _local_execution_diagnostics(
             logs,
             custodian,
             archives,
+        ),
+        oom=assess_oom_evidence(
+            scheduler,
+            log_observations=log_observations,
+            inspected_log_sources=inspected_log_sources,
+            source_limitations=source_limitations,
         ),
     )
 
@@ -1054,24 +1108,36 @@ def _local_incar_observation(binding: LocalStageBinding) -> IncarObservation:
     )
 
 
-def _observe_local_logs(directories: Sequence[Path]) -> tuple[LocalLogDiagnostic, ...]:
+def _observe_local_logs(
+    directories: Sequence[Path],
+    *,
+    explicit_paths: Sequence[Path] = (),
+) -> tuple[LocalLogDiagnostic, ...]:
     diagnostics: list[LocalLogDiagnostic] = []
     seen: set[Path] = set()
-    for directory in directories:
-        for filename in _LOCAL_DIAGNOSTIC_LOG_FILENAMES:
-            path = directory / filename
-            if path in seen or not path.exists():
-                continue
-            seen.add(path)
-            if not path.is_file():
-                continue
-            try:
-                text = _read_file_tail(path, limit=_LOCAL_LOG_DIAGNOSTIC_MAX_BYTES).decode("utf-8", "replace")
-            except OSError as exc:
-                diagnostics.append(LocalLogDiagnostic(filename, path, True, error=str(exc)))
-                continue
-            messages = _diagnostic_log_messages(text)
-            diagnostics.append(LocalLogDiagnostic(filename, path, True, messages=messages))
+    candidates = [
+        directory / filename
+        for directory in directories
+        for filename in _LOCAL_DIAGNOSTIC_LOG_FILENAMES
+    ]
+    candidates.extend(explicit_paths)
+    for path in candidates:
+        filename = path.name
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        if not path.is_file():
+            continue
+        try:
+            text = _read_file_tail(path, limit=_LOCAL_LOG_DIAGNOSTIC_MAX_BYTES).decode(
+                "utf-8",
+                "replace",
+            )
+        except OSError as exc:
+            diagnostics.append(LocalLogDiagnostic(filename, path, True, error=str(exc)))
+            continue
+        messages = _diagnostic_log_messages(text)
+        diagnostics.append(LocalLogDiagnostic(filename, path, True, messages=messages))
     return tuple(diagnostics)
 
 

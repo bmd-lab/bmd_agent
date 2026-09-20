@@ -13,6 +13,12 @@ import warnings
 from typing import Any
 
 from bmd_agent.config import SlurmClusterResource
+from bmd_agent.resources.oom import (
+    OomDiagnosticEvidence,
+    assess_oom_evidence,
+    oom_candidate_lines,
+    serialize_oom_evidence,
+)
 from bmd_agent.resources.slurm import (
     SlurmAccountingRecord,
     get_job_accounting,
@@ -29,6 +35,7 @@ from bmd_agent.resources.vasp import (
     remote_file_exists,
     remote_file_size,
     retrieve_remote_file,
+    retrieve_remote_file_tail,
 )
 
 
@@ -88,6 +95,7 @@ _DIAGNOSE_RECENT_WINDOW = 5
 _DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF")
 _OUTCAR_FORCE_EXTRACTION_SCHEMA = "bmd-agent-outcar-force-v1"
 _JOB_TRAJECTORY_JSON_SCHEMA_VERSION = 1
+_OOM_REMOTE_LOG_MAX_BYTES = 128_000
 _OSZICAR_IONIC_DE_SEMANTICS = (
     "VASP OSZICAR ionic-line d E value parsed by pymatgen; "
     "not Agent-computed F_n - F_(n-1)"
@@ -149,6 +157,7 @@ class LogRuntimeObservation:
     packages: Mapping[str, str]
     environment: Mapping[str, str]
     stage_uuids: Mapping[str, str]
+    oom_diagnostic_messages: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -261,6 +270,7 @@ class RunInspection:
     )
     executed_inputs: tuple[IncarObservation, ...] = ()
     input_expectations: tuple[InputExpectationObservation, ...] = ()
+    oom: OomDiagnosticEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -466,6 +476,7 @@ class JobInspection:
     calculation_reason: str | None
     bmd_compute: RunDiagnosis | None = None
     direct_vasp: DirectVaspInspection | None = None
+    oom: OomDiagnosticEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -623,6 +634,14 @@ def inspect_remote_run(
         runner=remote_runner,
         timeout=timeout,
     )
+    oom = _assess_remote_oom_evidence(
+        cluster,
+        scheduler,
+        remote_runner=remote_runner,
+        timeout=timeout,
+        existing_log_sources=runtime.sources,
+        existing_log_observations=runtime.oom_diagnostic_messages,
+    )
     if derive_scientific:
         scientific = _derive_scientific_result(
             cluster.ssh_host,
@@ -667,6 +686,7 @@ def inspect_remote_run(
         initial_structure=producer["initial_structure"],
         executed_inputs=executed_inputs,
         input_expectations=input_expectations,
+        oom=oom,
     )
 
 
@@ -767,7 +787,10 @@ def inspect_slurm_job(
             calculation_directory=None,
             calculation_type="unknown",
             calculation_reason="scheduler accounting was unavailable",
+            oom=assess_oom_evidence(None),
         )
+
+    scheduler_only_oom = assess_oom_evidence(scheduler)
 
     work_dir = getattr(scheduler, "work_dir", None)
     if not work_dir:
@@ -779,6 +802,7 @@ def inspect_slurm_job(
             calculation_directory=None,
             calculation_type="unknown",
             calculation_reason="scheduler WorkDir was unavailable",
+            oom=scheduler_only_oom,
         )
 
     try:
@@ -795,6 +819,7 @@ def inspect_slurm_job(
             calculation_directory=None,
             calculation_type="unknown",
             calculation_reason=f"scheduler WorkDir is not authorized: {exc}",
+            oom=scheduler_only_oom,
         )
 
     if not remote_directory_exists(
@@ -811,6 +836,7 @@ def inspect_slurm_job(
             calculation_directory=None,
             calculation_type="unknown",
             calculation_reason="scheduler WorkDir is authorized but is not a readable directory",
+            oom=scheduler_only_oom,
         )
 
     submission_path = build_remote_file_path(
@@ -858,6 +884,12 @@ def inspect_slurm_job(
                     calculation_directory=None,
                     calculation_type="unknown",
                     calculation_reason=f"{producer_reason}; {reason}",
+                    oom=_assess_remote_oom_evidence(
+                        cluster,
+                        scheduler,
+                        remote_runner=remote_runner,
+                        timeout=timeout,
+                    ),
                 )
             return JobInspection(
                 job_id=normalized_job_id,
@@ -868,6 +900,12 @@ def inspect_slurm_job(
                 calculation_type="direct VASP",
                 calculation_reason=None,
                 direct_vasp=direct,
+                oom=_assess_remote_oom_evidence(
+                    cluster,
+                    scheduler,
+                    remote_runner=remote_runner,
+                    timeout=timeout,
+                ),
             )
         return JobInspection(
             job_id=normalized_job_id,
@@ -878,6 +916,7 @@ def inspect_slurm_job(
             calculation_type="BMD Compute",
             calculation_reason=None,
             bmd_compute=diagnosis,
+            oom=diagnosis.inspection.oom,
         )
 
     direct, reason = _inspect_direct_vasp_directory(
@@ -899,6 +938,12 @@ def inspect_slurm_job(
             calculation_directory=None,
             calculation_type="unknown",
             calculation_reason=reason,
+            oom=_assess_remote_oom_evidence(
+                cluster,
+                scheduler,
+                remote_runner=remote_runner,
+                timeout=timeout,
+            ),
         )
 
     return JobInspection(
@@ -910,6 +955,12 @@ def inspect_slurm_job(
         calculation_type="direct VASP",
         calculation_reason=None,
         direct_vasp=direct,
+        oom=_assess_remote_oom_evidence(
+            cluster,
+            scheduler,
+            remote_runner=remote_runner,
+            timeout=timeout,
+        ),
     )
 
 
@@ -1129,6 +1180,7 @@ def serialize_job_trajectory_evidence(inspection: JobInspection) -> Mapping[str,
             _serialize_convergence_assessment(assessment)
             for assessment in assessments
         ],
+        "oom_diagnostic_evidence": serialize_oom_evidence(inspection.oom),
     }
 
 
@@ -3907,10 +3959,11 @@ def _parse_runtime_logs(
     packages: dict[str, str] = {}
     environment: dict[str, str] = {}
     stage_uuids: dict[str, str] = {}
+    oom_messages: list[tuple[str, str]] = []
     python: str | None = None
 
     for observation in paths:
-        if not observation.present or not observation.label.startswith("log_"):
+        if not observation.present:
             continue
         path = PurePosixPath(observation.path)
         try:
@@ -3923,6 +3976,10 @@ def _parse_runtime_logs(
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             continue
         sources.append(observation.path)
+        oom_messages.extend(
+            (observation.path, message)
+            for message in oom_candidate_lines(text)
+        )
         for line in text.splitlines():
             python_match = _PYTHON_RE.match(line.strip())
             if python_match:
@@ -3945,6 +4002,78 @@ def _parse_runtime_logs(
         packages=packages,
         environment=environment,
         stage_uuids=stage_uuids,
+        oom_diagnostic_messages=tuple(oom_messages),
+    )
+
+
+def _assess_remote_oom_evidence(
+    cluster: SlurmClusterResource,
+    scheduler: SlurmAccountingRecord | None,
+    *,
+    remote_runner: RemoteRunner,
+    timeout: float,
+    existing_log_sources: Iterable[str] = (),
+    existing_log_observations: Iterable[tuple[str, str]] = (),
+) -> OomDiagnosticEvidence:
+    observations = list(existing_log_observations)
+    inspected_sources = list(existing_log_sources)
+    limitations: list[str] = []
+    seen = set(inspected_sources)
+
+    if scheduler is not None:
+        scheduler_log_paths = [
+            ("SLURM stdout", scheduler.stdout_path),
+            ("SLURM stderr", scheduler.stderr_path),
+        ]
+        for step in scheduler.steps:
+            scheduler_log_paths.extend(
+                (
+                    (f"SLURM step {step.job_id_raw} stdout", step.stdout_path),
+                    (f"SLURM step {step.job_id_raw} stderr", step.stderr_path),
+                )
+            )
+        for label, raw_path in scheduler_log_paths:
+            if not raw_path or raw_path in seen:
+                continue
+            seen.add(raw_path)
+            try:
+                path = authorize_remote_path(
+                    raw_path,
+                    allowed_roots=cluster.allowed_remote_roots,
+                )
+            except RemotePathError:
+                limitations.append(f"{label} path was outside configured allowed remote roots")
+                continue
+            try:
+                if not remote_file_exists(
+                    cluster.ssh_host,
+                    path,
+                    runner=remote_runner,
+                    timeout=timeout,
+                ):
+                    limitations.append(f"{label} was unavailable at {path}")
+                    continue
+                text = retrieve_remote_file_tail(
+                    cluster.ssh_host,
+                    path,
+                    limit=_OOM_REMOTE_LOG_MAX_BYTES,
+                    runner=remote_runner,
+                    timeout=timeout,
+                ).decode("utf-8", "replace")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                limitations.append(f"{label} could not be read through the bounded diagnostic path")
+                continue
+            inspected_sources.append(f"{label} ({path})")
+            observations.extend(
+                (f"{label} ({path})", message)
+                for message in oom_candidate_lines(text)
+            )
+
+    return assess_oom_evidence(
+        scheduler,
+        log_observations=observations,
+        inspected_log_sources=inspected_sources,
+        source_limitations=limitations,
     )
 
 

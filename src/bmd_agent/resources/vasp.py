@@ -123,6 +123,30 @@ def retrieve_remote_file(
     return result.stdout
 
 
+def retrieve_remote_file_tail(
+    ssh_host: str,
+    remote_path: PurePosixPath,
+    *,
+    limit: int,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> bytes:
+    """Retrieve a bounded tail from one already-authorized remote file."""
+
+    if limit <= 0:
+        raise ValueError("remote tail byte limit must be positive")
+    remote_command = " ".join(
+        ["tail", "-c", str(limit), "--", shlex.quote(str(remote_path))]
+    )
+    result = runner(
+        ["ssh", ssh_host, remote_command],
+        capture_output=True,
+        check=True,
+        timeout=timeout,
+    )
+    return result.stdout
+
+
 def remote_file_exists(
     ssh_host: str,
     remote_path: PurePosixPath,
