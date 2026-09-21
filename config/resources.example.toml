@@ -57,9 +57,21 @@ ssh_host = "powerslurm-bmdguest"
 partition = "leeburton-pool"
 access = "observational"
 
+# Optional shipped reference profile. The profile records expected/observed
+# infrastructure facts; this deployment-local table remains authoritative for
+# acquisition and path authorization.
+deployment_profile = "power"
+
+# Operational bounds belong to the deployment-local acquisition resource.
+# They do not describe scientific evidence or alter the shipped POWER profile.
+ssh_connect_timeout_seconds = 10
+remote_command_timeout_seconds = 20
+scheduler_accounting_timeout_seconds = 60
+
 # Absolute POSIX directories that BMD Agent may read through this SSH
 # identity when inspecting calculation files. User-supplied paths must
 # stay within one of these roots after lexical normalization.
 allowed_remote_roots = [
-    "/home/example/calculations",
+    "/bmd-db/guest/flows",
+    "/bmd-db/guest/logs",
 ]

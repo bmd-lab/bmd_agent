@@ -846,6 +846,12 @@ def test_inspect_slurm_job_rejects_invalid_job_id_without_scheduler_or_remote_re
 
 def test_inspect_slurm_job_scheduler_timeout_is_finite_and_oom_is_insufficient() -> None:
     remote_calls: list[list[str]] = []
+    configured_cluster = replace(
+        cluster(),
+        ssh_connect_timeout_seconds=7,
+        remote_command_timeout_seconds=33,
+        scheduler_accounting_timeout_seconds=45,
+    )
 
     def fail_remote(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         remote_calls.append(command)
@@ -855,17 +861,16 @@ def test_inspect_slurm_job_scheduler_timeout_is_finite_and_oom_is_insufficient()
         command: list[str],
         **kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
-        assert command[:4] == ["ssh", "-o", "ConnectTimeout=10", "powerslurm-bmdguest"]
+        assert command[:4] == ["ssh", "-o", "ConnectTimeout=7", "powerslurm-bmdguest"]
         assert "sacct -P -n -j 21906221" in command[4]
         assert kwargs["timeout"] == 45
         raise subprocess.TimeoutExpired(command, 45)
 
     inspection = inspect_slurm_job(
-        cluster(),
+        configured_cluster,
         "21906221",
         remote_runner=fail_remote,
         slurm_runner=slow_scheduler,
-        scheduler_timeout=45,
     )
 
     assert inspection.scheduler is None

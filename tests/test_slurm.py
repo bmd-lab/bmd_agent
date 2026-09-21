@@ -65,6 +65,8 @@ def test_get_queue_uses_mocked_ssh_transport() -> None:
     assert calls == [
         [
             "ssh",
+            "-o",
+            f"ConnectTimeout={DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS}",
             "powerslurm-bmdguest",
             "squeue -p leeburton-pool --noheader '--format=%i|%u|%j|%t|%M|%R'",
         ]

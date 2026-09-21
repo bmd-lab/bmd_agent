@@ -4,11 +4,13 @@ import shlex
 import subprocess
 from typing import Callable
 
+from bmd_agent.config import (
+    DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+)
+
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
-
-DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 10
-DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS = 60
 
 _PARTITION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _JOB_ID_RE = re.compile(r"^\d+(?:_\d+)?(?:\.(?:batch|extern|\d+))?$")
@@ -120,11 +122,17 @@ def get_queue(
     *,
     runner: Runner = subprocess.run,
     timeout: float = 20,
+    ssh_connect_timeout: int = DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
 ) -> list[SlurmJob]:
     """Return jobs visible in a configured SLURM partition."""
 
+    if ssh_connect_timeout <= 0:
+        raise ValueError("SSH connection timeout must be positive")
+
     command = [
         "ssh",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout}",
         ssh_host,
         build_squeue_command(partition),
     ]

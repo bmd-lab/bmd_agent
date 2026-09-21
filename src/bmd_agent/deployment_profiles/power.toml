@@ -1,0 +1,75 @@
+schema = "bmd_agent.deployment_profile"
+schema_version = 1
+deployment_id = "power"
+name = "TAU POWER"
+
+[provenance]
+verified_date = "2026-09-21"
+verification = "verified by direct OS, SLURM, partition, and accounting probes"
+
+[expected]
+scheduler = "slurm"
+partition = "leeburton-pool"
+account = "power-leeburton-users_v2"
+
+[recorded.host]
+os_name = "Rocky Linux"
+os_family = "rocky"
+os_compatibility_family = "rhel-like"
+os_version = "9.8"
+os_variant = "Blue Onyx"
+
+[recorded.scheduler]
+version = "25.11.6"
+node_count = 8
+total_cpus = 1536
+cpus_per_node = 192
+
+[recorded.scheduler.slurm]
+default_time = "12:00:00"
+max_time = "UNLIMITED"
+over_time_limit = "NONE"
+preempt_mode = "REQUEUE"
+step_accounting_supported = true
+sacct_fields = [
+    "JobID",
+    "JobIDRaw",
+    "State",
+    "ExitCode",
+    "Elapsed",
+    "ReqMem",
+    "MaxRSS",
+    "MaxVMSize",
+    "AveRSS",
+    "AllocTRES",
+    "ReqTRES",
+    "NCPUS",
+    "NNodes",
+    "NodeList",
+    "Reason",
+]
+
+[recorded.scheduler.memory_per_node]
+value = 1030957
+unit = "MB"
+approximate = true
+source_semantics = "approximate value reported by sinfo"
+
+[recorded.paths]
+flows_root = "/bmd-db/guest/flows"
+logs_root = "/bmd-db/guest/logs"
+potcar_root = "/bmd-db/potcars"
+remote_python = "/bmd/bmdguest/envs/atomate2_remote/bin/python"
+scheduler_launch_directory = "/a/home/cc/tree/taucc/enginer/bmdguest"
+
+[recorded.software]
+vasp_version = "6.4.1"
+module_build_label_note = "rocky8 strings are module/build names and do not identify the current host OS"
+
+[[recorded.software.modules]]
+name = "intel/rocky8-oneAPI-2023"
+role = "MPI and oneAPI runtime environment"
+
+[[recorded.software.modules]]
+name = "vasp/rocky8-intel-6.4.1"
+role = "VASP application module"

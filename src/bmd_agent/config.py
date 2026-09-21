@@ -8,9 +8,13 @@ from typing import Any, Mapping
 
 
 CONFIG_ENV_VAR = "BMD_AGENT_RESOURCES"
+DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_REMOTE_COMMAND_TIMEOUT_SECONDS = 20
+DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS = 60
 
 _PARTITION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SSH_HOST_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+_DEPLOYMENT_PROFILE_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 class ConfigurationError(RuntimeError):
@@ -37,6 +41,10 @@ class SlurmClusterResource:
     partition: str
     access: str
     allowed_remote_roots: tuple[PurePosixPath, ...]
+    deployment_profile: str | None = None
+    ssh_connect_timeout_seconds: int = DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS
+    remote_command_timeout_seconds: int = DEFAULT_REMOTE_COMMAND_TIMEOUT_SECONDS
+    scheduler_accounting_timeout_seconds: int = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -196,6 +204,19 @@ def _parse_cluster(
             f"{source}: clusters.{key}.allowed_remote_roots must not be empty"
         )
 
+    deployment_profile = _optional_str(
+        table,
+        "deployment_profile",
+        f"clusters.{key}",
+        source=source,
+    )
+    if deployment_profile is not None and not _DEPLOYMENT_PROFILE_RE.fullmatch(
+        deployment_profile
+    ):
+        raise ConfigurationError(
+            f"{source}: clusters.{key}.deployment_profile is invalid"
+        )
+
     return SlurmClusterResource(
         key=key,
         name=_required_str(table, "name", f"clusters.{key}", source=source),
@@ -203,6 +224,28 @@ def _parse_cluster(
         partition=partition,
         access=access,
         allowed_remote_roots=allowed_remote_roots,
+        deployment_profile=deployment_profile,
+        ssh_connect_timeout_seconds=_optional_positive_int(
+            table,
+            "ssh_connect_timeout_seconds",
+            f"clusters.{key}",
+            default=DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+            source=source,
+        ),
+        remote_command_timeout_seconds=_optional_positive_int(
+            table,
+            "remote_command_timeout_seconds",
+            f"clusters.{key}",
+            default=DEFAULT_REMOTE_COMMAND_TIMEOUT_SECONDS,
+            source=source,
+        ),
+        scheduler_accounting_timeout_seconds=_optional_positive_int(
+            table,
+            "scheduler_accounting_timeout_seconds",
+            f"clusters.{key}",
+            default=DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+            source=source,
+        ),
     )
 
 
@@ -298,6 +341,40 @@ def _optional_path(
         raise ConfigurationError(f"{source}: {field}.{key} must be a non-empty string")
 
     return Path(value).expanduser()
+
+
+def _optional_str(
+    table: Mapping[str, Any],
+    key: str,
+    field: str,
+    *,
+    source: Path | str,
+) -> str | None:
+    value = table.get(key)
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str) or not value:
+        raise ConfigurationError(f"{source}: {field}.{key} must be a non-empty string")
+
+    return value
+
+
+def _optional_positive_int(
+    table: Mapping[str, Any],
+    key: str,
+    field: str,
+    *,
+    default: int,
+    source: Path | str,
+) -> int:
+    value = table.get(key, default)
+
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ConfigurationError(f"{source}: {field}.{key} must be a positive integer")
+
+    return value
 
 
 def _missing_config_message(path: Path) -> str:
