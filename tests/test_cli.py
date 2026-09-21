@@ -207,3 +207,62 @@ def test_cli_reports_missing_configuration(
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "No BMD Agent resource configuration found." in captured.err
+
+
+def test_status_exposes_resolved_profile_as_context_not_live_observation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cluster = SlurmClusterResource(
+        key="powerslurm",
+        name="PowerSLURM",
+        ssh_host="powerslurm-bmdguest",
+        partition="leeburton-pool",
+        access="observational",
+        allowed_remote_roots=(),
+        deployment_profile="power",
+    )
+    registry = ResourceRegistry(repositories={}, clusters={"powerslurm": cluster})
+
+    assert cli.show_status(registry) == 0
+
+    output = capsys.readouterr().out
+    assert "Deployment context:" in output
+    assert "profile: power (TAU POWER)" in output
+    assert "profile schema: bmd_agent.deployment_profile v1" in output
+    assert "expected scheduler: slurm" in output
+    assert "live" not in output.lower()
+
+
+def test_queue_uses_deployment_local_operational_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cluster = SlurmClusterResource(
+        key="powerslurm",
+        name="PowerSLURM",
+        ssh_host="powerslurm-bmdguest",
+        partition="leeburton-pool",
+        access="observational",
+        allowed_remote_roots=(),
+        ssh_connect_timeout_seconds=13,
+        remote_command_timeout_seconds=31,
+        scheduler_accounting_timeout_seconds=91,
+    )
+    registry = ResourceRegistry(repositories={}, clusters={"powerslurm": cluster})
+    observed: dict[str, object] = {}
+
+    def fake_queue(**kwargs: object) -> list:
+        observed.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli, "get_queue", fake_queue)
+
+    assert cli.show_queue(registry) == 0
+
+    assert observed == {
+        "ssh_host": "powerslurm-bmdguest",
+        "partition": "leeburton-pool",
+        "timeout": 31,
+        "ssh_connect_timeout": 13,
+    }
+    assert "No jobs in leeburton-pool." in capsys.readouterr().out

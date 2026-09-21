@@ -13,6 +13,7 @@ from bmd_agent.config import (
     SlurmClusterResource,
     load_resources,
 )
+from bmd_agent.deployment import DeploymentContext, resolve_deployment_context
 from bmd_agent.resources.bmdex import (
     BmdexDomainContextEnrichment,
     bmdex_repository,
@@ -132,7 +133,32 @@ def show_status(registry: ResourceRegistry | None = None) -> int:
     for repository in registry.repositories.values():
         show_repository(inspect_repository(repository))
 
+    for cluster in registry.clusters.values():
+        show_deployment_context(
+            resolve_deployment_context(registry, cluster_key=cluster.key)
+        )
+
     return 0
+
+
+def show_deployment_context(context: DeploymentContext) -> None:
+    """Display configured acquisition context without presenting it as live evidence."""
+
+    cluster = context.cluster
+    if cluster is None:
+        return
+
+    print("Deployment context:")
+    print(f"  acquisition resource: {cluster.name} ({cluster.key})")
+    print(f"  SSH alias: {cluster.ssh_host}")
+    if context.profile is None:
+        print("  profile: unknown/generic")
+    else:
+        profile = context.profile
+        print(f"  profile: {profile.deployment_id} ({profile.name})")
+        print(f"  profile schema: {profile.schema} v{profile.schema_version}")
+        print(f"  expected scheduler: {profile.expected.scheduler}")
+    print()
 
 
 def show_queue(registry: ResourceRegistry | None = None) -> int:
@@ -149,6 +175,8 @@ def show_queue(registry: ResourceRegistry | None = None) -> int:
         jobs = get_queue(
             ssh_host=cluster.ssh_host,
             partition=cluster.partition,
+            timeout=cluster.remote_command_timeout_seconds,
+            ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
         )
 
     except subprocess.TimeoutExpired:
@@ -214,6 +242,8 @@ def show_current_directory(
             scheduler_lookup = lambda job_id: get_job_accounting(
                 cluster.ssh_host,
                 job_id,
+                timeout=cluster.scheduler_accounting_timeout_seconds,
+                ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
             )
 
     analysis = analyze_calculation_directory(

@@ -5,6 +5,9 @@ import pytest
 
 from bmd_agent.config import (
     CONFIG_ENV_VAR,
+    DEFAULT_REMOTE_COMMAND_TIMEOUT_SECONDS,
+    DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
     ConfigurationError,
     load_resources,
     parse_resources,
@@ -75,6 +78,39 @@ def test_parse_resources_returns_typed_resources() -> None:
     assert registry.clusters["powerslurm"].allowed_remote_roots == (
         PurePosixPath("/home/example/calculations"),
     )
+    assert registry.clusters["powerslurm"].deployment_profile is None
+    assert (
+        registry.clusters["powerslurm"].ssh_connect_timeout_seconds
+        == DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS
+    )
+    assert (
+        registry.clusters["powerslurm"].remote_command_timeout_seconds
+        == DEFAULT_REMOTE_COMMAND_TIMEOUT_SECONDS
+    )
+    assert (
+        registry.clusters["powerslurm"].scheduler_accounting_timeout_seconds
+        == DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS
+    )
+
+
+def test_parse_resources_preserves_profile_and_operational_timeouts() -> None:
+    config = valid_config()
+    cluster = config["clusters"]["powerslurm"]
+    cluster.update(
+        {
+            "deployment_profile": "power",
+            "ssh_connect_timeout_seconds": 12,
+            "remote_command_timeout_seconds": 30,
+            "scheduler_accounting_timeout_seconds": 90,
+        }
+    )
+
+    parsed = parse_resources(config).clusters["powerslurm"]
+
+    assert parsed.deployment_profile == "power"
+    assert parsed.ssh_connect_timeout_seconds == 12
+    assert parsed.remote_command_timeout_seconds == 30
+    assert parsed.scheduler_accounting_timeout_seconds == 90
 
 
 def test_parse_resources_rejects_mutating_repository_access() -> None:
@@ -98,6 +134,30 @@ def test_parse_resources_requires_allowed_remote_roots() -> None:
     config["clusters"]["powerslurm"]["allowed_remote_roots"] = []
 
     with pytest.raises(ConfigurationError, match="must not be empty"):
+        parse_resources(config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "ssh_connect_timeout_seconds",
+        "remote_command_timeout_seconds",
+        "scheduler_accounting_timeout_seconds",
+    ),
+)
+def test_parse_resources_rejects_nonpositive_operational_timeouts(field: str) -> None:
+    config = valid_config()
+    config["clusters"]["powerslurm"][field] = 0
+
+    with pytest.raises(ConfigurationError, match="positive integer"):
+        parse_resources(config)
+
+
+def test_parse_resources_rejects_unsafe_deployment_profile_id() -> None:
+    config = valid_config()
+    config["clusters"]["powerslurm"]["deployment_profile"] = "power;id"
+
+    with pytest.raises(ConfigurationError, match="deployment_profile is invalid"):
         parse_resources(config)
 
 

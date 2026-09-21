@@ -20,7 +20,6 @@ from bmd_agent.resources.oom import (
     serialize_oom_evidence,
 )
 from bmd_agent.resources.slurm import (
-    DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
     SlurmAccountingRecord,
     get_job_accounting,
     normalize_job_id,
@@ -544,10 +543,13 @@ def inspect_remote_run(
     scientific_parser: ScientificParser | None = None,
     derive_scientific: bool = True,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
-    timeout: float = 20,
-    scheduler_timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    timeout: float | None = None,
+    scheduler_timeout: float | None = None,
 ) -> RunInspection:
     """Inspect a BMD Compute run through configured read-only resources."""
+
+    timeout = _remote_command_timeout(cluster, timeout)
+    scheduler_timeout = _scheduler_accounting_timeout(cluster, scheduler_timeout)
 
     submission_path = build_remote_file_path(
         flow_root,
@@ -629,6 +631,7 @@ def inspect_remote_run(
         job_id,
         runner=slurm_runner,
         timeout=scheduler_timeout,
+        ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
     )
     runtime = _parse_runtime_logs(
         cluster.ssh_host,
@@ -701,8 +704,8 @@ def compare_remote_runs(
     slurm_runner: SlurmRunner = subprocess.run,
     scientific_parser: ScientificParser | None = None,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
-    timeout: float = 20,
-    scheduler_timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    timeout: float | None = None,
+    scheduler_timeout: float | None = None,
 ) -> RunComparison:
     """Inspect and compare multiple remote runs through the read-only boundary."""
 
@@ -733,11 +736,14 @@ def diagnose_remote_run(
     remote_runner: RemoteRunner = subprocess.run,
     slurm_runner: SlurmRunner = subprocess.run,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
-    timeout: float = 20,
-    scheduler_timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    timeout: float | None = None,
+    scheduler_timeout: float | None = None,
     max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
 ) -> RunDiagnosis:
     """Describe termination and convergence trajectory evidence for one run."""
+
+    timeout = _remote_command_timeout(cluster, timeout)
+    scheduler_timeout = _scheduler_accounting_timeout(cluster, scheduler_timeout)
 
     inspection = inspect_remote_run(
         cluster,
@@ -773,18 +779,21 @@ def inspect_slurm_job(
     slurm_runner: SlurmRunner = subprocess.run,
     scientific_parser: ScientificParser | None = None,
     modifier_policies: Iterable[Mapping[str, Any]] = (),
-    timeout: float = 20,
-    scheduler_timeout: float = DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
+    timeout: float | None = None,
+    scheduler_timeout: float | None = None,
     max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
 ) -> JobInspection:
     """Inspect one scheduler job and supported calculation evidence read-only."""
 
+    timeout = _remote_command_timeout(cluster, timeout)
+    scheduler_timeout = _scheduler_accounting_timeout(cluster, scheduler_timeout)
     normalized_job_id = normalize_job_id(job_id)
     scheduler, scheduler_error = _inspect_scheduler(
         cluster.ssh_host,
         normalized_job_id,
         runner=slurm_runner,
         timeout=scheduler_timeout,
+        ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
     )
     if scheduler is None:
         return JobInspection(
@@ -3946,6 +3955,7 @@ def _inspect_scheduler(
     *,
     runner: SlurmRunner,
     timeout: float,
+    ssh_connect_timeout: int,
 ) -> tuple[SlurmAccountingRecord | None, str | None]:
     if job_id is None:
         return None, "No valid SLURM job ID was found in inspected producer artifacts."
@@ -3955,9 +3965,24 @@ def _inspect_scheduler(
             job_id,
             runner=runner,
             timeout=timeout,
+            ssh_connect_timeout=ssh_connect_timeout,
         ), None
     except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         return None, str(exc)
+
+
+def _remote_command_timeout(
+    cluster: SlurmClusterResource,
+    timeout: float | None,
+) -> float:
+    return cluster.remote_command_timeout_seconds if timeout is None else timeout
+
+
+def _scheduler_accounting_timeout(
+    cluster: SlurmClusterResource,
+    timeout: float | None,
+) -> float:
+    return cluster.scheduler_accounting_timeout_seconds if timeout is None else timeout
 
 
 def _parse_runtime_logs(
