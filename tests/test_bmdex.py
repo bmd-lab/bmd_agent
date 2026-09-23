@@ -22,6 +22,7 @@ from bmd_agent.resources.bmdex import (
     EnrichedScientificContext,
     bmdex_repository,
     build_bmdex_domain_query,
+    build_bmdex_domain_query_for_job,
     enrich_lifecycle_with_bmdex_domain_context,
     enrich_scientific_context_with_bmdex,
     inspect_bmdex_domain_context,
@@ -48,8 +49,11 @@ from bmd_agent.resources.lifecycle import (
     LocalStageBinding,
 )
 from bmd_agent.resources.run import (
+    DirectVaspInspection,
     ElectronicIterationObservation,
+    IncarObservation,
     JobInspection,
+    ScientificResult,
     StageTrajectoryObservation,
 )
 
@@ -174,6 +178,51 @@ def domain_analysis(*, hybrid: bool = True) -> LifecycleAnalysis:
     )
 
 
+def domain_job_inspection() -> JobInspection:
+    trajectory = StageTrajectoryObservation(
+        stage_index=1,
+        stage_label="work_dir",
+        stage_type="direct_vasp",
+        theory="unknown",
+        directory="/remote/calculation",
+        completed_ionic_steps=0,
+        incomplete_electronic_iteration_count=4,
+        recent_incomplete_electronic_iterations=tuple(
+            ElectronicIterationObservation(iteration=index, algorithm="DAV")
+            for index in range(1, 5)
+        ),
+    )
+    direct = DirectVaspInspection(
+        directory="/remote/calculation",
+        artifacts=(),
+        executed_inputs=(
+            IncarObservation(
+                label="work_dir",
+                path="/remote/calculation/INCAR",
+                present=True,
+                stage_index=1,
+                values={
+                    "LHFCALC": True,
+                    "HFSCREEN": 0.2,
+                    "ALGO": "Damped",
+                    "LSORBIT": True,
+                },
+            ),
+        ),
+        scientific=ScientificResult(source_paths=()),
+        trajectory=trajectory,
+        assessments=(),
+    )
+    return JobInspection(
+        job_id="21906221",
+        scheduler=None,
+        scheduler_error=None,
+        scheduler_work_dir="/generic/launcher",
+        calculation_directory="/remote/calculation",
+        calculation_type="direct VASP",
+        calculation_reason=None,
+        direct_vasp=direct,
+    )
 def domain_payload(query: dict, *, include_record: bool = True) -> dict:
     records = []
     if include_record:
@@ -773,6 +822,28 @@ def test_domain_query_uses_only_observed_hybrid_input_and_trajectory_context() -
 
 def test_unrelated_semilocal_context_does_not_query_bmdex() -> None:
     assert build_bmdex_domain_query(domain_analysis(hybrid=False)) is None
+
+
+def test_job_domain_query_reuses_remote_executed_input_and_trajectory_evidence() -> None:
+    query = build_bmdex_domain_query_for_job(domain_job_inspection())
+
+    assert query == {
+        "code": "VASP",
+        "calculation_family": "hybrid_functional",
+        "topic": "electronic_iteration_behavior",
+        "electronic_algorithm": "Damped",
+        "observed_patterns": [
+            "incomplete_first_electronic_cycle",
+            "initial_DAV_iterations_observed",
+            "4_initial_DAV_iterations_observed",
+        ],
+        "input_tags": {
+            "LHFCALC": True,
+            "HFSCREEN": 0.2,
+            "ALGO": "Damped",
+            "LSORBIT": True,
+        },
+    }
 
 
 def test_domain_context_invokes_fixed_external_producer_and_preserves_contract(

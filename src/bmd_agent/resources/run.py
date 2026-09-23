@@ -13,6 +13,7 @@ import warnings
 from typing import Any
 
 from bmd_agent.config import SlurmClusterResource
+from bmd_agent.deployment import DeploymentContext
 from bmd_agent.resources.custodian import (
     CustodianInterventionEvidence,
     CustodianPolicyEvidence,
@@ -26,6 +27,11 @@ from bmd_agent.resources.oom import (
     assess_oom_evidence,
     oom_candidate_lines,
     serialize_oom_evidence,
+)
+from bmd_agent.resources.job_resolution import (
+    RESOLVED,
+    JobRunResolution,
+    resolve_bmd_compute_job,
 )
 from bmd_agent.resources.slurm import (
     SlurmAccountingRecord,
@@ -498,6 +504,7 @@ class JobInspection:
     bmd_compute: RunDiagnosis | None = None
     direct_vasp: DirectVaspInspection | None = None
     oom: OomDiagnosticEvidence | None = None
+    run_resolution: JobRunResolution | None = None
 
 
 @dataclass(frozen=True)
@@ -566,6 +573,11 @@ def inspect_remote_run(
     modifier_policies: Iterable[Mapping[str, Any]] = (),
     timeout: float | None = None,
     scheduler_timeout: float | None = None,
+    scheduler_observation: tuple[SlurmAccountingRecord | None, str | None] | None = None,
+    expected_job_id: str | None = None,
+    submission_payload: Mapping[str, Any] | None = None,
+    attempt_payload: Mapping[str, Any] | None = None,
+    attempt_checked: bool = False,
 ) -> RunInspection:
     """Inspect a BMD Compute run through configured read-only resources."""
 
@@ -577,11 +589,15 @@ def inspect_remote_run(
         SUBMISSION_FILENAME,
         allowed_roots=cluster.allowed_remote_roots,
     )
-    submission = _read_json_file(
-        cluster.ssh_host,
-        submission_path,
-        runner=remote_runner,
-        timeout=timeout,
+    submission = (
+        dict(submission_payload)
+        if submission_payload is not None
+        else _read_json_file(
+            cluster.ssh_host,
+            submission_path,
+            runner=remote_runner,
+            timeout=timeout,
+        )
     )
     producer = _parse_submission(submission, allowed_roots=cluster.allowed_remote_roots)
 
@@ -649,20 +665,40 @@ def inspect_remote_run(
         timeout=timeout,
     )
 
-    attempt_state, attempt_payload = _read_attempt_state(
-        cluster.ssh_host,
-        producer["attempt_state_path"],
-        runner=remote_runner,
-        timeout=timeout,
-    )
-    job_id = _find_job_id(submission, attempt_payload)
-    scheduler, scheduler_error = _inspect_scheduler(
-        cluster.ssh_host,
-        job_id,
-        runner=slurm_runner,
-        timeout=scheduler_timeout,
-        ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
-    )
+    if attempt_checked:
+        attempt_state = AttemptStateObservation(
+            path=(
+                str(producer["attempt_state_path"])
+                if producer["attempt_state_path"] is not None
+                else None
+            ),
+            present=attempt_payload is not None,
+        )
+    else:
+        attempt_state, attempt_payload = _read_attempt_state(
+            cluster.ssh_host,
+            producer["attempt_state_path"],
+            runner=remote_runner,
+            timeout=timeout,
+        )
+    producer_job_id = _find_job_id(submission, attempt_payload)
+    if expected_job_id is not None:
+        expected_job_id = normalize_job_id(expected_job_id)
+        if producer_job_id is not None and producer_job_id != expected_job_id:
+            raise RunInspectionError(
+                "resolved scheduler job ID conflicts with submission provenance"
+            )
+    job_id = producer_job_id or expected_job_id
+    if scheduler_observation is None:
+        scheduler, scheduler_error = _inspect_scheduler(
+            cluster.ssh_host,
+            job_id,
+            runner=slurm_runner,
+            timeout=scheduler_timeout,
+            ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
+        )
+    else:
+        scheduler, scheduler_error = scheduler_observation
     runtime = _parse_runtime_logs(
         cluster.ssh_host,
         log_paths,
@@ -771,6 +807,13 @@ def diagnose_remote_run(
     timeout: float | None = None,
     scheduler_timeout: float | None = None,
     max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
+    scheduler_observation: tuple[SlurmAccountingRecord | None, str | None] | None = None,
+    expected_job_id: str | None = None,
+    derive_scientific: bool = False,
+    scientific_parser: ScientificParser | None = None,
+    submission_payload: Mapping[str, Any] | None = None,
+    attempt_payload: Mapping[str, Any] | None = None,
+    attempt_checked: bool = False,
 ) -> RunDiagnosis:
     """Describe termination and convergence trajectory evidence for one run."""
 
@@ -782,10 +825,16 @@ def diagnose_remote_run(
         flow_root,
         remote_runner=remote_runner,
         slurm_runner=slurm_runner,
-        derive_scientific=False,
+        derive_scientific=derive_scientific,
+        scientific_parser=scientific_parser,
         modifier_policies=modifier_policies,
         timeout=timeout,
         scheduler_timeout=scheduler_timeout,
+        scheduler_observation=scheduler_observation,
+        expected_job_id=expected_job_id,
+        submission_payload=submission_payload,
+        attempt_payload=attempt_payload,
+        attempt_checked=attempt_checked,
     )
     trajectories = _observe_stage_trajectories(
         cluster.ssh_host,
@@ -814,6 +863,7 @@ def inspect_slurm_job(
     timeout: float | None = None,
     scheduler_timeout: float | None = None,
     max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
+    deployment: DeploymentContext | None = None,
 ) -> JobInspection:
     """Inspect one scheduler job and supported calculation evidence read-only."""
 
@@ -827,6 +877,59 @@ def inspect_slurm_job(
         timeout=scheduler_timeout,
         ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
     )
+    resolution = resolve_bmd_compute_job(
+        cluster,
+        deployment,
+        normalized_job_id,
+        runner=remote_runner,
+        timeout=timeout,
+    )
+    if resolution.resolution_status == RESOLVED and resolution.run_directory is not None:
+        try:
+            diagnosis = diagnose_remote_run(
+                cluster,
+                resolution.run_directory,
+                remote_runner=remote_runner,
+                slurm_runner=slurm_runner,
+                modifier_policies=modifier_policies,
+                timeout=timeout,
+                scheduler_timeout=scheduler_timeout,
+                max_vasprun_bytes=max_vasprun_bytes,
+                scheduler_observation=(scheduler, scheduler_error),
+                expected_job_id=normalized_job_id,
+                derive_scientific=True,
+                scientific_parser=scientific_parser,
+                submission_payload=resolution._submission_payload,
+                attempt_payload=resolution._attempt_payload,
+                attempt_checked=resolution._attempt_checked,
+            )
+        except (RunInspectionError, RemotePathError, subprocess.SubprocessError) as exc:
+            return JobInspection(
+                job_id=normalized_job_id,
+                scheduler=scheduler,
+                scheduler_error=scheduler_error,
+                scheduler_work_dir=getattr(scheduler, "work_dir", None),
+                calculation_directory=resolution.run_directory,
+                calculation_type="BMD Compute",
+                calculation_reason=f"resolved BMD Compute run could not be analyzed: {exc}",
+                oom=assess_oom_evidence(
+                    scheduler,
+                    source_limitations=(str(exc),),
+                ),
+                run_resolution=resolution,
+            )
+        return JobInspection(
+            job_id=normalized_job_id,
+            scheduler=scheduler,
+            scheduler_error=scheduler_error,
+            scheduler_work_dir=getattr(scheduler, "work_dir", None),
+            calculation_directory=resolution.run_directory,
+            calculation_type="BMD Compute",
+            calculation_reason=None,
+            bmd_compute=diagnosis,
+            oom=diagnosis.inspection.oom,
+            run_resolution=resolution,
+        )
     if scheduler is None:
         return JobInspection(
             job_id=normalized_job_id,
@@ -840,6 +943,7 @@ def inspect_slurm_job(
                 None,
                 source_limitations=(scheduler_error or "scheduler accounting was unavailable",),
             ),
+            run_resolution=resolution,
         )
 
     scheduler_only_oom = assess_oom_evidence(scheduler)
@@ -855,6 +959,7 @@ def inspect_slurm_job(
             calculation_type="unknown",
             calculation_reason="scheduler WorkDir was unavailable",
             oom=scheduler_only_oom,
+            run_resolution=resolution,
         )
 
     try:
@@ -872,6 +977,7 @@ def inspect_slurm_job(
             calculation_type="unknown",
             calculation_reason=f"scheduler WorkDir is not authorized: {exc}",
             oom=scheduler_only_oom,
+            run_resolution=resolution,
         )
 
     if not remote_directory_exists(
@@ -889,6 +995,7 @@ def inspect_slurm_job(
             calculation_type="unknown",
             calculation_reason="scheduler WorkDir is authorized but is not a readable directory",
             oom=scheduler_only_oom,
+            run_resolution=resolution,
         )
 
     submission_path = build_remote_file_path(
@@ -912,6 +1019,8 @@ def inspect_slurm_job(
                 timeout=timeout,
                 scheduler_timeout=scheduler_timeout,
                 max_vasprun_bytes=max_vasprun_bytes,
+                scheduler_observation=(scheduler, scheduler_error),
+                expected_job_id=normalized_job_id,
             )
         except (RunInspectionError, RemotePathError, subprocess.SubprocessError) as exc:
             producer_reason = (
@@ -944,6 +1053,7 @@ def inspect_slurm_job(
                         remote_runner=remote_runner,
                         timeout=timeout,
                     ),
+                    run_resolution=resolution,
                 )
             return JobInspection(
                 job_id=normalized_job_id,
@@ -960,6 +1070,7 @@ def inspect_slurm_job(
                     remote_runner=remote_runner,
                     timeout=timeout,
                 ),
+                run_resolution=resolution,
             )
         return JobInspection(
             job_id=normalized_job_id,
@@ -971,6 +1082,7 @@ def inspect_slurm_job(
             calculation_reason=None,
             bmd_compute=diagnosis,
             oom=diagnosis.inspection.oom,
+            run_resolution=resolution,
         )
 
     direct, reason = _inspect_direct_vasp_directory(
@@ -999,6 +1111,7 @@ def inspect_slurm_job(
                 remote_runner=remote_runner,
                 timeout=timeout,
             ),
+            run_resolution=resolution,
         )
 
     return JobInspection(
@@ -1016,6 +1129,7 @@ def inspect_slurm_job(
             remote_runner=remote_runner,
             timeout=timeout,
         ),
+        run_resolution=resolution,
     )
 
 
