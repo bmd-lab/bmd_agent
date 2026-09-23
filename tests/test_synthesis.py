@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 import subprocess
 
 from bmd_agent import cli
@@ -15,6 +16,13 @@ from bmd_agent.resources.context import (
     ScientificContext,
     ScientificIdentitySummary,
     build_scientific_context,
+)
+from bmd_agent.resources.custodian import (
+    CUSTODIAN_INTERVENTION_EVIDENCE,
+    TERMINATION_ASSESSMENT,
+    assess_termination_evidence,
+    parse_custodian_json,
+    parse_custodian_policy_provenance,
 )
 from bmd_agent.resources.run import (
     CONVERGENCE_PROGRESS_ASSESSMENT,
@@ -519,6 +527,97 @@ def test_builder_performs_no_remote_reads_subprocess_network_or_producer_calls(
     summary = build_scientific_evidence_summary(enriched_direct_context())
 
     assert summary.source_context.base.identity.job_id == "21153721"
+
+
+def test_custodian_intervention_policy_and_termination_keep_native_sources() -> None:
+    evidence = parse_custodian_json(
+        (Path(__file__).parent / "fixtures" / "custodian_frozen_repeated.json").read_text(
+            encoding="utf-8"
+        ),
+        source_path="/calculation/custodian.json",
+    )
+    termination = assess_termination_evidence(
+        scheduler_state="FAILED",
+        custodian_evidence=(evidence,),
+        log_messages=("SIGTERM received",),
+        error_archive_count=5,
+    )
+    job = bmd_compute_job()
+    diagnosis = job.bmd_compute
+    policy = parse_custodian_policy_provenance(
+        {
+            "provenance": {
+                "execution": {
+                    "custodian": {
+                        "stages": [
+                            {
+                                "index": 1,
+                                "policy_id": "bmd_compute.vasp",
+                                "policy_version": 1,
+                                "stage": {"stage_type": "relax", "theory": "pbe"},
+                                "handlers": [],
+                                "explicit_handler_exclusions": [
+                                    "custodian.vasp.handlers.FrozenJobErrorHandler"
+                                ],
+                                "vasp_error_exclusions": [],
+                                "validators": {
+                                    "source": "atomate2.vasp.run._DEFAULT_VALIDATORS",
+                                    "explicit_override": None,
+                                    "resolved": [],
+                                },
+                                "walltime_authority": "slurm",
+                                "walltime_handler": None,
+                                "custodian_version": "2025.12.14",
+                                "implementation_source": "producer.module",
+                                "rationale": "producer-owned rationale",
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    )
+    updated = replace(
+        job,
+        bmd_compute=replace(
+            diagnosis,
+            inspection=replace(
+                diagnosis.inspection,
+                custodian_evidence=(evidence,),
+                custodian_policy=policy,
+            ),
+            termination=replace(diagnosis.termination, assessment=termination),
+        ),
+    )
+
+    summary = build_scientific_evidence_summary(
+        EnrichedScientificContext(base=build_scientific_context(updated))
+    )
+
+    corrections = [
+        item for item in summary.items
+        if item.predicate == "correction_intervention"
+    ]
+    repeated = next(
+        item for item in summary.items
+        if item.predicate == "repeated_equivalent_intervention"
+    )
+    policy_item = next(
+        item for item in summary.items
+        if item.predicate == "custodian_execution_policy"
+    )
+    termination_item = next(
+        item for item in summary.items
+        if item.subject == "termination" and item.predicate == "classification"
+    )
+    assert len(corrections) == 5
+    assert corrections[0].source.source_evidence_type == CUSTODIAN_INTERVENTION_EVIDENCE
+    assert corrections[0].source.provenance["source_path"] == "/calculation/custodian.json"
+    assert repeated.value["count"] == 5
+    assert policy_item.source.source_evidence_type == "producer_provenance"
+    assert policy_item.value["walltime_authority"] == "slurm"
+    assert termination_item.source.source_evidence_type == TERMINATION_ASSESSMENT
+    assert termination_item.value == "custodian_triggered_process_termination"
 
 
 def test_no_cli_synthesis_surface_is_exposed(capsys) -> None:

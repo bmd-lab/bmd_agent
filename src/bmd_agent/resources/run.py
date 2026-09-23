@@ -13,6 +13,14 @@ import warnings
 from typing import Any
 
 from bmd_agent.config import SlurmClusterResource
+from bmd_agent.resources.custodian import (
+    CustodianInterventionEvidence,
+    CustodianPolicyEvidence,
+    TerminationEvidenceAssessment,
+    assess_termination_evidence,
+    parse_custodian_json,
+    parse_custodian_policy_provenance,
+)
 from bmd_agent.resources.oom import (
     OomDiagnosticEvidence,
     assess_oom_evidence,
@@ -96,6 +104,7 @@ _DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF")
 _OUTCAR_FORCE_EXTRACTION_SCHEMA = "bmd-agent-outcar-force-v1"
 _JOB_TRAJECTORY_JSON_SCHEMA_VERSION = 1
 _OOM_REMOTE_LOG_MAX_BYTES = 128_000
+_CUSTODIAN_REMOTE_MAX_BYTES = 2_000_000
 _OSZICAR_IONIC_DE_SEMANTICS = (
     "VASP OSZICAR ionic-line d E value parsed by pymatgen; "
     "not Agent-computed F_n - F_(n-1)"
@@ -111,6 +120,7 @@ _STARTING_JOB_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\)",
     re.IGNORECASE,
 )
+_TERMINATION_LOG_RE = re.compile(r"\b(SIGTERM|SIGKILL|terminated by custodian)\b", re.IGNORECASE)
 _OUTCAR_FORCE_HEADER_RE = re.compile(
     r"^\s*POSITION\s+TOTAL-FORCE\s+\(eV/Angst\)\s*$"
 )
@@ -158,6 +168,7 @@ class LogRuntimeObservation:
     environment: Mapping[str, str]
     stage_uuids: Mapping[str, str]
     oom_diagnostic_messages: tuple[tuple[str, str], ...] = ()
+    termination_diagnostic_messages: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -271,6 +282,13 @@ class RunInspection:
     executed_inputs: tuple[IncarObservation, ...] = ()
     input_expectations: tuple[InputExpectationObservation, ...] = ()
     oom: OomDiagnosticEvidence | None = None
+    custodian_policy: CustodianPolicyEvidence = field(
+        default_factory=lambda: CustodianPolicyEvidence(
+            available=False,
+            reason="submission has no persisted Custodian execution-policy provenance",
+        )
+    )
+    custodian_evidence: tuple[CustodianInterventionEvidence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -316,6 +334,7 @@ class TerminationObservation:
     vasp_completed_normally: bool | None = None
     custodian_events: tuple[str, ...] = ()
     unavailable: tuple[str, ...] = ()
+    assessment: TerminationEvidenceAssessment | None = None
 
 
 @dataclass(frozen=True)
@@ -463,6 +482,8 @@ class DirectVaspInspection:
     trajectory: StageTrajectoryObservation
     assessments: tuple[ConvergenceProgressAssessment, ...]
     producer_reason: str = "no BMD Compute producer record found"
+    custodian_evidence: tuple[CustodianInterventionEvidence, ...] = ()
+    termination_assessment: TerminationEvidenceAssessment | None = None
 
 
 @dataclass(frozen=True)
@@ -618,6 +639,15 @@ def inspect_remote_run(
         runner=remote_runner,
         timeout=timeout,
     )
+    custodian_evidence = _observe_remote_custodian_evidence(
+        cluster.ssh_host,
+        producer["stage_dirs"],
+        producer["result_dir"],
+        producer["workflow_stages"],
+        allowed_roots=cluster.allowed_remote_roots,
+        runner=remote_runner,
+        timeout=timeout,
+    )
 
     attempt_state, attempt_payload = _read_attempt_state(
         cluster.ssh_host,
@@ -693,6 +723,8 @@ def inspect_remote_run(
         executed_inputs=executed_inputs,
         input_expectations=input_expectations,
         oom=oom,
+        custodian_policy=producer["custodian_policy"],
+        custodian_evidence=custodian_evidence,
     )
 
 
@@ -895,6 +927,7 @@ def inspect_slurm_job(
                 timeout=timeout,
                 max_vasprun_bytes=max_vasprun_bytes,
                 producer_reason=producer_reason,
+                scheduler_state=scheduler.state,
             )
             if direct is None:
                 return JobInspection(
@@ -949,6 +982,7 @@ def inspect_slurm_job(
         timeout=timeout,
         max_vasprun_bytes=max_vasprun_bytes,
         producer_reason="no BMD Compute producer record found",
+        scheduler_state=scheduler.state,
     )
     if direct is None:
         return JobInspection(
@@ -2282,6 +2316,92 @@ def vasp_reported_parameter_observations(
     return tuple(observations)
 
 
+def _observe_remote_custodian_evidence(
+    ssh_host: str,
+    stage_dirs: Mapping[str, PurePosixPath],
+    result_dir: PurePosixPath,
+    workflow_stages: Sequence[WorkflowStage],
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> tuple[CustodianInterventionEvidence, ...]:
+    evidence: list[CustodianInterventionEvidence] = []
+    seen: set[PurePosixPath] = set()
+    for binding in _bound_stage_directories(stage_dirs, result_dir, workflow_stages):
+        path = build_remote_file_path(
+            binding.directory,
+            "custodian.json",
+            allowed_roots=allowed_roots,
+        )
+        if path in seen:
+            continue
+        seen.add(path)
+        if not remote_file_exists(ssh_host, path, runner=runner, timeout=timeout):
+            continue
+        try:
+            size = remote_file_size(ssh_host, path, runner=runner, timeout=timeout)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, OSError) as exc:
+            evidence.append(
+                CustodianInterventionEvidence(
+                    source_path=str(path),
+                    present=True,
+                    error=f"custodian.json size could not be checked: {type(exc).__name__}",
+                )
+            )
+            continue
+        if size > _CUSTODIAN_REMOTE_MAX_BYTES:
+            evidence.append(
+                CustodianInterventionEvidence(
+                    source_path=str(path),
+                    present=True,
+                    error=(
+                        "custodian.json exceeds diagnostic read limit "
+                        f"{_CUSTODIAN_REMOTE_MAX_BYTES} bytes"
+                    ),
+                )
+            )
+            continue
+        try:
+            contents = retrieve_remote_file(
+                ssh_host,
+                path,
+                runner=runner,
+                timeout=timeout,
+            ).decode("utf-8")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, UnicodeError, OSError) as exc:
+            evidence.append(
+                CustodianInterventionEvidence(
+                    source_path=str(path),
+                    present=True,
+                    error=f"custodian.json could not be read: {type(exc).__name__}",
+                )
+            )
+            continue
+        evidence.append(parse_custodian_json(contents, source_path=str(path)))
+    return tuple(evidence)
+
+
+def _observe_remote_custodian_evidence_for_direct_vasp(
+    ssh_host: str,
+    directory: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> tuple[CustodianInterventionEvidence, ...]:
+    stage = WorkflowStage(1, "direct_vasp", "unknown", (), None)
+    return _observe_remote_custodian_evidence(
+        ssh_host,
+        {},
+        directory,
+        (stage,),
+        allowed_roots=allowed_roots,
+        runner=runner,
+        timeout=timeout,
+    )
+
+
 def _termination_observation(inspection: RunInspection) -> TerminationObservation:
     unavailable: list[str] = []
     scheduler = inspection.scheduler
@@ -2294,7 +2414,17 @@ def _termination_observation(inspection: RunInspection) -> TerminationObservatio
             unavailable.append("scheduler timelimit was unavailable")
 
     unavailable.append("VASP normal-completion marker is unavailable in diagnose-run v1")
-    unavailable.append("No producer-declared custodian event artifact is inspected in diagnose-run v1")
+    if not inspection.custodian_evidence:
+        unavailable.append("custodian.json intervention evidence was unavailable")
+
+    assessment = assess_termination_evidence(
+        scheduler_state=scheduler.state if scheduler else None,
+        custodian_evidence=inspection.custodian_evidence,
+        log_messages=tuple(
+            message
+            for _, message in inspection.runtime.termination_diagnostic_messages
+        ),
+    )
 
     return TerminationObservation(
         scheduler_state=scheduler.state if scheduler else None,
@@ -2303,8 +2433,13 @@ def _termination_observation(inspection: RunInspection) -> TerminationObservatio
         scheduler_timelimit=scheduler.timelimit if scheduler else None,
         scheduler_reports_timeout=scheduler_timeout,
         vasp_completed_normally=None,
-        custodian_events=(),
+        custodian_events=tuple(
+            event
+            for evidence in inspection.custodian_evidence
+            for event in evidence.events
+        ),
         unavailable=tuple(unavailable),
+        assessment=assessment,
     )
 
 
@@ -2318,6 +2453,7 @@ def _inspect_direct_vasp_directory(
     timeout: float,
     max_vasprun_bytes: int,
     producer_reason: str,
+    scheduler_state: str | None,
 ) -> tuple[DirectVaspInspection | None, str | None]:
     artifacts = _observe_direct_vasp_artifacts(
         ssh_host,
@@ -2367,6 +2503,17 @@ def _inspect_direct_vasp_directory(
         max_vasprun_bytes=max_vasprun_bytes,
     )
     assessments = assess_convergence_progress((trajectory,))
+    custodian_evidence = _observe_remote_custodian_evidence_for_direct_vasp(
+        ssh_host,
+        directory,
+        allowed_roots=allowed_roots,
+        runner=remote_runner,
+        timeout=timeout,
+    )
+    termination_assessment = assess_termination_evidence(
+        scheduler_state=scheduler_state,
+        custodian_evidence=custodian_evidence,
+    )
     return (
         DirectVaspInspection(
             directory=str(directory),
@@ -2376,6 +2523,8 @@ def _inspect_direct_vasp_directory(
             trajectory=trajectory,
             assessments=assessments,
             producer_reason=producer_reason,
+            custodian_evidence=custodian_evidence,
+            termination_assessment=termination_assessment,
         ),
         None,
     )
@@ -3513,6 +3662,7 @@ def _parse_submission(
         "cluster_request": dict(_optional_mapping(submission, "cluster")),
         "resources_request": dict(_optional_mapping(submission, "resources")),
         "environment_policy": dict(_optional_mapping(submission, "environment")),
+        "custodian_policy": parse_custodian_policy_provenance(submission),
         "attempt_state_path": _attempt_state_path(
             submission,
             paths,
@@ -3997,6 +4147,7 @@ def _parse_runtime_logs(
     environment: dict[str, str] = {}
     stage_uuids: dict[str, str] = {}
     oom_messages: list[tuple[str, str]] = []
+    termination_messages: list[tuple[str, str]] = []
     python: str | None = None
 
     for observation in paths:
@@ -4016,6 +4167,10 @@ def _parse_runtime_logs(
         oom_messages.extend(
             (observation.path, message)
             for message in oom_candidate_lines(text)
+        )
+        termination_messages.extend(
+            (observation.path, message)
+            for message in _termination_candidate_lines(text)
         )
         for line in text.splitlines():
             python_match = _PYTHON_RE.match(line.strip())
@@ -4040,7 +4195,21 @@ def _parse_runtime_logs(
         environment=environment,
         stage_uuids=stage_uuids,
         oom_diagnostic_messages=tuple(oom_messages),
+        termination_diagnostic_messages=tuple(termination_messages),
     )
+
+
+def _termination_candidate_lines(text: str, *, limit: int = 8) -> tuple[str, ...]:
+    messages: list[str] = []
+    for line in text.splitlines():
+        compact = " ".join(line.strip().split())
+        if not compact or not _TERMINATION_LOG_RE.search(compact):
+            continue
+        if compact not in messages:
+            messages.append(compact[:500])
+        if len(messages) >= limit:
+            break
+    return tuple(messages)
 
 
 def _assess_remote_oom_evidence(

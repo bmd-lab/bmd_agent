@@ -3872,3 +3872,82 @@ def test_cli_requested_executed_magmom_discrepancy_remains_visible(
     assert "expected present, 90 sites" in captured.out
     assert "discrepancy" in captured.out
     assert "retained_incar:stage_01: present, 90 sites, fingerprint" in captured.out
+
+
+def test_remote_custodian_acquisition_is_fixed_bounded_and_read_only() -> None:
+    fixture = (
+        Path(__file__).parent / "fixtures" / "custodian_frozen_repeated.json"
+    ).read_bytes()
+    commands: list[str] = []
+
+    def runner(command, **_kwargs):
+        remote_command = command[2]
+        commands.append(remote_command)
+        if remote_command.startswith("test -f "):
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        if remote_command.startswith("stat -c %s -- "):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=str(len(fixture)).encode("ascii"),
+                stderr=b"",
+            )
+        if remote_command.startswith("cat -- "):
+            return subprocess.CompletedProcess(command, 0, stdout=fixture, stderr=b"")
+        raise AssertionError(f"unexpected remote command: {remote_command}")
+
+    evidence = run_resource._observe_remote_custodian_evidence(
+        "bmd-vm",
+        {"stage_01": PurePosixPath("/bmd-db/guest/flows/run/stage_01")},
+        PurePosixPath("/bmd-db/guest/flows/run/stage_01"),
+        (WorkflowStage(1, "static", "hse06", ("soc",), None),),
+        allowed_roots=(PurePosixPath("/bmd-db/guest/flows"),),
+        runner=runner,
+        timeout=20,
+    )
+
+    assert len(evidence) == 1
+    assert len(evidence[0].corrections) == 5
+    assert len(commands) == 3
+    assert all("/bmd-db/guest/flows/run/stage_01/custodian.json" in item for item in commands)
+    assert not any("find " in item or "POTCAR" in item for item in commands)
+
+
+def test_remote_custodian_absence_does_not_become_an_intervention() -> None:
+    def runner(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+
+    evidence = run_resource._observe_remote_custodian_evidence(
+        "bmd-vm",
+        {},
+        PurePosixPath("/bmd-db/guest/flows/run"),
+        (WorkflowStage(1, "static", "pbe", (), None),),
+        allowed_roots=(PurePosixPath("/bmd-db/guest/flows"),),
+        runner=runner,
+        timeout=20,
+    )
+
+    assert evidence == ()
+
+
+def test_runtime_log_parsing_preserves_bounded_sigterm_termination_evidence() -> None:
+    path = "/bmd-db/guest/flows/run/std_err.txt"
+
+    def runner(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b"routine line\nSIGTERM received by VASP\n",
+            stderr=b"",
+        )
+
+    runtime = run_resource._parse_runtime_logs(
+        "bmd-vm",
+        (PathObservation("log_err", path, "file", True, LOG_OBSERVATION),),
+        runner=runner,
+        timeout=20,
+    )
+
+    assert runtime.termination_diagnostic_messages == (
+        (path, "SIGTERM received by VASP"),
+    )
