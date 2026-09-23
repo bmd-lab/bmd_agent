@@ -11,6 +11,14 @@ import re
 from typing import Any
 import warnings
 
+from bmd_agent.resources.custodian import (
+    CustodianInterventionEvidence,
+    CustodianPolicyEvidence,
+    TerminationEvidenceAssessment,
+    assess_termination_evidence,
+    parse_custodian_json,
+    parse_custodian_policy_provenance,
+)
 from bmd_agent.resources.oom import OomDiagnosticEvidence, assess_oom_evidence
 from bmd_agent.resources.run import (
     ConvergenceProgressAssessment,
@@ -82,6 +90,12 @@ class BmdWorkflowDiscovery:
     job_id: str | None = None
     attempt_state_path: Path | None = None
     attempt_state: Mapping[str, Any] | None = None
+    custodian_policy: CustodianPolicyEvidence = field(
+        default_factory=lambda: CustodianPolicyEvidence(
+            available=False,
+            reason="submission has no persisted Custodian execution-policy provenance",
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -167,22 +181,15 @@ class LocalLogDiagnostic:
 
 
 @dataclass(frozen=True)
-class LocalCustodianDiagnostic:
-    path: Path
-    present: bool
-    events: tuple[str, ...] = ()
-    error: str | None = None
-
-
-@dataclass(frozen=True)
 class LocalExecutionDiagnostics:
     trajectories: tuple[StageTrajectoryObservation, ...] = ()
     assessments: tuple[ConvergenceProgressAssessment, ...] = ()
     logs: tuple[LocalLogDiagnostic, ...] = ()
-    custodian: LocalCustodianDiagnostic | None = None
+    custodian: CustodianInterventionEvidence | None = None
     error_archives: tuple[LocalFileEvidence, ...] = ()
     suggested_checks: tuple[str, ...] = ()
     oom: OomDiagnosticEvidence | None = None
+    termination: TerminationEvidenceAssessment | None = None
 
 
 def analyze_calculation_directory(
@@ -269,6 +276,13 @@ def _analyze_bmd_workflow(
             structure=structure,
             incar_settings=incar_settings,
             scientific=scientific,
+            diagnostics=(
+                diagnostics
+                if diagnostics is not None
+                and diagnostics.custodian is not None
+                and bool(diagnostics.custodian.corrections)
+                else None
+            ),
             evidence_gaps=tuple(gaps),
         )
 
@@ -414,6 +428,13 @@ def _analyze_direct_vasp_directory(directory: Path) -> LifecycleAnalysis:
             structure=structure,
             incar_settings=incar_settings,
             scientific=scientific,
+            diagnostics=(
+                diagnostics
+                if diagnostics is not None
+                and diagnostics.custodian is not None
+                and bool(diagnostics.custodian.corrections)
+                else None
+            ),
             evidence_gaps=tuple(gaps),
         )
 
@@ -554,6 +575,7 @@ def _workflow_from_submission(
         job_id=_find_job_id(submission, attempt_state),
         attempt_state_path=attempt_state_path,
         attempt_state=attempt_state,
+        custodian_policy=parse_custodian_policy_provenance(submission),
     )
 
 
@@ -775,6 +797,12 @@ def _local_execution_diagnostics(
             log_observations=log_observations,
             inspected_log_sources=inspected_log_sources,
             source_limitations=source_limitations,
+        ),
+        termination=assess_termination_evidence(
+            scheduler_state=scheduler.state if scheduler else None,
+            custodian_evidence=(custodian,) if custodian is not None else (),
+            log_messages=tuple(message for _, message in log_observations),
+            error_archive_count=len(archives),
         ),
     )
 
@@ -1154,7 +1182,9 @@ def _diagnostic_log_messages(text: str) -> tuple[str, ...]:
     return tuple(messages)
 
 
-def _observe_local_custodian(directories: Sequence[Path]) -> LocalCustodianDiagnostic | None:
+def _observe_local_custodian(
+    directories: Sequence[Path],
+) -> CustodianInterventionEvidence | None:
     for directory in directories:
         path = directory / "custodian.json"
         if not path.exists():
@@ -1163,66 +1193,26 @@ def _observe_local_custodian(directories: Sequence[Path]) -> LocalCustodianDiagn
             continue
         try:
             if path.stat().st_size > _LOCAL_CUSTODIAN_MAX_BYTES:
-                return LocalCustodianDiagnostic(
-                    path=path,
+                return CustodianInterventionEvidence(
+                    source_path=str(path),
                     present=True,
                     error=(
                         f"custodian.json exceeds diagnostic read limit "
                         f"{_LOCAL_CUSTODIAN_MAX_BYTES} bytes"
                     ),
                 )
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return LocalCustodianDiagnostic(path=path, present=True, error=str(exc))
-        return LocalCustodianDiagnostic(
-            path=path,
-            present=True,
-            events=_custodian_event_summaries(payload),
+            contents = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            return CustodianInterventionEvidence(
+                source_path=str(path),
+                present=True,
+                error=f"custodian.json could not be read: {type(exc).__name__}",
+            )
+        return parse_custodian_json(
+            contents,
+            source_path=str(path),
         )
     return None
-
-
-def _custodian_event_summaries(payload: Any) -> tuple[str, ...]:
-    events: list[str] = []
-    attempts = payload if isinstance(payload, list) else payload.get("jobs", ()) if isinstance(payload, Mapping) else ()
-    if isinstance(attempts, Sequence) and not isinstance(attempts, (str, bytes)):
-        events.append(f"custodian records: {len(attempts)} top-level attempt(s)")
-    _collect_custodian_events(payload, events, depth=0)
-    deduped: list[str] = []
-    for event in events:
-        if event not in deduped:
-            deduped.append(event)
-        if len(deduped) >= 12:
-            break
-    return tuple(deduped)
-
-
-def _collect_custodian_events(payload: Any, events: list[str], *, depth: int) -> None:
-    if depth > 4 or len(events) >= 16:
-        return
-    if isinstance(payload, Mapping):
-        for key in ("handler", "handler_name", "validator", "validator_name"):
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                events.append(f"{key}: {value}")
-        for key in ("errors", "actions", "corrections"):
-            value = payload.get(key)
-            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-                events.append(f"{key}: {len(value)} item(s)")
-                for item in value[:3]:
-                    _collect_custodian_events(item, events, depth=depth + 1)
-            elif isinstance(value, str) and value:
-                events.append(f"{key}: {value[:160]}")
-        for key in ("error", "exception", "message"):
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                events.append(f"{key}: {' '.join(value.split())[:200]}")
-        for value in payload.values():
-            if isinstance(value, (Mapping, list, tuple)):
-                _collect_custodian_events(value, events, depth=depth + 1)
-    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
-        for item in payload[:8]:
-            _collect_custodian_events(item, events, depth=depth + 1)
 
 
 def _observe_error_archives(directories: Sequence[Path]) -> tuple[LocalFileEvidence, ...]:
@@ -1243,7 +1233,7 @@ def _observe_error_archives(directories: Sequence[Path]) -> tuple[LocalFileEvide
 def _suggested_diagnostic_checks(
     trajectories: Sequence[StageTrajectoryObservation],
     logs: Sequence[LocalLogDiagnostic],
-    custodian: LocalCustodianDiagnostic | None,
+    custodian: CustodianInterventionEvidence | None,
     archives: Sequence[LocalFileEvidence],
 ) -> tuple[str, ...]:
     suggestions: list[str] = []

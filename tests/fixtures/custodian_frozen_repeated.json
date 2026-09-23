@@ -1,0 +1,76 @@
+[
+  {
+    "job": {
+      "@module": "custodian.vasp.jobs",
+      "@class": "VaspJob"
+    },
+    "corrections": [
+      {
+        "errors": ["Frozen job"],
+        "actions": [
+          {"dict": "INCAR", "action": {"_set": {"SYMPREC": 1e-8}}}
+        ],
+        "handler": {
+          "@module": "custodian.vasp.handlers",
+          "@class": "FrozenJobErrorHandler",
+          "timeout": 21600,
+          "output_filename": "vasp.out"
+        }
+      },
+      {
+        "errors": ["Frozen job"],
+        "actions": [
+          {"dict": "INCAR", "action": {"_set": {"SYMPREC": 1e-8}}}
+        ],
+        "handler": {
+          "@module": "custodian.vasp.handlers",
+          "@class": "FrozenJobErrorHandler",
+          "timeout": 21600,
+          "output_filename": "vasp.out"
+        }
+      },
+      {
+        "errors": ["Frozen job"],
+        "actions": [
+          {"dict": "INCAR", "action": {"_set": {"SYMPREC": 1e-8}}}
+        ],
+        "handler": {
+          "@module": "custodian.vasp.handlers",
+          "@class": "FrozenJobErrorHandler",
+          "timeout": 21600,
+          "output_filename": "vasp.out"
+        }
+      },
+      {
+        "errors": ["Frozen job"],
+        "actions": [
+          {"dict": "INCAR", "action": {"_set": {"SYMPREC": 1e-8}}}
+        ],
+        "handler": {
+          "@module": "custodian.vasp.handlers",
+          "@class": "FrozenJobErrorHandler",
+          "timeout": 21600,
+          "output_filename": "vasp.out"
+        }
+      },
+      {
+        "errors": ["Frozen job"],
+        "actions": [
+          {"dict": "INCAR", "action": {"_set": {"SYMPREC": 1e-8}}}
+        ],
+        "handler": {
+          "@module": "custodian.vasp.handlers",
+          "@class": "FrozenJobErrorHandler",
+          "timeout": 21600,
+          "output_filename": "vasp.out"
+        }
+      }
+    ],
+    "handler": null,
+    "validator": null,
+    "max_errors": false,
+    "max_errors_per_job": true,
+    "max_errors_per_handler": false,
+    "nonzero_return_code": false
+  }
+]

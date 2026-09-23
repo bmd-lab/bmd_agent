@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from bmd_agent.resources.custodian import CUSTODIAN_INTERVENTION_EVIDENCE
 from bmd_agent.resources.run import (
     AGENT_COMPARISON,
     ARTIFACT_OBSERVATION,
@@ -245,6 +246,15 @@ def _bmd_compute_gaps(gaps: list[EvidenceGap], diagnosis: RunDiagnosis) -> None:
             "producer git provenance unavailable",
             run.submission_path,
         )
+    if not run.custodian_policy.available:
+        _add_gap(
+            gaps,
+            PRODUCER_PROVENANCE,
+            "execution_policy.custodian",
+            run.custodian_policy.reason or "Custodian execution-policy provenance unavailable",
+            run.submission_path,
+        )
+    _custodian_gaps(gaps, run.custodian_evidence)
 
     if run.runtime and not run.runtime.sources:
         _add_gap(
@@ -279,6 +289,19 @@ def _direct_vasp_gaps(gaps: list[EvidenceGap], direct: DirectVaspInspection) -> 
     _scientific_gaps(gaps, direct.scientific)
     _trajectory_gaps(gaps, (direct.trajectory,))
     _assessment_gaps(gaps, direct.assessments)
+    _custodian_gaps(gaps, direct.custodian_evidence)
+
+
+def _custodian_gaps(gaps: list[EvidenceGap], evidence_items: Sequence[Any]) -> None:
+    for evidence in evidence_items:
+        if evidence.error:
+            _add_gap(
+                gaps,
+                CUSTODIAN_INTERVENTION_EVIDENCE,
+                "custodian_intervention_history",
+                evidence.error,
+                evidence.source_path,
+            )
 
 
 def _initial_structure_gap(gaps: list[EvidenceGap], run: RunInspection) -> None:

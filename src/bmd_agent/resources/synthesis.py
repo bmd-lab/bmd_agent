@@ -6,6 +6,10 @@ from typing import Any
 
 from bmd_agent.resources.bmdex import BmdexCompositionEvidence, EnrichedScientificContext
 from bmd_agent.resources.context import EvidenceGap
+from bmd_agent.resources.custodian import (
+    CUSTODIAN_INTERVENTION_EVIDENCE,
+    TERMINATION_ASSESSMENT,
+)
 from bmd_agent.resources.run import (
     ARTIFACT_OBSERVATION,
     CONVERGENCE_PROGRESS_ASSESSMENT,
@@ -88,6 +92,7 @@ def build_scientific_evidence_summary(
     _add_executed_input_items(items, context)
     _add_trajectory_items(items, context)
     _add_assessment_items(items, context)
+    _add_custodian_items(items, context)
     _add_bmdex_items(items, context)
     _add_context_gap_items(items, context)
     return ScientificEvidenceSummary(source_context=context, items=tuple(items))
@@ -491,6 +496,153 @@ def _add_assessment_items(
             )
 
 
+def _add_custodian_items(
+    items: list[ScientificEvidenceItem],
+    context: EnrichedScientificContext,
+) -> None:
+    job = context.base.job
+    run = job.bmd_compute.inspection if job.bmd_compute is not None else None
+    if run is not None and run.custodian_policy.available:
+        for index, stage in enumerate(run.custodian_policy.stages):
+            base_path = (
+                "source_context.base.job.bmd_compute.inspection."
+                f"custodian_policy.stages[{index}]"
+            )
+            _append(
+                items,
+                CATEGORY_OBSERVATION,
+                f"stage_{stage.stage_index}",
+                "custodian_execution_policy",
+                {
+                    "policy_id": stage.policy_id,
+                    "policy_version": stage.policy_version,
+                    "stage_type": stage.stage_type,
+                    "theory": stage.theory,
+                    "configured_handlers": tuple(
+                        {
+                            "class": component.class_name,
+                            "configuration": dict(component.configuration),
+                        }
+                        for component in stage.handlers
+                    ),
+                    "explicit_handler_exclusions": stage.explicit_handler_exclusions,
+                    "vasp_error_exclusions": stage.vasp_error_exclusions,
+                    "validators": tuple(
+                        {
+                            "class": component.class_name,
+                            "configuration": dict(component.configuration),
+                        }
+                        for component in stage.validators
+                    ),
+                    "validators_source": stage.validators_source,
+                    "validators_explicit_override": stage.validators_explicit_override,
+                    "walltime_authority": stage.walltime_authority,
+                    "walltime_handler": stage.walltime_handler,
+                    "custodian_version": stage.custodian_version,
+                    "implementation_source": stage.implementation_source,
+                    "rationale": stage.rationale,
+                },
+                source=EvidenceSourceRef(
+                    PRODUCER_PROVENANCE,
+                    f"stage_{stage.stage_index}.custodian_policy",
+                    base_path,
+                ),
+            )
+
+    evidence_items, base_path = _job_custodian_evidence(job)
+    for evidence_index, evidence in enumerate(evidence_items):
+        evidence_path = f"{base_path}[{evidence_index}]"
+        for correction_index, correction in enumerate(evidence.corrections):
+            correction_path = f"{evidence_path}.corrections[{correction_index}]"
+            _append(
+                items,
+                CATEGORY_OBSERVATION,
+                "Custodian",
+                "correction_intervention",
+                {
+                    "attempt_index": correction.attempt_index,
+                    "correction_index": correction.correction_index,
+                    "sequence_index": correction.sequence_index,
+                    "handler": correction.handler,
+                    "handler_configuration": dict(correction.handler_configuration),
+                    "errors": correction.errors,
+                    "actions": tuple(action.summary for action in correction.actions),
+                },
+                source=EvidenceSourceRef(
+                    CUSTODIAN_INTERVENTION_EVIDENCE,
+                    "Custodian correction history",
+                    correction_path,
+                    {"source_path": evidence.source_path},
+                ),
+            )
+        for repeated_index, repeated in enumerate(evidence.repeated_interventions):
+            _append(
+                items,
+                CATEGORY_DERIVED_OBSERVATION,
+                "Custodian",
+                "repeated_equivalent_intervention",
+                {
+                    "handler": repeated.handler,
+                    "count": repeated.count,
+                    "timeout_seconds": repeated.timeout_seconds,
+                    "errors": repeated.errors,
+                    "actions": repeated.action_summaries,
+                    "correction_positions": repeated.correction_positions,
+                },
+                source=EvidenceSourceRef(
+                    CUSTODIAN_INTERVENTION_EVIDENCE,
+                    "Custodian correction history",
+                    f"{evidence_path}.repeated_interventions[{repeated_index}]",
+                    {"source_path": evidence.source_path},
+                ),
+            )
+        for flag_index, flag in enumerate(evidence.terminal_flags):
+            _append(
+                items,
+                CATEGORY_OBSERVATION,
+                "Custodian",
+                f"terminal_flag.{flag.name}",
+                flag.value,
+                source=EvidenceSourceRef(
+                    CUSTODIAN_INTERVENTION_EVIDENCE,
+                    f"Custodian attempt {flag.attempt_index}",
+                    f"{evidence_path}.terminal_flags[{flag_index}]",
+                    {"interpretation": flag.interpretation},
+                ),
+            )
+        for limitation_index, limitation in enumerate(evidence.limitations):
+            _append(
+                items,
+                CATEGORY_LIMITATION,
+                "Custodian",
+                "intervention_evidence_limitation",
+                limitation,
+                source=EvidenceSourceRef(
+                    CUSTODIAN_INTERVENTION_EVIDENCE,
+                    "Custodian correction history",
+                    f"{evidence_path}.limitations[{limitation_index}]",
+                ),
+            )
+
+    termination, termination_path = _job_termination_assessment(job)
+    if termination is not None:
+        _append(
+            items,
+            CATEGORY_ASSESSMENT,
+            "termination",
+            "classification",
+            termination.classification,
+            status=termination.status,
+            source=EvidenceSourceRef(
+                TERMINATION_ASSESSMENT,
+                "process/job termination",
+                termination_path,
+                {"basis": termination.basis},
+            ),
+            limitations=termination.limitations,
+        )
+
+
 def _add_bmdex_items(
     items: list[ScientificEvidenceItem],
     context: EnrichedScientificContext,
@@ -775,6 +927,34 @@ def _job_assessments(
     if job.direct_vasp is not None:
         return job.direct_vasp.assessments
     return ()
+
+
+def _job_custodian_evidence(job: JobInspection) -> tuple[tuple[Any, ...], str]:
+    if job.bmd_compute is not None:
+        return (
+            job.bmd_compute.inspection.custodian_evidence,
+            "source_context.base.job.bmd_compute.inspection.custodian_evidence",
+        )
+    if job.direct_vasp is not None:
+        return (
+            job.direct_vasp.custodian_evidence,
+            "source_context.base.job.direct_vasp.custodian_evidence",
+        )
+    return (), "source_context.base.job"
+
+
+def _job_termination_assessment(job: JobInspection) -> tuple[Any | None, str]:
+    if job.bmd_compute is not None:
+        return (
+            job.bmd_compute.termination.assessment,
+            "source_context.base.job.bmd_compute.termination.assessment",
+        )
+    if job.direct_vasp is not None:
+        return (
+            job.direct_vasp.termination_assessment,
+            "source_context.base.job.direct_vasp.termination_assessment",
+        )
+    return None, "source_context.base.job"
 
 
 def _trajectory_native_path(job: JobInspection, index: int) -> str:

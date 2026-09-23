@@ -642,21 +642,45 @@ def _domain_context_assessment(
 ) -> BmdexContextualAssessment | None:
     if not evidence.records:
         return None
-    basis = tuple(
+    basis = [
         (
             "Observed VASP input and electronic-trajectory context are consistent with the "
             f"applicability of cited BMDex reference {record.record_id}: {record.title}."
         )
         for record in evidence.records
+    ]
+    termination = (
+        analysis.diagnostics.termination
+        if analysis.diagnostics is not None
+        else None
     )
+    custodian_supported = (
+        termination is not None
+        and termination.classification == "custodian_triggered_process_termination"
+        and termination.status == "supported"
+    )
+    if custodian_supported:
+        basis.append(
+            "Independently observed Custodian intervention and termination evidence supports "
+            "a qualified Custodian-triggered process-termination assessment; the cited BMDex "
+            "records remain contextual reference evidence rather than termination evidence."
+        )
     limitations = [
         "Contextual-reference applicability does not establish the cause of the calculation's termination.",
         "Contextual reference evidence does not establish a hang or a method incompatibility by itself.",
     ]
-    if _analysis_mentions_sigterm(analysis):
+    if custodian_supported:
+        limitations.extend(
+            (
+                "The combined evidence does not prove the interrupted VASP operation would eventually converge.",
+                "The combined evidence does not establish that every Custodian intervention was a false positive.",
+                "The combined evidence does not establish scientific success.",
+            )
+        )
+    elif _analysis_mentions_sigterm(analysis):
         limitations.append("The available evidence does not establish why SIGTERM was issued.")
     return BmdexContextualAssessment(
-        basis=basis,
+        basis=tuple(basis),
         limitations=tuple(limitations),
         source_record_ids=tuple(record.record_id for record in evidence.records),
     )

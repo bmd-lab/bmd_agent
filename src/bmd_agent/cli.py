@@ -300,6 +300,9 @@ def print_lifecycle_analysis(
         if workflow.job_id:
             print(f"  job id: {workflow.job_id}")
         print()
+        if analysis.diagnostics is not None:
+            _print_custodian_policy_context(workflow.custodian_policy)
+            print()
 
     if analysis.scheduler is not None:
         print("Scheduler observation:")
@@ -911,6 +914,11 @@ def print_job_inspection(inspection: JobInspection) -> None:
     print(f"  reason: {direct.producer_reason}")
     print()
 
+    if _has_relevant_custodian_evidence(direct.custodian_evidence):
+        _print_custodian_intervention_evidence(direct.custodian_evidence)
+        _print_termination_assessment(direct.termination_assessment)
+        print()
+
     print("Executed VASP inputs (executed_input):")
     _print_executed_input_observations(direct.executed_inputs, ())
     print()
@@ -979,6 +987,13 @@ def print_run_inspection(inspection: RunInspection) -> None:
     print(f"  git commit:  {_display_commit(inspection.producer_git.get('git_commit'))}")
     print(f"  git state:   {inspection.producer_git.get('state', 'unavailable')}")
     print()
+
+    _print_custodian_policy_context(inspection.custodian_policy)
+    print()
+
+    if _has_relevant_custodian_evidence(inspection.custodian_evidence):
+        _print_custodian_intervention_evidence(inspection.custodian_evidence)
+        print()
 
     print(f"Requested workflow ({PRODUCER_REQUESTED}):")
     for stage in inspection.workflow_stages:
@@ -1104,6 +1119,18 @@ def print_run_diagnosis(diagnosis: RunDiagnosis) -> None:
             print(f"     options: {options}")
     print()
 
+    if (
+        _has_relevant_custodian_evidence(inspection.custodian_evidence)
+        or inspection.scheduler is None
+        or inspection.scheduler.state.upper() != "COMPLETED"
+    ):
+        _print_custodian_policy_context(inspection.custodian_policy)
+        print()
+
+    if _has_relevant_custodian_evidence(inspection.custodian_evidence):
+        _print_custodian_intervention_evidence(inspection.custodian_evidence)
+        print()
+
     termination = diagnosis.termination
     print(f"Termination evidence ({termination.evidence_type}):")
     _print_optional_value("scheduler state", termination.scheduler_state)
@@ -1112,12 +1139,9 @@ def print_run_diagnosis(diagnosis: RunDiagnosis) -> None:
     _print_optional_value("time limit", termination.scheduler_timelimit)
     _print_optional_value("scheduler reports timeout", termination.scheduler_reports_timeout)
     _print_optional_value("VASP normal completion", termination.vasp_completed_normally)
-    if termination.custodian_events:
-        print("  custodian events:")
-        for event in termination.custodian_events:
-            print(f"    {event}")
     for item in termination.unavailable:
         print(f"  unavailable: {item}")
+    _print_termination_assessment(termination.assessment, indent="  ")
     print()
 
     _print_oom_evidence(inspection.oom)
@@ -1663,6 +1687,10 @@ def _local_stage_status(stage_evidence: object) -> str:
 
 def _print_lifecycle_diagnostic_evidence(diagnostics: object) -> None:
     print("Diagnostic evidence:")
+    custodian = getattr(diagnostics, "custodian", None)
+    if _has_relevant_custodian_evidence((custodian,) if custodian is not None else ()):
+        _print_custodian_intervention_evidence((custodian,), indent="  ")
+        _print_termination_assessment(getattr(diagnostics, "termination", None), indent="  ")
     logs = getattr(diagnostics, "logs", ())
     if logs:
         print("  bounded log excerpts:")
@@ -1675,17 +1703,6 @@ def _print_lifecycle_diagnostic_evidence(diagnostics: object) -> None:
                     print(f"      {message}")
             else:
                 print("      no fatal/error excerpt found in bounded read")
-    custodian = getattr(diagnostics, "custodian", None)
-    if custodian is not None:
-        print("  custodian:")
-        print(f"    path: {getattr(custodian, 'path', '')}")
-        if getattr(custodian, "error", None):
-            print(f"    unavailable: {getattr(custodian, 'error')}")
-        elif getattr(custodian, "events", ()):
-            for event in getattr(custodian, "events", ()):
-                print(f"    {event}")
-        else:
-            print("    present; no compact correction/error summary extracted")
     archives = getattr(diagnostics, "error_archives", ())
     if archives:
         print("  error archives:")
@@ -1694,6 +1711,172 @@ def _print_lifecycle_diagnostic_evidence(diagnostics: object) -> None:
         print("    not unpacked by BMD Agent")
     if not logs and custodian is None and not archives:
         print("  unavailable: no local diagnostic logs, custodian.json, or error archives were found")
+
+
+def _print_custodian_intervention_evidence(
+    evidence_items: Iterable[object],
+    *,
+    indent: str = "",
+) -> None:
+    print(f"{indent}Custodian intervention evidence:")
+    for evidence in evidence_items:
+        print(f"{indent}  source: {getattr(evidence, 'source_path', 'unavailable')}")
+        error = getattr(evidence, "error", None)
+        if error:
+            print(f"{indent}  unavailable: {error}")
+            continue
+        repeated = getattr(evidence, "repeated_interventions", ())
+        repeated_positions = {
+            position
+            for item in repeated
+            for position in getattr(item, "correction_positions", ())
+        }
+        for item in repeated:
+            print(f"{indent}  {_short_class_name(getattr(item, 'handler', 'unknown'))}:")
+            print(f"{indent}    interventions: {getattr(item, 'count', 0)}")
+            timeout = getattr(item, "timeout_seconds", None)
+            if timeout is not None:
+                hours = float(timeout) / 3600
+                print(f"{indent}    inactivity timeout: {timeout:g} s ({hours:g} h)")
+            for reported_error in getattr(item, "errors", ()):
+                print(f"{indent}    reported error: {reported_error}")
+            for action in getattr(item, "action_summaries", ()):
+                print(f"{indent}    repeated correction: {action}")
+        for correction in getattr(evidence, "corrections", ()):
+            position = (
+                getattr(correction, "attempt_index", 0),
+                getattr(correction, "correction_index", 0),
+            )
+            if position in repeated_positions:
+                continue
+            print(
+                f"{indent}  correction {getattr(correction, 'sequence_index', '?')}: "
+                f"{_short_class_name(getattr(correction, 'handler', 'unknown'))}"
+            )
+            timeout = getattr(correction, "timeout_seconds", None)
+            if timeout is not None:
+                print(f"{indent}    timeout: {timeout:g} s")
+            for reported_error in getattr(correction, "errors", ()):
+                print(f"{indent}    reported error: {reported_error}")
+            for action in getattr(correction, "actions", ()):
+                print(f"{indent}    correction: {getattr(action, 'summary', action)}")
+        for flag in getattr(evidence, "terminal_flags", ()):
+            if getattr(flag, "value", None) is True:
+                print(
+                    f"{indent}  terminal flag: {getattr(flag, 'name', 'unknown')}=true "
+                    f"({getattr(flag, 'interpretation', 'raw Custodian flag')})"
+                )
+        if not getattr(evidence, "corrections", ()) and not error:
+            print(f"{indent}  no correction interventions recorded")
+        for limitation in getattr(evidence, "limitations", ()):
+            print(f"{indent}  limitation: {limitation}")
+
+
+def _print_custodian_policy_context(policy: object) -> None:
+    print("Execution-policy context (producer_provenance):")
+    if not getattr(policy, "available", False):
+        print(f"  unavailable: {getattr(policy, 'reason', 'no persisted Custodian policy provenance')}")
+        return
+    for stage in getattr(policy, "stages", ()):
+        print(
+            f"  stage {getattr(stage, 'stage_index', '?')}: "
+            f"{getattr(stage, 'stage_type', 'unknown')} / {getattr(stage, 'theory', 'unknown')}"
+        )
+        print(
+            f"    policy: {getattr(stage, 'policy_id', 'unknown')} "
+            f"v{getattr(stage, 'policy_version', 'unknown')}"
+        )
+        print(
+            "    FrozenJobErrorHandler: "
+            f"{getattr(stage, 'frozen_job_handler_status', 'unknown')}"
+        )
+        print(
+            "    configured handlers: "
+            f"{_component_names(getattr(stage, 'handlers', ()))}"
+        )
+        for component in getattr(stage, "handlers", ()):
+            configuration = getattr(component, "configuration", {})
+            if configuration:
+                print(
+                    f"      {_short_class_name(getattr(component, 'class_name', 'unknown'))}: "
+                    f"{_format_options(configuration)}"
+                )
+        handler_exclusions = getattr(stage, "explicit_handler_exclusions", ())
+        print(
+            "    explicit handler exclusions: "
+            f"{', '.join(_short_class_name(item) for item in handler_exclusions) if handler_exclusions else 'none recorded'}"
+        )
+        exclusions = getattr(stage, "vasp_error_exclusions", ())
+        print(
+            "    VaspErrorHandler exclusions: "
+            f"{', '.join(exclusions) if exclusions else 'none recorded'}"
+        )
+        print(
+            "    validators: "
+            f"{_component_names(getattr(stage, 'validators', ()))}"
+        )
+        validators_source = getattr(stage, "validators_source", None)
+        if validators_source:
+            print(f"    validators source: {validators_source}")
+        print(
+            "    walltime authority: "
+            f"{getattr(stage, 'walltime_authority', None) or 'unavailable'}"
+        )
+        walltime_handler = getattr(stage, "walltime_handler", None)
+        print(
+            "    internal walltime handler: "
+            f"{'none' if walltime_handler is None else walltime_handler}"
+        )
+        print(
+            "    Custodian version: "
+            f"{getattr(stage, 'custodian_version', None) or 'unavailable'}"
+        )
+        implementation_source = getattr(stage, "implementation_source", None)
+        if implementation_source:
+            print(f"    implementation source: {implementation_source}")
+        rationale = getattr(stage, "rationale", None)
+        if rationale:
+            print(f"    rationale: {rationale}")
+
+
+def _print_termination_assessment(
+    assessment: object | None,
+    *,
+    indent: str = "",
+) -> None:
+    if assessment is None:
+        return
+    print(f"{indent}termination assessment:")
+    print(f"{indent}  classification: {getattr(assessment, 'classification', 'unknown')}")
+    print(f"{indent}  status: {getattr(assessment, 'status', 'insufficient_evidence')}")
+    for basis in getattr(assessment, "basis", ()):
+        print(f"{indent}  basis: {basis}")
+    for limitation in getattr(assessment, "limitations", ()):
+        print(f"{indent}  limitation: {limitation}")
+
+
+def _has_relevant_custodian_evidence(evidence_items: Iterable[object]) -> bool:
+    return any(
+        getattr(evidence, "error", None)
+        or getattr(evidence, "corrections", ())
+        or any(
+            getattr(flag, "value", None) is True
+            for flag in getattr(evidence, "terminal_flags", ())
+        )
+        for evidence in evidence_items
+    )
+
+
+def _component_names(components: Iterable[object]) -> str:
+    names = [
+        _short_class_name(getattr(component, "class_name", "unknown"))
+        for component in components
+    ]
+    return ", ".join(names) if names else "none recorded"
+
+
+def _short_class_name(value: object) -> str:
+    return str(value).rsplit(".", 1)[-1]
 
 
 def _print_lifecycle_suggested_checks(diagnostics: object) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import subprocess
 from pathlib import Path
@@ -33,6 +34,10 @@ from bmd_agent.resources.context import (
     ScientificContext,
     ScientificIdentitySummary,
     build_scientific_context,
+)
+from bmd_agent.resources.custodian import (
+    assess_termination_evidence,
+    parse_custodian_json,
 )
 from bmd_agent.resources.lifecycle import (
     BmdWorkflowDiscovery,
@@ -920,6 +925,49 @@ def test_domain_context_assessment_is_qualified_and_source_linked(tmp_path: Path
     assert "does not establish why sigterm was issued" in assessment_text
     assert "definitely" not in assessment_text
     assert "restart" not in assessment_text
+
+
+def test_domain_context_remains_independently_sourced_when_custodian_termination_supported(
+    tmp_path: Path,
+) -> None:
+    analysis = domain_analysis()
+    evidence = parse_custodian_json(
+        (Path(__file__).parent / "fixtures" / "custodian_frozen_repeated.json").read_text(
+            encoding="utf-8"
+        ),
+        source_path="/calculation/custodian.json",
+    )
+    termination = assess_termination_evidence(
+        scheduler_state="FAILED",
+        custodian_evidence=(evidence,),
+        log_messages=("SIGTERM received",),
+        error_archive_count=5,
+    )
+    analysis = replace(
+        analysis,
+        diagnostics=replace(
+            analysis.diagnostics,
+            custodian=evidence,
+            termination=termination,
+        ),
+    )
+    query = dict(build_bmdex_domain_query(analysis) or {})
+
+    enriched = enrich_lifecycle_with_bmdex_domain_context(
+        analysis,
+        repository(tmp_path),
+        runner=lambda *_args, **_kwargs: completed(domain_payload(query)),
+    )
+
+    assert enriched.evidence is not None
+    assert enriched.evidence.evidence_type == DOMAIN_CONTEXT_EVIDENCE_TYPE
+    assert enriched.assessment is not None
+    assert enriched.assessment.source_record_ids == ("vasp.test.context",)
+    text = " ".join(enriched.assessment.basis).lower()
+    assert "independently observed custodian intervention" in text
+    assert "contextual reference evidence rather than termination evidence" in text
+    limitations = " ".join(enriched.assessment.limitations).lower()
+    assert "does not prove the interrupted vasp operation would eventually converge" in limitations
 
 
 def test_lifecycle_cli_renders_contextual_evidence_with_compact_provenance(

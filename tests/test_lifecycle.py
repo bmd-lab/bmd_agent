@@ -506,6 +506,7 @@ def test_unknown_relocated_partial_snapshot_gets_diagnostic_evidence(tmp_path: P
     assert any("fatal" in " ".join(log.messages).lower() for log in analysis.diagnostics.logs)
     assert analysis.diagnostics.custodian is not None
     assert any("VaspErrorHandler" in event for event in analysis.diagnostics.custodian.events)
+    assert analysis.diagnostics.custodian.corrections[0].errors == ("eddrmm",)
     assert [archive.name for archive in analysis.diagnostics.error_archives] == ["error.1.tar.gz"]
 
 
@@ -724,7 +725,7 @@ def test_relocated_partial_cli_prints_diagnostics_without_vasprun_exception(
     assert "completed ionic steps: 2" in captured.out
     assert "vasprun trajectory enrichment unavailable: file could not be parsed completely" in captured.out
     assert "Diagnostic evidence:" in captured.out
-    assert "custodian:" in captured.out
+    assert "Custodian intervention evidence:" in captured.out
     assert "VaspErrorHandler" in captured.out
     assert "error archives:" in captured.out
     assert "not unpacked by BMD Agent" in captured.out
