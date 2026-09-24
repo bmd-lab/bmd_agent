@@ -58,8 +58,9 @@ partition = "leeburton-pool"
 access = "observational"
 
 # Optional shipped reference profile. The profile records expected/observed
-# infrastructure facts; this deployment-local table remains authoritative for
-# acquisition and path authorization.
+# infrastructure facts, including the BMD Compute flows and logs roots used for
+# exact job_<SLURM_JOB_ID>.json run resolution. This deployment-local table and
+# allowed_remote_roots remain authoritative for acquisition and path authorization.
 deployment_profile = "power"
 
 # Operational bounds belong to the deployment-local acquisition resource.

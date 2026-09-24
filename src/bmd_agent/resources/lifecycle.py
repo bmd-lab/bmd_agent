@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from pathlib import PurePosixPath
 import posixpath
-import re
 from typing import Any
 import warnings
 
@@ -18,6 +17,10 @@ from bmd_agent.resources.custodian import (
     assess_termination_evidence,
     parse_custodian_json,
     parse_custodian_policy_provenance,
+)
+from bmd_agent.resources.diagnostics import (
+    BoundedLogDiagnostic as LocalLogDiagnostic,
+    diagnostic_log_messages,
 )
 from bmd_agent.resources.oom import OomDiagnosticEvidence, assess_oom_evidence
 from bmd_agent.resources.run import (
@@ -163,23 +166,6 @@ _NORMAL_COMPLETION_MARKERS = (
     "General timing and accounting informations for this job",
     "Voluntary context switches",
 )
-_LOG_DIAGNOSTIC_RE = re.compile(
-    r"\b(error|fatal|traceback|exception|zbrent|brmix|edddav|eddrmm|segmentation|forrtl|"
-    r"killed|sigterm|sigkill|oom|out of memory|memory limit|cannot allocate memory|"
-    r"bad_alloc|allocation failed|insufficient memory)\b",
-    re.IGNORECASE,
-)
-
-
-@dataclass(frozen=True)
-class LocalLogDiagnostic:
-    label: str
-    path: Path
-    present: bool
-    messages: tuple[str, ...] = ()
-    error: str | None = None
-
-
 @dataclass(frozen=True)
 class LocalExecutionDiagnostics:
     trajectories: tuple[StageTrajectoryObservation, ...] = ()
@@ -1170,16 +1156,7 @@ def _observe_local_logs(
 
 
 def _diagnostic_log_messages(text: str) -> tuple[str, ...]:
-    messages: list[str] = []
-    for line in text.splitlines():
-        compact = " ".join(line.strip().split())
-        if not compact or not _LOG_DIAGNOSTIC_RE.search(compact):
-            continue
-        if compact not in messages:
-            messages.append(compact[:240])
-        if len(messages) >= 8:
-            break
-    return tuple(messages)
+    return diagnostic_log_messages(text)
 
 
 def _observe_local_custodian(

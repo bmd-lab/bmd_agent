@@ -10,6 +10,7 @@ from bmd_agent.resources.context import EvidenceGap, ScientificContext
 
 if TYPE_CHECKING:
     from bmd_agent.resources.lifecycle import LifecycleAnalysis
+    from bmd_agent.resources.run import JobInspection, StageTrajectoryObservation
 
 
 SCHEMA_VERSION = 1
@@ -211,6 +212,49 @@ def enrich_lifecycle_with_bmdex_domain_context(
     if query is None:
         return BmdexDomainContextEnrichment()
 
+    return _acquire_domain_context(
+        query,
+        repository,
+        runner=runner,
+        timeout=timeout,
+        assessment_factory=lambda evidence: _domain_context_assessment(analysis, evidence),
+    )
+
+
+def enrich_job_with_bmdex_domain_context(
+    inspection: JobInspection,
+    repository: GitRepositoryResource | None,
+    *,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> BmdexDomainContextEnrichment:
+    """Acquire the existing contextual references for remote job evidence."""
+
+    query = build_bmdex_domain_query_for_job(inspection)
+    if query is None:
+        return BmdexDomainContextEnrichment()
+
+    return _acquire_domain_context(
+        query,
+        repository,
+        runner=runner,
+        timeout=timeout,
+        assessment_factory=lambda evidence: _job_domain_context_assessment(
+            inspection,
+            evidence,
+        ),
+    )
+
+
+def _acquire_domain_context(
+    query: Mapping[str, Any],
+    repository: GitRepositoryResource | None,
+    *,
+    runner: Runner,
+    timeout: float,
+    assessment_factory: Callable[[BmdexDomainContextEvidence], BmdexContextualAssessment | None],
+) -> BmdexDomainContextEnrichment:
+
     if repository is None:
         return BmdexDomainContextEnrichment(
             query=query,
@@ -261,7 +305,7 @@ def enrich_lifecycle_with_bmdex_domain_context(
             ),
         )
 
-    assessment = _domain_context_assessment(analysis, evidence)
+    assessment = assessment_factory(evidence)
     return BmdexDomainContextEnrichment(
         query=query,
         evidence=evidence,
@@ -293,16 +337,66 @@ def build_bmdex_domain_query(
     if trajectory is None:
         return None
 
+    theory = _observed_stage_theory(analysis, trajectory.stage_index)
+    return _hybrid_domain_query(
+        trajectory,
+        analysis.incar_settings,
+        theory=theory,
+    )
+
+
+def build_bmdex_domain_query_for_job(
+    inspection: JobInspection,
+) -> Mapping[str, Any] | None:
+    """Build the same factual hybrid-trajectory query from remote job evidence."""
+
+    if inspection.bmd_compute is not None:
+        trajectories = inspection.bmd_compute.trajectories
+        inputs = inspection.bmd_compute.inspection.executed_inputs
+        stages = inspection.bmd_compute.inspection.workflow_stages
+    elif inspection.direct_vasp is not None:
+        trajectories = (inspection.direct_vasp.trajectory,)
+        inputs = inspection.direct_vasp.executed_inputs
+        stages = ()
+    else:
+        return None
+
+    trajectory = next(
+        (
+            item
+            for item in trajectories
+            if item.completed_ionic_steps == 0
+            and item.incomplete_electronic_iteration_count is not None
+            and item.incomplete_electronic_iteration_count > 0
+        ),
+        None,
+    )
+    if trajectory is None:
+        return None
+    settings = _job_executed_settings(inputs, trajectory.stage_index)
+    if not _bool_value(settings.get("LHFCALC")):
+        return None
+    theory = None
+    if trajectory.stage_index is not None and 1 <= trajectory.stage_index <= len(stages):
+        theory = stages[trajectory.stage_index - 1].theory
+    return _hybrid_domain_query(trajectory, settings, theory=theory)
+
+
+def _hybrid_domain_query(
+    trajectory: StageTrajectoryObservation,
+    input_settings: Mapping[str, Any],
+    *,
+    theory: str | None,
+) -> Mapping[str, Any]:
     query: dict[str, Any] = {
         "code": "VASP",
         "calculation_family": "hybrid_functional",
         "topic": "electronic_iteration_behavior",
     }
-    theory = _observed_stage_theory(analysis, trajectory.stage_index)
     if theory and theory.lower() != "unknown":
         query["functional"] = theory
 
-    algorithm = analysis.incar_settings.get("ALGO")
+    algorithm = input_settings.get("ALGO")
     if isinstance(algorithm, str) and algorithm.strip():
         query["electronic_algorithm"] = algorithm.strip()
 
@@ -320,13 +414,32 @@ def build_bmdex_domain_query(
     query["observed_patterns"] = observed_patterns
 
     input_tags = {
-        key: analysis.incar_settings[key]
+        key: input_settings[key]
         for key in ("LHFCALC", "HFSCREEN", "AEXX", "ALGO", "NELMDL", "LSORBIT")
-        if key in analysis.incar_settings
+        if key in input_settings
     }
     if input_tags:
         query["input_tags"] = input_tags
     return query
+
+
+def _job_executed_settings(inputs: tuple[Any, ...], stage_index: int | None) -> dict[str, Any]:
+    observations = tuple(
+        item
+        for item in inputs
+        if item.present
+        and item.error is None
+        and (stage_index is None or item.stage_index in {None, stage_index})
+    )
+    values_by_key: dict[str, list[Any]] = {}
+    for observation in observations:
+        for key, value in observation.values.items():
+            values_by_key.setdefault(str(key).upper(), []).append(value)
+    return {
+        key: values[0]
+        for key, values in values_by_key.items()
+        if values and all(value == values[0] for value in values[1:])
+    }
 
 
 def inspect_bmdex_domain_context(
@@ -640,15 +753,6 @@ def _domain_context_assessment(
     analysis: LifecycleAnalysis,
     evidence: BmdexDomainContextEvidence,
 ) -> BmdexContextualAssessment | None:
-    if not evidence.records:
-        return None
-    basis = [
-        (
-            "Observed VASP input and electronic-trajectory context are consistent with the "
-            f"applicability of cited BMDex reference {record.record_id}: {record.title}."
-        )
-        for record in evidence.records
-    ]
     termination = (
         analysis.diagnostics.termination
         if analysis.diagnostics is not None
@@ -659,6 +763,49 @@ def _domain_context_assessment(
         and termination.classification == "custodian_triggered_process_termination"
         and termination.status == "supported"
     )
+    return _contextual_assessment(
+        evidence,
+        custodian_supported=custodian_supported,
+        mentions_sigterm=_analysis_mentions_sigterm(analysis),
+    )
+
+
+def _job_domain_context_assessment(
+    inspection: JobInspection,
+    evidence: BmdexDomainContextEvidence,
+) -> BmdexContextualAssessment | None:
+    termination = None
+    if inspection.bmd_compute is not None:
+        termination = inspection.bmd_compute.termination.assessment
+    elif inspection.direct_vasp is not None:
+        termination = inspection.direct_vasp.termination_assessment
+    custodian_supported = (
+        termination is not None
+        and termination.classification == "custodian_triggered_process_termination"
+        and termination.status == "supported"
+    )
+    return _contextual_assessment(
+        evidence,
+        custodian_supported=custodian_supported,
+        mentions_sigterm=False,
+    )
+
+
+def _contextual_assessment(
+    evidence: BmdexDomainContextEvidence,
+    *,
+    custodian_supported: bool,
+    mentions_sigterm: bool,
+) -> BmdexContextualAssessment | None:
+    if not evidence.records:
+        return None
+    basis = [
+        (
+            "Observed VASP input and electronic-trajectory context are consistent with the "
+            f"applicability of cited BMDex reference {record.record_id}: {record.title}."
+        )
+        for record in evidence.records
+    ]
     if custodian_supported:
         basis.append(
             "Independently observed Custodian intervention and termination evidence supports "
@@ -677,7 +824,7 @@ def _domain_context_assessment(
                 "The combined evidence does not establish scientific success.",
             )
         )
-    elif _analysis_mentions_sigterm(analysis):
+    elif mentions_sigterm:
         limitations.append("The available evidence does not establish why SIGTERM was issued.")
     return BmdexContextualAssessment(
         basis=tuple(basis),

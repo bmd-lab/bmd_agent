@@ -14,6 +14,9 @@ import pytest
 from bmd_agent import cli
 import bmd_agent.resources.run as run_resource
 from bmd_agent.config import ResourceRegistry, SlurmClusterResource
+from bmd_agent.deployment import DeploymentContext, load_deployment_profile
+from bmd_agent.resources.bmdex import build_bmdex_domain_query_for_job
+from bmd_agent.resources.job_resolution import NOT_BMD_COMPUTE, RESOLVED
 from bmd_agent.resources.run import (
     AGENT_COMPARISON,
     ARTIFACT_OBSERVATION,
@@ -66,6 +69,7 @@ from bmd_agent.resources.run import (
 )
 from bmd_agent.resources.oom import (
     INSUFFICIENT_OOM_EVIDENCE,
+    NO_OOM_EVIDENCE,
     OOM_ESTABLISHED,
 )
 from bmd_agent.resources.slurm import (
@@ -441,6 +445,11 @@ def cluster() -> SlurmClusterResource:
         access="observational",
         allowed_remote_roots=(PurePosixPath("/bmd-db/guest"),),
     )
+
+
+def power_deployment(resource: SlurmClusterResource | None = None) -> DeploymentContext:
+    resource = resource or cluster()
+    return DeploymentContext(profile=load_deployment_profile("power"), cluster=resource)
 
 
 def submission_payload(*, outside_path: bool = False) -> dict:
@@ -983,6 +992,48 @@ def test_inspect_slurm_job_identifies_direct_vasp_without_submission_json() -> N
     assert "POTCAR" not in remote_commands
 
 
+def test_missing_bmd_state_preserves_authorized_manual_vasp_workdir_fallback() -> None:
+    remote = RemoteFixture(files=direct_vasp_files(), directories={DIRECT_DIR})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(),
+        scientific_parser=fake_direct_scientific_parser,
+        deployment=power_deployment(),
+    )
+
+    assert inspection.run_resolution is not None
+    assert inspection.run_resolution.resolution_status == NOT_BMD_COMPUTE
+    assert inspection.scheduler is not None
+    assert inspection.calculation_type == "direct VASP"
+    assert inspection.direct_vasp is not None
+    commands = " ".join(command[2] for command in remote.commands)
+    assert f"test -f {LOG_ROOT}/job_20893681.json" in commands
+    assert "find " not in commands
+    assert "ls " not in commands
+
+
+def test_missing_bmd_state_keeps_scheduler_evidence_when_workdir_is_not_authorized() -> None:
+    remote = RemoteFixture(files={}, directories=set())
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(work_dir="/a/home/cc/tree/taucc/enginer/bmdguest"),
+        deployment=power_deployment(),
+    )
+
+    assert inspection.run_resolution is not None
+    assert inspection.run_resolution.resolution_status == NOT_BMD_COMPUTE
+    assert inspection.scheduler is not None
+    assert inspection.scheduler.state == "COMPLETED"
+    assert inspection.calculation_type == "unknown"
+    assert "not authorized" in (inspection.calculation_reason or "")
+
+
 def test_inspect_slurm_job_reads_bounded_scheduler_stderr_for_explicit_oom() -> None:
     stderr_path = f"{LOG_ROOT}/slurm-20893681.err"
     files = direct_vasp_files()
@@ -1071,6 +1122,332 @@ def test_inspect_slurm_job_delegates_bmd_compute_workdir_to_existing_diagnosis()
     assert inspection.bmd_compute.inspection.workflow_stages[0].stage_type == "relax"
 
 
+def test_authoritative_job_record_resolves_generic_workdir_into_common_bmd_analysis() -> None:
+    files = default_files()
+    spec = submission_payload()
+    spec["run_name"] = "validation-run"
+    spec["submission"]["attempt_id"] = "attempt-validation"
+    files[f"{FLOW_ROOT}/submission.json"] = json.dumps(spec).encode()
+    files[f"{LOG_ROOT}/submission_attempts/attempt.json"] = json.dumps(
+        {
+            "attempt_id": "attempt-validation",
+            "state": "SUBMITTED",
+            "job_id": "20893681",
+            "run_dir": FLOW_ROOT,
+            "job_record": {
+                "job_id": "20893681",
+                "run_dir": FLOW_ROOT,
+                "submission_spec": spec,
+            },
+        }
+    ).encode()
+    state_path = f"{LOG_ROOT}/job_20893681.json"
+    files[state_path] = json.dumps(
+        {
+            "job_id": "20893681",
+            "run_name": "validation-run",
+            "run_dir": FLOW_ROOT,
+            "remote_script": f"{FLOW_ROOT}.sbatch.sh",
+            "log_paths": {},
+            "cluster": {"partition": "leeburton-pool"},
+            "resources": {"nodes": 1, "ntasks": 24},
+            "submitted_at": "2026-08-21T12:00:00+03:00",
+            "status": "submitted",
+            "submission_spec": spec,
+            "remote_state_path": state_path,
+        }
+    ).encode()
+    remote = RemoteFixture(files=files, directories=default_directories())
+    scheduler_calls = 0
+    scheduler_runner = job_slurm_runner(work_dir="/a/home/cc/tree/taucc/enginer/bmdguest")
+
+    def counting_scheduler(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal scheduler_calls
+        scheduler_calls += 1
+        return scheduler_runner(command, **kwargs)
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=counting_scheduler,
+        scientific_parser=fake_scientific_parser,
+        max_vasprun_bytes=0,
+        deployment=power_deployment(),
+    )
+
+    assert scheduler_calls == 1
+    assert inspection.run_resolution is not None
+    assert inspection.run_resolution.resolution_status == RESOLVED
+    assert inspection.calculation_directory == FLOW_ROOT
+    assert inspection.scheduler_work_dir == "/a/home/cc/tree/taucc/enginer/bmdguest"
+    assert inspection.calculation_type == "BMD Compute"
+    assert inspection.bmd_compute is not None
+    assert inspection.bmd_compute.inspection.scheduler is inspection.scheduler
+    assert inspection.bmd_compute.inspection.scientific.final_formula == "Example2"
+    commands = " ".join(command[2] for command in remote.commands)
+    assert "find " not in commands
+    assert "ls " not in commands
+    assert "POTCAR" not in commands
+    assert "/a/home/cc/tree/taucc/enginer/bmdguest" not in commands
+    assert [command[2] for command in remote.commands].count(
+        f"cat -- {FLOW_ROOT}/submission.json"
+    ) == 1
+    assert [command[2] for command in remote.commands].count(
+        f"cat -- {LOG_ROOT}/submission_attempts/attempt.json"
+    ) == 1
+
+
+def test_resolved_running_bmd_job_keeps_partial_trajectory_nonfatal() -> None:
+    spec = single_stage_submission_payload()
+    spec["run_name"] = "running-run"
+    attempt_path = f"{LOG_ROOT}/submission_attempts/running-attempt.json"
+    spec["submission"] = {
+        "attempt_id": "running-attempt",
+        "attempt_state": attempt_path,
+    }
+    spec["paths"]["submission_attempt_state"] = attempt_path
+    files = {
+        f"{FLOW_ROOT}/submission.json": json.dumps(spec).encode(),
+        attempt_path: json.dumps(
+            {
+                "attempt_id": "running-attempt",
+                "state": "SUBMITTED",
+                "job_id": "20893681",
+                "run_dir": FLOW_ROOT,
+            }
+        ).encode(),
+        f"{LOG_ROOT}/job_20893681.json": json.dumps(
+            {
+                "job_id": "20893681",
+                "run_name": "running-run",
+                "run_dir": FLOW_ROOT,
+                "status": "submitted",
+                "submission_spec": spec,
+                "remote_state_path": f"{LOG_ROOT}/job_20893681.json",
+            }
+        ).encode(),
+        f"{FLOW_ROOT}/INCAR": b"NELM = 200\nNSW = 99\nEDIFFG = -0.01\n",
+        f"{FLOW_ROOT}/POSCAR": POSCAR_TWO_SITE,
+        f"{FLOW_ROOT}/KPOINTS": b"kpoints",
+        f"{FLOW_ROOT}/OSZICAR": oszicar_incomplete_cycle(4),
+    }
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "20893681",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(
+            state="RUNNING",
+            work_dir="/a/home/cc/tree/taucc/enginer/bmdguest",
+        ),
+        max_vasprun_bytes=0,
+        deployment=power_deployment(),
+    )
+
+    assert inspection.bmd_compute is not None
+    assert inspection.scheduler is not None
+    assert inspection.scheduler.state == "RUNNING"
+    trajectory = inspection.bmd_compute.trajectories[0]
+    assert trajectory.completed_ionic_steps == 0
+    assert trajectory.incomplete_electronic_iteration_count == 4
+    assert inspection.bmd_compute.inspection.scientific.error is None
+
+
+def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidence(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "job_21906221.json"
+    state_bytes = fixture_path.read_bytes()
+    state = json.loads(state_bytes)
+    spec = state["submission_spec"]
+    run_dir = state["run_dir"]
+    attempt_path = spec["submission"]["attempt_state"]
+    custodian_bytes = (
+        Path(__file__).parent / "fixtures" / "custodian_frozen_repeated.json"
+    ).read_bytes()
+    files = {
+        state["remote_state_path"]: state_bytes,
+        f"{run_dir}/submission.json": json.dumps(spec).encode(),
+        attempt_path: json.dumps(
+            {
+                "attempt_id": spec["submission"]["attempt_id"],
+                "state": "SUBMITTED",
+                "job_id": "21906221",
+                "run_dir": run_dir,
+                "job_record": {
+                    "job_id": "21906221",
+                    "run_dir": run_dir,
+                    "submission_spec": spec,
+                },
+            }
+        ).encode(),
+        f"{run_dir}/INCAR": (
+            b"LHFCALC = True\nHFSCREEN = 0.2\nLSORBIT = True\n"
+            b"NELM = 200\nALGO = Normal\n"
+        ),
+        f"{run_dir}/OSZICAR": oszicar_incomplete_cycle(4),
+        f"{run_dir}/OUTCAR": b"",
+        f"{run_dir}/CONTCAR": b"contcar",
+        f"{run_dir}/custodian.json": custodian_bytes,
+        f"{run_dir}/std_err.txt": (
+            b"forrtl: error (78): process killed (SIGTERM)\n"
+        ),
+        **{
+            f"{run_dir}/error.{index}.tar.gz": b"archive contents are not inspected"
+            for index in range(1, 6)
+        },
+        spec["paths"]["log_out"]: b"",
+        spec["paths"]["log_err"]: b"",
+        spec["paths"]["slurm_out"]: b"",
+        spec["paths"]["slurm_err"]: b"",
+    }
+    remote = RemoteFixture(files=files, directories={run_dir})
+
+    inspection = inspect_slurm_job(
+        cluster(),
+        "21906221",
+        remote_runner=remote,
+        slurm_runner=job_slurm_runner(
+            job_id="21906221",
+            state="FAILED",
+            work_dir="/a/home/cc/tree/taucc/enginer/bmdguest",
+            max_rss="45045764K",
+        ),
+        scientific_parser=lambda local, display, workflow: ScientificResult(
+            source_paths=tuple(display.values()),
+            final_formula="fixture",
+        ),
+        max_vasprun_bytes=0,
+        deployment=power_deployment(),
+    )
+
+    assert inspection.run_resolution is not None
+    assert inspection.run_resolution.resolution_status == RESOLVED
+    assert inspection.scheduler is not None
+    assert inspection.scheduler.state == "FAILED"
+    assert inspection.bmd_compute is not None
+    run = inspection.bmd_compute.inspection
+    assert run.workflow_stages[0].theory == "hse06"
+    assert run.workflow_stages[0].modifiers == ("soc",)
+    assert inspection.bmd_compute.trajectories[0].incomplete_electronic_iteration_count == 4
+    assert len(run.custodian_evidence) == 1
+    assert len(run.custodian_evidence[0].corrections) == 5
+    assert run.custodian_evidence[0].repeated_interventions[0].count == 5
+    assert run.custodian_evidence[0].repeated_interventions[0].timeout_seconds == 21600
+    assert run.custodian_policy.available is False
+    assert run.execution_diagnostics.logs[0].path == f"{run_dir}/std_err.txt"
+    assert "SIGTERM" in run.execution_diagnostics.logs[0].messages[0]
+    assert len(run.execution_diagnostics.error_archives) == 5
+    assert inspection.bmd_compute.termination.assessment is not None
+    assert (
+        inspection.bmd_compute.termination.assessment.classification
+        == "custodian_triggered_process_termination"
+    )
+    assert inspection.bmd_compute.termination.assessment.status == "supported"
+    assert inspection.oom is not None
+    assert inspection.oom.assessment == NO_OOM_EVIDENCE
+    contextual_query = build_bmdex_domain_query_for_job(inspection)
+    assert contextual_query is not None
+    assert contextual_query["calculation_family"] == "hybrid_functional"
+    assert contextual_query["functional"] == "hse06"
+    assert "incomplete_first_electronic_cycle" in contextual_query["observed_patterns"]
+    remote_commands = [command[2] for command in remote.commands]
+    assert f"tail -c 128000 -- {run_dir}/std_err.txt" in remote_commands
+    assert not any(
+        shlex.split(command)[0] in {"tar", "find", "ls"}
+        for command in remote_commands
+    )
+    assert not any("error.*.tar.gz" in command or "POTCAR" in command for command in remote_commands)
+
+    cli.print_job_inspection(inspection)
+    output = capsys.readouterr().out
+    assert "classification: custodian_triggered_process_termination" in output
+    assert "status: supported" in output
+    assert "submission has no persisted Custodian execution-policy provenance" in output
+    assert "assessment: NO OOM EVIDENCE FOUND" in output
+
+
+def test_remote_execution_diagnostics_use_bounded_exact_read_only_paths() -> None:
+    directory = PurePosixPath(FLOW_ROOT)
+    files = {
+        f"{FLOW_ROOT}/std_err.txt": b"SIGTERM received by VASP\n",
+        f"{FLOW_ROOT}/vasp.out": b"fatal: bounded diagnostic fixture\n",
+        f"{FLOW_ROOT}/OUTCAR": b"forrtl: process killed\n",
+        f"{FLOW_ROOT}/error.1.tar.gz": b"not read",
+        f"{FLOW_ROOT}/error.2.tar.gz": b"not read",
+    }
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    evidence = run_resource._observe_remote_execution_diagnostics(
+        "powerslurm-bmdguest",
+        directory,
+        {},
+        directory,
+        (WorkflowStage(1, "static", "hse06", (), None),),
+        allowed_roots=(PurePosixPath("/bmd-db/guest"),),
+        runner=remote,
+        timeout=20,
+    )
+
+    assert [item.label for item in evidence.logs] == ["std_err.txt", "vasp.out", "OUTCAR"]
+    assert evidence.logs[0].messages == ("SIGTERM received by VASP",)
+    assert [item.label for item in evidence.error_archives] == [
+        "error.1.tar.gz",
+        "error.2.tar.gz",
+    ]
+    commands = [command[2] for command in remote.commands]
+    assert f"tail -c 128000 -- {FLOW_ROOT}/std_err.txt" in commands
+    assert f"test -f {FLOW_ROOT}/error.3.tar.gz" in commands
+    assert not any(command.startswith("cat --") for command in commands)
+    assert not any(shlex.split(command)[0] in {"tar", "find", "ls"} for command in commands)
+    assert not any("error.*.tar.gz" in command or "POTCAR" in command for command in commands)
+
+
+def test_missing_remote_execution_diagnostics_are_nonfatal() -> None:
+    directory = PurePosixPath(FLOW_ROOT)
+    remote = RemoteFixture(files={}, directories={FLOW_ROOT})
+
+    evidence = run_resource._observe_remote_execution_diagnostics(
+        "powerslurm-bmdguest",
+        directory,
+        {},
+        directory,
+        (WorkflowStage(1, "static", "pbe", (), None),),
+        allowed_roots=(PurePosixPath("/bmd-db/guest"),),
+        runner=remote,
+        timeout=20,
+    )
+
+    assert evidence.logs == ()
+    assert evidence.error_archives == ()
+
+
+def test_completed_remote_bmd_run_remains_free_of_custodian_failure_sections(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    remote = RemoteFixture(files=default_files(), directories=default_directories())
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=slurm_runner,
+        max_vasprun_bytes=0,
+    )
+
+    assert diagnosis.inspection.scheduler is not None
+    assert diagnosis.inspection.scheduler.state == "COMPLETED"
+    assert diagnosis.inspection.custodian_evidence == ()
+    assert diagnosis.inspection.execution_diagnostics.error_archives == ()
+
+    cli.print_run_diagnosis(diagnosis)
+    output = capsys.readouterr().out
+    assert "Custodian intervention evidence" not in output
+    assert "error archives" not in output
+
+
 def test_direct_vasp_truncated_vasprun_keeps_oszicar_trajectory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1138,6 +1515,25 @@ def test_direct_vasp_scientific_parsing_captures_malformed_vasprun_warning(
     assert "file could not be parsed completely" in captured.out
     assert "list index out of range" not in captured.out
     assert "XML is malformed" not in captured.out
+
+
+def test_bmd_run_scientific_parsing_captures_malformed_vasprun_warning() -> None:
+    remote = RemoteFixture(files=single_stage_files(), directories={FLOW_ROOT})
+
+    with fake_pymatgen_modules(FakeMalformedVasprun), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        inspection = inspect_remote_run(
+            cluster(),
+            FLOW_ROOT,
+            remote_runner=remote,
+            slurm_runner=slurm_runner,
+            scientific_parser=parse_vasp_output_files,
+        )
+
+    assert caught == []
+    assert inspection.scientific.error is None
+    assert "vasprun.xml could not be parsed completely" in inspection.scientific.unavailable
+    assert "list index out of range" not in " ".join(inspection.scientific.unavailable)
 
 
 def test_completed_direct_vasp_relaxation_reports_converged(
@@ -2960,6 +3356,12 @@ class FakeMalformedVasprun(FakeBandVasprun):
         raise IndexError("list index out of range")
 
 
+class FakeUnexpectedWarningVasprun(FakeBandVasprun):
+    def __init__(self, path: str, **kwargs: object) -> None:
+        warnings.warn("unexpected parser diagnostic", RuntimeWarning)
+        super().__init__(path, **kwargs)
+
+
 @contextmanager
 def fake_pymatgen_modules(vasprun_cls: type[FakeBandVasprun]):
     modules = {
@@ -3056,6 +3458,27 @@ def test_band_parsing_keeps_final_vasprun_fermi_reference(tmp_path: Path) -> Non
     assert result.executed_parameters[0].values["IVDW"] == 11
     assert result.executed_parameters[1].source_type == "vasprun_xml.parameters"
     assert result.executed_parameters[1].values["ENCUT"] == 520
+
+
+def test_tolerant_vasprun_boundary_does_not_suppress_unexpected_warnings(
+    tmp_path: Path,
+) -> None:
+    local_paths, display_paths = fake_vasp_paths(tmp_path)
+
+    with (
+        fake_pymatgen_modules(FakeUnexpectedWarningVasprun),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        result = parse_vasp_output_files(
+            local_paths,
+            display_paths,
+            arbitrary_band_workflow_spec(),
+        )
+
+    assert result.final_formula == "X2"
+    assert [str(item.message) for item in caught] == ["unexpected parser diagnostic"]
+    assert result.error is None
 
 
 def test_scalar_observations_survive_band_structure_failure(tmp_path: Path) -> None:

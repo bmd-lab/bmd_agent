@@ -13,6 +13,7 @@ import warnings
 from typing import Any
 
 from bmd_agent.config import SlurmClusterResource
+from bmd_agent.deployment import DeploymentContext
 from bmd_agent.resources.custodian import (
     CustodianInterventionEvidence,
     CustodianPolicyEvidence,
@@ -21,11 +22,17 @@ from bmd_agent.resources.custodian import (
     parse_custodian_json,
     parse_custodian_policy_provenance,
 )
+from bmd_agent.resources.diagnostics import BoundedLogDiagnostic, diagnostic_log_messages
 from bmd_agent.resources.oom import (
     OomDiagnosticEvidence,
     assess_oom_evidence,
     oom_candidate_lines,
     serialize_oom_evidence,
+)
+from bmd_agent.resources.job_resolution import (
+    RESOLVED,
+    JobRunResolution,
+    resolve_bmd_compute_job,
 )
 from bmd_agent.resources.slurm import (
     SlurmAccountingRecord,
@@ -104,6 +111,9 @@ _DIAGNOSE_CRITERIA_KEYS = ("NELM", "EDIFF", "NSW", "EDIFFG", "ISIF")
 _OUTCAR_FORCE_EXTRACTION_SCHEMA = "bmd-agent-outcar-force-v1"
 _JOB_TRAJECTORY_JSON_SCHEMA_VERSION = 1
 _OOM_REMOTE_LOG_MAX_BYTES = 128_000
+_REMOTE_DIAGNOSTIC_LOG_MAX_BYTES = 128_000
+_REMOTE_DIAGNOSTIC_LOG_FILENAMES = ("std_err.txt", "vasp.out", "OUTCAR")
+_REMOTE_ERROR_ARCHIVE_LIMIT = 64
 _CUSTODIAN_REMOTE_MAX_BYTES = 2_000_000
 _OSZICAR_IONIC_DE_SEMANTICS = (
     "VASP OSZICAR ionic-line d E value parsed by pymatgen; "
@@ -111,6 +121,9 @@ _OSZICAR_IONIC_DE_SEMANTICS = (
 )
 _INCOMPLETE_VASPRUN_TRAJECTORY_REASON = "file could not be parsed completely"
 _UNREADABLE_VASPRUN_TRAJECTORY_REASON = "file could not be read"
+_EXPECTED_MALFORMED_XML_WARNING = (
+    "XML is malformed. Parsing has stopped but partial data is available."
+)
 _PACKAGE_RE = re.compile(r"^\[runner\]\s+(\w+)\s+version:\s*(.+)$")
 _PYTHON_RE = re.compile(r"^\[runner\]\s+python:\s*(.+)$")
 _ENV_RE = re.compile(r"\b(PMG_VASP_PSP_DIR)=([^\s]+)")
@@ -169,6 +182,12 @@ class LogRuntimeObservation:
     stage_uuids: Mapping[str, str]
     oom_diagnostic_messages: tuple[tuple[str, str], ...] = ()
     termination_diagnostic_messages: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class RemoteExecutionDiagnosticEvidence:
+    logs: tuple[BoundedLogDiagnostic, ...] = ()
+    error_archives: tuple[PathObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -289,6 +308,9 @@ class RunInspection:
         )
     )
     custodian_evidence: tuple[CustodianInterventionEvidence, ...] = ()
+    execution_diagnostics: RemoteExecutionDiagnosticEvidence = field(
+        default_factory=RemoteExecutionDiagnosticEvidence
+    )
 
 
 @dataclass(frozen=True)
@@ -498,6 +520,7 @@ class JobInspection:
     bmd_compute: RunDiagnosis | None = None
     direct_vasp: DirectVaspInspection | None = None
     oom: OomDiagnosticEvidence | None = None
+    run_resolution: JobRunResolution | None = None
 
 
 @dataclass(frozen=True)
@@ -566,6 +589,11 @@ def inspect_remote_run(
     modifier_policies: Iterable[Mapping[str, Any]] = (),
     timeout: float | None = None,
     scheduler_timeout: float | None = None,
+    scheduler_observation: tuple[SlurmAccountingRecord | None, str | None] | None = None,
+    expected_job_id: str | None = None,
+    submission_payload: Mapping[str, Any] | None = None,
+    attempt_payload: Mapping[str, Any] | None = None,
+    attempt_checked: bool = False,
 ) -> RunInspection:
     """Inspect a BMD Compute run through configured read-only resources."""
 
@@ -577,11 +605,15 @@ def inspect_remote_run(
         SUBMISSION_FILENAME,
         allowed_roots=cluster.allowed_remote_roots,
     )
-    submission = _read_json_file(
-        cluster.ssh_host,
-        submission_path,
-        runner=remote_runner,
-        timeout=timeout,
+    submission = (
+        dict(submission_payload)
+        if submission_payload is not None
+        else _read_json_file(
+            cluster.ssh_host,
+            submission_path,
+            runner=remote_runner,
+            timeout=timeout,
+        )
     )
     producer = _parse_submission(submission, allowed_roots=cluster.allowed_remote_roots)
 
@@ -649,26 +681,59 @@ def inspect_remote_run(
         timeout=timeout,
     )
 
-    attempt_state, attempt_payload = _read_attempt_state(
-        cluster.ssh_host,
-        producer["attempt_state_path"],
-        runner=remote_runner,
-        timeout=timeout,
-    )
-    job_id = _find_job_id(submission, attempt_payload)
-    scheduler, scheduler_error = _inspect_scheduler(
-        cluster.ssh_host,
-        job_id,
-        runner=slurm_runner,
-        timeout=scheduler_timeout,
-        ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
-    )
+    if attempt_checked:
+        attempt_state = AttemptStateObservation(
+            path=(
+                str(producer["attempt_state_path"])
+                if producer["attempt_state_path"] is not None
+                else None
+            ),
+            present=attempt_payload is not None,
+        )
+    else:
+        attempt_state, attempt_payload = _read_attempt_state(
+            cluster.ssh_host,
+            producer["attempt_state_path"],
+            runner=remote_runner,
+            timeout=timeout,
+        )
+    producer_job_id = _find_job_id(submission, attempt_payload)
+    if expected_job_id is not None:
+        expected_job_id = normalize_job_id(expected_job_id)
+        if producer_job_id is not None and producer_job_id != expected_job_id:
+            raise RunInspectionError(
+                "resolved scheduler job ID conflicts with submission provenance"
+            )
+    job_id = producer_job_id or expected_job_id
+    if scheduler_observation is None:
+        scheduler, scheduler_error = _inspect_scheduler(
+            cluster.ssh_host,
+            job_id,
+            runner=slurm_runner,
+            timeout=scheduler_timeout,
+            ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
+        )
+    else:
+        scheduler, scheduler_error = scheduler_observation
     runtime = _parse_runtime_logs(
         cluster.ssh_host,
         log_paths,
         runner=remote_runner,
         timeout=timeout,
     )
+    execution_diagnostics = _observe_remote_execution_diagnostics(
+        cluster.ssh_host,
+        authorize_remote_path(flow_root, allowed_roots=cluster.allowed_remote_roots),
+        producer["stage_dirs"],
+        producer["result_dir"],
+        producer["workflow_stages"],
+        allowed_roots=cluster.allowed_remote_roots,
+        runner=remote_runner,
+        timeout=timeout,
+        already_read=runtime.sources,
+        known_file_presence={item.path: item.present for item in final_artifacts},
+    )
+    runtime = _merge_runtime_diagnostics(runtime, execution_diagnostics.logs)
     oom = _assess_remote_oom_evidence(
         cluster,
         scheduler,
@@ -725,6 +790,7 @@ def inspect_remote_run(
         oom=oom,
         custodian_policy=producer["custodian_policy"],
         custodian_evidence=custodian_evidence,
+        execution_diagnostics=execution_diagnostics,
     )
 
 
@@ -771,6 +837,13 @@ def diagnose_remote_run(
     timeout: float | None = None,
     scheduler_timeout: float | None = None,
     max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
+    scheduler_observation: tuple[SlurmAccountingRecord | None, str | None] | None = None,
+    expected_job_id: str | None = None,
+    derive_scientific: bool = False,
+    scientific_parser: ScientificParser | None = None,
+    submission_payload: Mapping[str, Any] | None = None,
+    attempt_payload: Mapping[str, Any] | None = None,
+    attempt_checked: bool = False,
 ) -> RunDiagnosis:
     """Describe termination and convergence trajectory evidence for one run."""
 
@@ -782,10 +855,16 @@ def diagnose_remote_run(
         flow_root,
         remote_runner=remote_runner,
         slurm_runner=slurm_runner,
-        derive_scientific=False,
+        derive_scientific=derive_scientific,
+        scientific_parser=scientific_parser,
         modifier_policies=modifier_policies,
         timeout=timeout,
         scheduler_timeout=scheduler_timeout,
+        scheduler_observation=scheduler_observation,
+        expected_job_id=expected_job_id,
+        submission_payload=submission_payload,
+        attempt_payload=attempt_payload,
+        attempt_checked=attempt_checked,
     )
     trajectories = _observe_stage_trajectories(
         cluster.ssh_host,
@@ -814,6 +893,7 @@ def inspect_slurm_job(
     timeout: float | None = None,
     scheduler_timeout: float | None = None,
     max_vasprun_bytes: int = _DIAGNOSE_VASPRUN_MAX_BYTES,
+    deployment: DeploymentContext | None = None,
 ) -> JobInspection:
     """Inspect one scheduler job and supported calculation evidence read-only."""
 
@@ -827,6 +907,59 @@ def inspect_slurm_job(
         timeout=scheduler_timeout,
         ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
     )
+    resolution = resolve_bmd_compute_job(
+        cluster,
+        deployment,
+        normalized_job_id,
+        runner=remote_runner,
+        timeout=timeout,
+    )
+    if resolution.resolution_status == RESOLVED and resolution.run_directory is not None:
+        try:
+            diagnosis = diagnose_remote_run(
+                cluster,
+                resolution.run_directory,
+                remote_runner=remote_runner,
+                slurm_runner=slurm_runner,
+                modifier_policies=modifier_policies,
+                timeout=timeout,
+                scheduler_timeout=scheduler_timeout,
+                max_vasprun_bytes=max_vasprun_bytes,
+                scheduler_observation=(scheduler, scheduler_error),
+                expected_job_id=normalized_job_id,
+                derive_scientific=True,
+                scientific_parser=scientific_parser,
+                submission_payload=resolution._submission_payload,
+                attempt_payload=resolution._attempt_payload,
+                attempt_checked=resolution._attempt_checked,
+            )
+        except (RunInspectionError, RemotePathError, subprocess.SubprocessError) as exc:
+            return JobInspection(
+                job_id=normalized_job_id,
+                scheduler=scheduler,
+                scheduler_error=scheduler_error,
+                scheduler_work_dir=getattr(scheduler, "work_dir", None),
+                calculation_directory=resolution.run_directory,
+                calculation_type="BMD Compute",
+                calculation_reason=f"resolved BMD Compute run could not be analyzed: {exc}",
+                oom=assess_oom_evidence(
+                    scheduler,
+                    source_limitations=(str(exc),),
+                ),
+                run_resolution=resolution,
+            )
+        return JobInspection(
+            job_id=normalized_job_id,
+            scheduler=scheduler,
+            scheduler_error=scheduler_error,
+            scheduler_work_dir=getattr(scheduler, "work_dir", None),
+            calculation_directory=resolution.run_directory,
+            calculation_type="BMD Compute",
+            calculation_reason=None,
+            bmd_compute=diagnosis,
+            oom=diagnosis.inspection.oom,
+            run_resolution=resolution,
+        )
     if scheduler is None:
         return JobInspection(
             job_id=normalized_job_id,
@@ -840,6 +973,7 @@ def inspect_slurm_job(
                 None,
                 source_limitations=(scheduler_error or "scheduler accounting was unavailable",),
             ),
+            run_resolution=resolution,
         )
 
     scheduler_only_oom = assess_oom_evidence(scheduler)
@@ -855,6 +989,7 @@ def inspect_slurm_job(
             calculation_type="unknown",
             calculation_reason="scheduler WorkDir was unavailable",
             oom=scheduler_only_oom,
+            run_resolution=resolution,
         )
 
     try:
@@ -872,6 +1007,7 @@ def inspect_slurm_job(
             calculation_type="unknown",
             calculation_reason=f"scheduler WorkDir is not authorized: {exc}",
             oom=scheduler_only_oom,
+            run_resolution=resolution,
         )
 
     if not remote_directory_exists(
@@ -889,6 +1025,7 @@ def inspect_slurm_job(
             calculation_type="unknown",
             calculation_reason="scheduler WorkDir is authorized but is not a readable directory",
             oom=scheduler_only_oom,
+            run_resolution=resolution,
         )
 
     submission_path = build_remote_file_path(
@@ -912,6 +1049,8 @@ def inspect_slurm_job(
                 timeout=timeout,
                 scheduler_timeout=scheduler_timeout,
                 max_vasprun_bytes=max_vasprun_bytes,
+                scheduler_observation=(scheduler, scheduler_error),
+                expected_job_id=normalized_job_id,
             )
         except (RunInspectionError, RemotePathError, subprocess.SubprocessError) as exc:
             producer_reason = (
@@ -944,6 +1083,7 @@ def inspect_slurm_job(
                         remote_runner=remote_runner,
                         timeout=timeout,
                     ),
+                    run_resolution=resolution,
                 )
             return JobInspection(
                 job_id=normalized_job_id,
@@ -960,6 +1100,7 @@ def inspect_slurm_job(
                     remote_runner=remote_runner,
                     timeout=timeout,
                 ),
+                run_resolution=resolution,
             )
         return JobInspection(
             job_id=normalized_job_id,
@@ -971,6 +1112,7 @@ def inspect_slurm_job(
             calculation_reason=None,
             bmd_compute=diagnosis,
             oom=diagnosis.inspection.oom,
+            run_resolution=resolution,
         )
 
     direct, reason = _inspect_direct_vasp_directory(
@@ -999,6 +1141,7 @@ def inspect_slurm_job(
                 remote_runner=remote_runner,
                 timeout=timeout,
             ),
+            run_resolution=resolution,
         )
 
     return JobInspection(
@@ -1016,6 +1159,7 @@ def inspect_slurm_job(
             remote_runner=remote_runner,
             timeout=timeout,
         ),
+        run_resolution=resolution,
     )
 
 
@@ -2171,19 +2315,24 @@ def parse_vasp_output_files(
     vasprun = None
     executed_parameters: tuple[IncarObservation, ...] = ()
     if "vasprun" in local_paths:
-        try:
-            vasprun = _load_vasprun(
-                Vasprun,
-                local_paths["vasprun"],
-                parse_eigenvalues=parse_eigenvalues,
-            )
+        vasprun, malformed_xml, parse_error = _load_vasprun_tolerantly(
+            Vasprun,
+            local_paths["vasprun"],
+            parse_eigenvalues=parse_eigenvalues,
+        )
+        if parse_error is not None:
+            if malformed_xml:
+                unavailable.append("vasprun.xml could not be parsed completely")
+            else:
+                unavailable.append(f"vasprun.xml could not be parsed: {parse_error}")
+        else:
+            if malformed_xml:
+                unavailable.append("vasprun.xml could not be parsed completely")
             executed_parameters = vasp_reported_parameter_observations(
                 vasprun,
                 source_path=display_paths.get("vasprun"),
                 stage_index=_workflow_final_stage_index(workflow_spec),
             )
-        except Exception as exc:
-            unavailable.append(f"vasprun.xml could not be parsed: {exc}")
     else:
         unavailable.append("vasprun.xml is unavailable")
 
@@ -2424,6 +2573,7 @@ def _termination_observation(inspection: RunInspection) -> TerminationObservatio
             message
             for _, message in inspection.runtime.termination_diagnostic_messages
         ),
+        error_archive_count=len(inspection.execution_diagnostics.error_archives),
     )
 
     return TerminationObservation(
@@ -2617,34 +2767,21 @@ def _derive_direct_vasp_scientific_result(
         selected.append(observation)
 
     try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", UserWarning)
-            scientific = _derive_scientific_result(
-                ssh_host,
-                selected,
-                _direct_vasp_workflow_spec(),
-                runner=runner,
-                parser=parser,
-                timeout=timeout,
-            )
+        scientific = _derive_scientific_result(
+            ssh_host,
+            selected,
+            _direct_vasp_workflow_spec(),
+            runner=runner,
+            parser=parser,
+            timeout=timeout,
+        )
     except Exception as exc:
-        if _has_malformed_xml_warning(caught):
-            scientific = ScientificResult(
-                source_paths=tuple(
-                    observation.path for observation in selected if observation.present
-                ),
-                unavailable=("vasprun.xml could not be parsed completely",),
-            )
-        else:
-            scientific = ScientificResult(
-                source_paths=tuple(
-                    observation.path for observation in selected if observation.present
-                ),
-                error=str(exc),
-            )
-    else:
-        if _has_malformed_xml_warning(caught):
-            scientific = _scientific_with_malformed_vasprun_unavailable(scientific)
+        scientific = ScientificResult(
+            source_paths=tuple(
+                observation.path for observation in selected if observation.present
+            ),
+            error=str(exc),
+        )
     if unavailable:
         return replace(scientific, unavailable=scientific.unavailable + tuple(unavailable))
     return scientific
@@ -2662,22 +2799,6 @@ def _direct_vasp_workflow_spec() -> Mapping[str, Any]:
             }
         ]
     }
-
-
-def _scientific_with_malformed_vasprun_unavailable(
-    scientific: ScientificResult,
-) -> ScientificResult:
-    unavailable = tuple(
-        item
-        for item in scientific.unavailable
-        if "vasprun.xml could not be parsed:" not in item
-        and "list index out of range" not in item
-        and "xml is malformed" not in item.lower()
-    )
-    reason = "vasprun.xml could not be parsed completely"
-    if reason not in unavailable:
-        unavailable = unavailable + (reason,)
-    return replace(scientific, unavailable=unavailable)
 
 
 def _observe_stage_trajectories(
@@ -3346,22 +3467,24 @@ def _observe_vasprun_trajectory(
             handle.write(contents)
             temporary_path = Path(handle.name)
         try:
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", UserWarning)
-                vasprun = _load_vasprun(Vasprun, temporary_path, parse_eigenvalues=False)
-                if _has_malformed_xml_warning(caught):
-                    return _VasprunTrajectory(
-                        present=True,
-                        path=str(path),
-                        error=_INCOMPLETE_VASPRUN_TRAJECTORY_REASON,
-                    )
-                ionic_steps = tuple(getattr(vasprun, "ionic_steps", ()) or ())
-                parameters = _vasp_parameter_values(getattr(vasprun, "parameters", None))
-                converged_electronic = _bool_or_none(
-                    getattr(vasprun, "converged_electronic", None)
+            vasprun, malformed_xml, parse_error = _load_vasprun_tolerantly(
+                Vasprun,
+                temporary_path,
+                parse_eigenvalues=False,
+            )
+            if malformed_xml or parse_error is not None:
+                return _VasprunTrajectory(
+                    present=True,
+                    path=str(path),
+                    error=_INCOMPLETE_VASPRUN_TRAJECTORY_REASON,
                 )
-                converged_ionic = _bool_or_none(getattr(vasprun, "converged_ionic", None))
-                max_forces = _max_forces_by_step(ionic_steps)
+            ionic_steps = tuple(getattr(vasprun, "ionic_steps", ()) or ())
+            parameters = _vasp_parameter_values(getattr(vasprun, "parameters", None))
+            converged_electronic = _bool_or_none(
+                getattr(vasprun, "converged_electronic", None)
+            )
+            converged_ionic = _bool_or_none(getattr(vasprun, "converged_ionic", None))
+            max_forces = _max_forces_by_step(ionic_steps)
         finally:
             temporary_path.unlink(missing_ok=True)
     except Exception:
@@ -3379,13 +3502,6 @@ def _observe_vasprun_trajectory(
         converged_electronic=converged_electronic,
         converged_ionic=converged_ionic,
         max_forces=max_forces,
-    )
-
-
-def _has_malformed_xml_warning(caught_warnings: Sequence[warnings.WarningMessage]) -> bool:
-    return any(
-        "xml is malformed" in str(item.message).lower()
-        for item in caught_warnings
     )
 
 
@@ -4135,6 +4251,180 @@ def _scheduler_accounting_timeout(
     return cluster.scheduler_accounting_timeout_seconds if timeout is None else timeout
 
 
+def _observe_remote_execution_diagnostics(
+    ssh_host: str,
+    flow_root: PurePosixPath,
+    stage_dirs: Mapping[str, PurePosixPath],
+    result_dir: PurePosixPath,
+    workflow_stages: Sequence[WorkflowStage],
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+    already_read: Iterable[str] = (),
+    known_file_presence: Mapping[str, bool] | None = None,
+) -> RemoteExecutionDiagnosticEvidence:
+    directories = [flow_root]
+    directories.extend(
+        binding.directory
+        for binding in _bound_stage_directories(stage_dirs, result_dir, workflow_stages)
+    )
+    unique_directories: list[PurePosixPath] = []
+    seen_directories: set[str] = set()
+    for directory in directories:
+        key = str(directory)
+        if key in seen_directories:
+            continue
+        seen_directories.add(key)
+        unique_directories.append(directory)
+
+    logs = _observe_remote_diagnostic_logs(
+        ssh_host,
+        unique_directories,
+        allowed_roots=allowed_roots,
+        runner=runner,
+        timeout=timeout,
+        already_read=already_read,
+        known_file_presence=known_file_presence or {},
+    )
+    archives = _observe_remote_error_archives(
+        ssh_host,
+        unique_directories,
+        allowed_roots=allowed_roots,
+        runner=runner,
+        timeout=timeout,
+    )
+    return RemoteExecutionDiagnosticEvidence(logs=logs, error_archives=archives)
+
+
+def _observe_remote_diagnostic_logs(
+    ssh_host: str,
+    directories: Sequence[PurePosixPath],
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+    already_read: Iterable[str],
+    known_file_presence: Mapping[str, bool],
+) -> tuple[BoundedLogDiagnostic, ...]:
+    observations: list[BoundedLogDiagnostic] = []
+    seen = set(already_read)
+    for directory in directories:
+        for filename in _REMOTE_DIAGNOSTIC_LOG_FILENAMES:
+            path = build_remote_file_path(
+                directory,
+                filename,
+                allowed_roots=allowed_roots,
+            )
+            path_text = str(path)
+            if path_text in seen:
+                continue
+            seen.add(path_text)
+            present = known_file_presence.get(path_text)
+            if present is None:
+                present = remote_file_exists(
+                    ssh_host,
+                    path,
+                    runner=runner,
+                    timeout=timeout,
+                )
+            if not present:
+                continue
+            try:
+                text = retrieve_remote_file_tail(
+                    ssh_host,
+                    path,
+                    limit=_REMOTE_DIAGNOSTIC_LOG_MAX_BYTES,
+                    runner=runner,
+                    timeout=timeout,
+                ).decode("utf-8", "replace")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                observations.append(
+                    BoundedLogDiagnostic(
+                        filename,
+                        path_text,
+                        True,
+                        error="file could not be read through the bounded diagnostic path",
+                    )
+                )
+                continue
+            observations.append(
+                BoundedLogDiagnostic(
+                    filename,
+                    path_text,
+                    True,
+                    messages=diagnostic_log_messages(text),
+                )
+            )
+    return tuple(observations)
+
+
+def _observe_remote_error_archives(
+    ssh_host: str,
+    directories: Sequence[PurePosixPath],
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> tuple[PathObservation, ...]:
+    observations: list[PathObservation] = []
+    for directory in directories:
+        for index in range(1, _REMOTE_ERROR_ARCHIVE_LIMIT + 1):
+            filename = f"error.{index}.tar.gz"
+            path = build_remote_file_path(
+                directory,
+                filename,
+                allowed_roots=allowed_roots,
+            )
+            if not remote_file_exists(
+                ssh_host,
+                path,
+                runner=runner,
+                timeout=timeout,
+            ):
+                break
+            observations.append(
+                PathObservation(
+                    label=filename,
+                    path=str(path),
+                    kind="file",
+                    present=True,
+                    evidence_type=ARTIFACT_OBSERVATION,
+                )
+            )
+    return tuple(observations)
+
+
+def _merge_runtime_diagnostics(
+    runtime: LogRuntimeObservation,
+    logs: Sequence[BoundedLogDiagnostic],
+) -> LogRuntimeObservation:
+    sources = list(runtime.sources)
+    oom_messages = list(runtime.oom_diagnostic_messages)
+    termination_messages = list(runtime.termination_diagnostic_messages)
+    for log in logs:
+        if log.error is not None:
+            continue
+        path = str(log.path)
+        if path not in sources:
+            sources.append(path)
+        for message in log.messages:
+            for oom_message in oom_candidate_lines(message):
+                item = (path, oom_message)
+                if item not in oom_messages:
+                    oom_messages.append(item)
+            for termination_message in _termination_candidate_lines(message):
+                item = (path, termination_message)
+                if item not in termination_messages:
+                    termination_messages.append(item)
+    return replace(
+        runtime,
+        sources=tuple(sources),
+        oom_diagnostic_messages=tuple(oom_messages),
+        termination_diagnostic_messages=tuple(termination_messages),
+    )
+
+
 def _parse_runtime_logs(
     ssh_host: str,
     paths: Iterable[PathObservation],
@@ -4607,6 +4897,43 @@ def _load_vasprun(vasprun_cls: Any, path: Path, *, parse_eigenvalues: bool):
             parse_eigen=False,
             **scalar_only,
         )
+
+
+def _load_vasprun_tolerantly(
+    vasprun_cls: Any,
+    path: Path,
+    *,
+    parse_eigenvalues: bool,
+) -> tuple[Any | None, bool, Exception | None]:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        try:
+            vasprun = _load_vasprun(
+                vasprun_cls,
+                path,
+                parse_eigenvalues=parse_eigenvalues,
+            )
+        except Exception as exc:
+            vasprun = None
+            error: Exception | None = exc
+        else:
+            error = None
+
+    malformed_xml = False
+    for warning in caught:
+        if (
+            warning.category is UserWarning
+            and str(warning.message) == _EXPECTED_MALFORMED_XML_WARNING
+        ):
+            malformed_xml = True
+            continue
+        warnings.warn_explicit(
+            str(warning.message),
+            warning.category,
+            warning.filename,
+            warning.lineno,
+        )
+    return vasprun, malformed_xml, error
 
 
 def _band_structure_from_vasprun(vasprun: Any, local_paths: Mapping[str, Path]):

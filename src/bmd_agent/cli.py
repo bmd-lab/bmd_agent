@@ -17,6 +17,7 @@ from bmd_agent.deployment import DeploymentContext, resolve_deployment_context
 from bmd_agent.resources.bmdex import (
     BmdexDomainContextEnrichment,
     bmdex_repository,
+    enrich_job_with_bmdex_domain_context,
     enrich_lifecycle_with_bmdex_domain_context,
 )
 from bmd_agent.resources.compute import (
@@ -839,6 +840,7 @@ def show_job(
 
     registry = registry or load_resources()
     cluster = powerslurm_cluster(registry)
+    deployment = resolve_deployment_context(registry, cluster_key=cluster.key)
     modifier_policies, _ = modifier_policies_from_compute(registry)
 
     if not trajectory_json:
@@ -851,6 +853,7 @@ def show_job(
             cluster,
             job_id,
             modifier_policies=modifier_policies,
+            deployment=deployment,
         )
 
     except ValueError as exc:
@@ -871,11 +874,22 @@ def show_job(
             )
         )
     else:
-        print_job_inspection(inspection)
+        contextual_enrichment = enrich_job_with_bmdex_domain_context(
+            inspection,
+            bmdex_repository(registry),
+        )
+        print_job_inspection(
+            inspection,
+            contextual_enrichment=contextual_enrichment,
+        )
     return 0
 
 
-def print_job_inspection(inspection: JobInspection) -> None:
+def print_job_inspection(
+    inspection: JobInspection,
+    *,
+    contextual_enrichment: BmdexDomainContextEnrichment | None = None,
+) -> None:
     """Print a concise student-oriented job inspection summary."""
 
     print("Job (scheduler_observation):")
@@ -895,8 +909,31 @@ def print_job_inspection(inspection: JobInspection) -> None:
         print(f"  reason: {inspection.calculation_reason}")
     print()
 
+    resolution = inspection.run_resolution
+    if resolution is not None:
+        print(f"BMD Compute run resolution ({resolution.evidence_type}):")
+        status = (
+            "not found"
+            if resolution.resolution_status == "not_bmd_compute"
+            else resolution.resolution_status
+        )
+        print(f"  status: {status}")
+        if resolution.producer_state_path:
+            print(f"  producer state: {resolution.producer_state_path}")
+        if resolution.run_directory:
+            print(f"  run directory: {resolution.run_directory}")
+        if resolution.submission_attempt_id:
+            print(f"  submission attempt: {resolution.submission_attempt_id}")
+        if resolution.reason:
+            print(f"  reason: {resolution.reason}")
+        for limitation in resolution.limitations:
+            print(f"  limitation: {limitation}")
+        print()
+
     if inspection.bmd_compute is not None:
         print_run_diagnosis(inspection.bmd_compute)
+        if contextual_enrichment is not None:
+            _print_bmdex_contextual_enrichment(contextual_enrichment)
         return
 
     _print_oom_evidence(inspection.oom)
@@ -906,6 +943,8 @@ def print_job_inspection(inspection: JobInspection) -> None:
         print("Producer provenance (producer_provenance):")
         print("  unavailable")
         print("  reason: no supported calculation evidence was identified")
+        if contextual_enrichment is not None:
+            _print_bmdex_contextual_enrichment(contextual_enrichment)
         return
 
     direct = inspection.direct_vasp
@@ -934,6 +973,9 @@ def print_job_inspection(inspection: JobInspection) -> None:
 
     _print_trajectory_observations((direct.trajectory,))
     _print_convergence_progress_assessment_values(direct.assessments)
+    if contextual_enrichment is not None:
+        print()
+        _print_bmdex_contextual_enrichment(contextual_enrichment)
 
 
 def _print_job_record(record: object) -> None:

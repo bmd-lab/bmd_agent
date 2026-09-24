@@ -1,0 +1,82 @@
+{
+  "job_id": "21906221",
+  "run_name": "vasp_run_hse_static-20260917-211618",
+  "run_dir": "/bmd-db/guest/flows/vasp_run_hse_static-20260917-211618",
+  "remote_script": "/bmd-db/guest/flows/vasp_run_hse_static-20260917-211618.sbatch.sh",
+  "log_paths": {
+    "stdout": "/bmd-db/guest/logs/vasp_run_hse_static-20260917-211618.out",
+    "stderr": "/bmd-db/guest/logs/vasp_run_hse_static-20260917-211618.err",
+    "slurm_out": "/bmd-db/guest/logs/vasp_run_hse_static-20260917-211618.slurm.out",
+    "slurm_err": "/bmd-db/guest/logs/vasp_run_hse_static-20260917-211618.slurm.err"
+  },
+  "cluster": {
+    "partition": "leeburton-pool",
+    "account": "power-leeburton-users_v2"
+  },
+  "resources": {
+    "nodes": 1,
+    "ntasks": 24,
+    "mem_gb": 192,
+    "walltime": "12:00:00"
+  },
+  "submitted_at": "2026-09-17T21:16:20+03:00",
+  "raw_output": "21906221\n",
+  "status": "submitted",
+  "submission_spec": {
+    "run_name": "vasp_run_hse_static-20260917-211618",
+    "flow_spec": {
+      "workflow": "hse_static",
+      "workflow_spec": {
+        "recipe": "hse_static",
+        "label": null,
+        "stages": [
+          {
+            "stage_type": "static",
+            "theory": "hse06",
+            "modifiers": ["soc"],
+            "label": null,
+            "options": {}
+          }
+        ]
+      }
+    },
+    "paths": {
+      "run_dir": "/bmd-db/guest/flows/vasp_run_hse_static-20260917-211618",
+      "logs_dir": "/bmd-db/guest/logs",
+      "stage_dirs": {},
+      "result_dir": "/bmd-db/guest/flows/vasp_run_hse_static-20260917-211618",
+      "log_out": "/bmd-db/guest/logs/vasp_run_hse_static-20260917-211618.out",
+      "log_err": "/bmd-db/guest/logs/vasp_run_hse_static-20260917-211618.err",
+      "slurm_out": "/bmd-db/guest/logs/vasp_run_hse_static-20260917-211618.slurm.out",
+      "slurm_err": "/bmd-db/guest/logs/vasp_run_hse_static-20260917-211618.slurm.err",
+      "submission_attempt_state": "/bmd-db/guest/logs/submission_attempts/acceptance-21906221.json"
+    },
+    "submission": {
+      "attempt_id": "acceptance-21906221",
+      "attempt_state": "/bmd-db/guest/logs/submission_attempts/acceptance-21906221.json"
+    },
+    "cluster": {
+      "partition": "leeburton-pool",
+      "account": "power-leeburton-users_v2"
+    },
+    "resources": {
+      "nodes": 1,
+      "ntasks": 24,
+      "mem_gb": 192,
+      "walltime": "12:00:00"
+    },
+    "environment": {
+      "VASP_CMD": "mpirun -n $SLURM_NTASKS vasp_std"
+    },
+    "provenance": {
+      "bmd_compute": {
+        "source": {
+          "git_commit": "historical-acceptance-fixture",
+          "state": "clean",
+          "dirty": false
+        }
+      }
+    }
+  },
+  "remote_state_path": "/bmd-db/guest/logs/job_21906221.json"
+}
