@@ -69,6 +69,7 @@ from bmd_agent.resources.run import (
 )
 from bmd_agent.resources.oom import (
     INSUFFICIENT_OOM_EVIDENCE,
+    NO_OOM_EVIDENCE,
     OOM_ESTABLISHED,
 )
 from bmd_agent.resources.slurm import (
@@ -1254,7 +1255,9 @@ def test_resolved_running_bmd_job_keeps_partial_trajectory_nonfatal() -> None:
     assert inspection.bmd_compute.inspection.scientific.error is None
 
 
-def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidence() -> None:
+def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidence(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     fixture_path = Path(__file__).parent / "fixtures" / "job_21906221.json"
     state_bytes = fixture_path.read_bytes()
     state = json.loads(state_bytes)
@@ -1288,6 +1291,13 @@ def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidenc
         f"{run_dir}/OUTCAR": b"",
         f"{run_dir}/CONTCAR": b"contcar",
         f"{run_dir}/custodian.json": custodian_bytes,
+        f"{run_dir}/std_err.txt": (
+            b"forrtl: error (78): process killed (SIGTERM)\n"
+        ),
+        **{
+            f"{run_dir}/error.{index}.tar.gz": b"archive contents are not inspected"
+            for index in range(1, 6)
+        },
         spec["paths"]["log_out"]: b"",
         spec["paths"]["log_err"]: b"",
         spec["paths"]["slurm_out"]: b"",
@@ -1326,11 +1336,116 @@ def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidenc
     assert len(run.custodian_evidence[0].corrections) == 5
     assert run.custodian_evidence[0].repeated_interventions[0].count == 5
     assert run.custodian_evidence[0].repeated_interventions[0].timeout_seconds == 21600
+    assert run.custodian_policy.available is False
+    assert run.execution_diagnostics.logs[0].path == f"{run_dir}/std_err.txt"
+    assert "SIGTERM" in run.execution_diagnostics.logs[0].messages[0]
+    assert len(run.execution_diagnostics.error_archives) == 5
+    assert inspection.bmd_compute.termination.assessment is not None
+    assert (
+        inspection.bmd_compute.termination.assessment.classification
+        == "custodian_triggered_process_termination"
+    )
+    assert inspection.bmd_compute.termination.assessment.status == "supported"
+    assert inspection.oom is not None
+    assert inspection.oom.assessment == NO_OOM_EVIDENCE
     contextual_query = build_bmdex_domain_query_for_job(inspection)
     assert contextual_query is not None
     assert contextual_query["calculation_family"] == "hybrid_functional"
     assert contextual_query["functional"] == "hse06"
     assert "incomplete_first_electronic_cycle" in contextual_query["observed_patterns"]
+    remote_commands = [command[2] for command in remote.commands]
+    assert f"tail -c 128000 -- {run_dir}/std_err.txt" in remote_commands
+    assert not any(
+        shlex.split(command)[0] in {"tar", "find", "ls"}
+        for command in remote_commands
+    )
+    assert not any("error.*.tar.gz" in command or "POTCAR" in command for command in remote_commands)
+
+    cli.print_job_inspection(inspection)
+    output = capsys.readouterr().out
+    assert "classification: custodian_triggered_process_termination" in output
+    assert "status: supported" in output
+    assert "submission has no persisted Custodian execution-policy provenance" in output
+    assert "assessment: NO OOM EVIDENCE FOUND" in output
+
+
+def test_remote_execution_diagnostics_use_bounded_exact_read_only_paths() -> None:
+    directory = PurePosixPath(FLOW_ROOT)
+    files = {
+        f"{FLOW_ROOT}/std_err.txt": b"SIGTERM received by VASP\n",
+        f"{FLOW_ROOT}/vasp.out": b"fatal: bounded diagnostic fixture\n",
+        f"{FLOW_ROOT}/OUTCAR": b"forrtl: process killed\n",
+        f"{FLOW_ROOT}/error.1.tar.gz": b"not read",
+        f"{FLOW_ROOT}/error.2.tar.gz": b"not read",
+    }
+    remote = RemoteFixture(files=files, directories={FLOW_ROOT})
+
+    evidence = run_resource._observe_remote_execution_diagnostics(
+        "powerslurm-bmdguest",
+        directory,
+        {},
+        directory,
+        (WorkflowStage(1, "static", "hse06", (), None),),
+        allowed_roots=(PurePosixPath("/bmd-db/guest"),),
+        runner=remote,
+        timeout=20,
+    )
+
+    assert [item.label for item in evidence.logs] == ["std_err.txt", "vasp.out", "OUTCAR"]
+    assert evidence.logs[0].messages == ("SIGTERM received by VASP",)
+    assert [item.label for item in evidence.error_archives] == [
+        "error.1.tar.gz",
+        "error.2.tar.gz",
+    ]
+    commands = [command[2] for command in remote.commands]
+    assert f"tail -c 128000 -- {FLOW_ROOT}/std_err.txt" in commands
+    assert f"test -f {FLOW_ROOT}/error.3.tar.gz" in commands
+    assert not any(command.startswith("cat --") for command in commands)
+    assert not any(shlex.split(command)[0] in {"tar", "find", "ls"} for command in commands)
+    assert not any("error.*.tar.gz" in command or "POTCAR" in command for command in commands)
+
+
+def test_missing_remote_execution_diagnostics_are_nonfatal() -> None:
+    directory = PurePosixPath(FLOW_ROOT)
+    remote = RemoteFixture(files={}, directories={FLOW_ROOT})
+
+    evidence = run_resource._observe_remote_execution_diagnostics(
+        "powerslurm-bmdguest",
+        directory,
+        {},
+        directory,
+        (WorkflowStage(1, "static", "pbe", (), None),),
+        allowed_roots=(PurePosixPath("/bmd-db/guest"),),
+        runner=remote,
+        timeout=20,
+    )
+
+    assert evidence.logs == ()
+    assert evidence.error_archives == ()
+
+
+def test_completed_remote_bmd_run_remains_free_of_custodian_failure_sections(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    remote = RemoteFixture(files=default_files(), directories=default_directories())
+
+    diagnosis = diagnose_remote_run(
+        cluster(),
+        FLOW_ROOT,
+        remote_runner=remote,
+        slurm_runner=slurm_runner,
+        max_vasprun_bytes=0,
+    )
+
+    assert diagnosis.inspection.scheduler is not None
+    assert diagnosis.inspection.scheduler.state == "COMPLETED"
+    assert diagnosis.inspection.custodian_evidence == ()
+    assert diagnosis.inspection.execution_diagnostics.error_archives == ()
+
+    cli.print_run_diagnosis(diagnosis)
+    output = capsys.readouterr().out
+    assert "Custodian intervention evidence" not in output
+    assert "error archives" not in output
 
 
 def test_direct_vasp_truncated_vasprun_keeps_oszicar_trajectory(
@@ -1400,6 +1515,25 @@ def test_direct_vasp_scientific_parsing_captures_malformed_vasprun_warning(
     assert "file could not be parsed completely" in captured.out
     assert "list index out of range" not in captured.out
     assert "XML is malformed" not in captured.out
+
+
+def test_bmd_run_scientific_parsing_captures_malformed_vasprun_warning() -> None:
+    remote = RemoteFixture(files=single_stage_files(), directories={FLOW_ROOT})
+
+    with fake_pymatgen_modules(FakeMalformedVasprun), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        inspection = inspect_remote_run(
+            cluster(),
+            FLOW_ROOT,
+            remote_runner=remote,
+            slurm_runner=slurm_runner,
+            scientific_parser=parse_vasp_output_files,
+        )
+
+    assert caught == []
+    assert inspection.scientific.error is None
+    assert "vasprun.xml could not be parsed completely" in inspection.scientific.unavailable
+    assert "list index out of range" not in " ".join(inspection.scientific.unavailable)
 
 
 def test_completed_direct_vasp_relaxation_reports_converged(
@@ -3222,6 +3356,12 @@ class FakeMalformedVasprun(FakeBandVasprun):
         raise IndexError("list index out of range")
 
 
+class FakeUnexpectedWarningVasprun(FakeBandVasprun):
+    def __init__(self, path: str, **kwargs: object) -> None:
+        warnings.warn("unexpected parser diagnostic", RuntimeWarning)
+        super().__init__(path, **kwargs)
+
+
 @contextmanager
 def fake_pymatgen_modules(vasprun_cls: type[FakeBandVasprun]):
     modules = {
@@ -3318,6 +3458,27 @@ def test_band_parsing_keeps_final_vasprun_fermi_reference(tmp_path: Path) -> Non
     assert result.executed_parameters[0].values["IVDW"] == 11
     assert result.executed_parameters[1].source_type == "vasprun_xml.parameters"
     assert result.executed_parameters[1].values["ENCUT"] == 520
+
+
+def test_tolerant_vasprun_boundary_does_not_suppress_unexpected_warnings(
+    tmp_path: Path,
+) -> None:
+    local_paths, display_paths = fake_vasp_paths(tmp_path)
+
+    with (
+        fake_pymatgen_modules(FakeUnexpectedWarningVasprun),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        result = parse_vasp_output_files(
+            local_paths,
+            display_paths,
+            arbitrary_band_workflow_spec(),
+        )
+
+    assert result.final_formula == "X2"
+    assert [str(item.message) for item in caught] == ["unexpected parser diagnostic"]
+    assert result.error is None
 
 
 def test_scalar_observations_survive_band_structure_failure(tmp_path: Path) -> None:
