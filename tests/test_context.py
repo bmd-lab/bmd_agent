@@ -464,4 +464,7 @@ def test_no_new_cli_context_command_is_exposed(capsys) -> None:
 
     captured = capsys.readouterr()
     assert exit_code == 2
-    assert "Usage: bmd-agent job <SLURM_JOB_ID> [--trajectory-json]" in captured.out
+    assert (
+        "Usage: bmd-agent job <SLURM_JOB_ID> [--trajectory-json | --profile]"
+        in captured.out
+    )

@@ -47,6 +47,29 @@ def test_bare_numeric_target_and_explicit_job_use_same_job_implementation(
     assert calls == [("21853598", False), ("21853598", False)]
 
 
+def test_bare_numeric_and_explicit_job_profile_use_same_job_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def fake_show_job(
+        job_id: str,
+        registry: ResourceRegistry | None = None,
+        *,
+        trajectory_json: bool = False,
+        profile: bool = False,
+    ) -> int:
+        assert trajectory_json is False
+        calls.append((job_id, profile))
+        return 0
+
+    monkeypatch.setattr(cli, "show_job", fake_show_job)
+
+    assert cli.main(["21853598", "--profile"]) == 0
+    assert cli.main(["job", "21853598", "--profile"]) == 0
+    assert calls == [("21853598", True), ("21853598", True)]
+
+
 def test_bare_numeric_target_wins_over_same_named_local_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

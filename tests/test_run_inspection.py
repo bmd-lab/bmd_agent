@@ -15,6 +15,7 @@ from bmd_agent import cli
 import bmd_agent.resources.run as run_resource
 from bmd_agent.config import ResourceRegistry, SlurmClusterResource
 from bmd_agent.deployment import DeploymentContext, load_deployment_profile
+from bmd_agent.profiling import PerformanceProfiler, profiled_runner
 from bmd_agent.resources.bmdex import build_bmdex_domain_query_for_job
 from bmd_agent.resources.job_resolution import NOT_BMD_COMPUTE, RESOLVED
 from bmd_agent.resources.run import (
@@ -1303,12 +1304,11 @@ def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidenc
         spec["paths"]["slurm_out"]: b"",
         spec["paths"]["slurm_err"]: b"",
     }
-    remote = RemoteFixture(files=files, directories={run_dir})
-
-    inspection = inspect_slurm_job(
+    unprofiled_remote = RemoteFixture(files=files, directories={run_dir})
+    unprofiled_inspection = inspect_slurm_job(
         cluster(),
         "21906221",
-        remote_runner=remote,
+        remote_runner=unprofiled_remote,
         slurm_runner=job_slurm_runner(
             job_id="21906221",
             state="FAILED",
@@ -1322,6 +1322,49 @@ def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidenc
         max_vasprun_bytes=0,
         deployment=power_deployment(),
     )
+
+    profiled_remote = RemoteFixture(files=files, directories={run_dir})
+    profiler = PerformanceProfiler()
+    with profiler.activate():
+        inspection = inspect_slurm_job(
+            cluster(),
+            "21906221",
+            remote_runner=profiled_runner(profiled_remote, role="remote"),
+            slurm_runner=profiled_runner(
+                job_slurm_runner(
+                    job_id="21906221",
+                    state="FAILED",
+                    work_dir="/a/home/cc/tree/taucc/enginer/bmdguest",
+                    max_rss="45045764K",
+                ),
+                role="scheduler",
+            ),
+            scientific_parser=lambda local, display, workflow: ScientificResult(
+                source_paths=tuple(display.values()),
+                final_formula="fixture",
+            ),
+            max_vasprun_bytes=0,
+            deployment=power_deployment(),
+        )
+    profile = profiler.snapshot()
+
+    assert inspection == unprofiled_inspection
+    assert profiled_remote.commands == unprofiled_remote.commands
+    assert profile.operations.counts["scheduler_operations"] == 1
+    assert profile.operations.counts["ssh_invocations"] == len(profiled_remote.commands) + 1
+    assert profile.operations.counts["archive_probes"] == 6
+    assert profile.operations.bytes_transferred > 0
+    assert profile.operations.failure_count == 0
+    phase_names = {phase.name for phase in profile.phases}
+    assert "scheduler_acquisition" in phase_names
+    assert "job_run_resolution" in phase_names
+    assert "producer_submission_provenance" in phase_names
+    assert "calculation_workflow_acquisition" in phase_names
+    assert "vasp_scientific_evidence" in phase_names
+    assert "vasp_trajectory_evidence" in phase_names
+    assert "local_vasp_parsing" in phase_names
+    assert "diagnostic_custodian_evidence" in phase_names
+    assert "oom_resource_analysis" in phase_names
 
     assert inspection.run_resolution is not None
     assert inspection.run_resolution.resolution_status == RESOLVED
@@ -1353,7 +1396,7 @@ def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidenc
     assert contextual_query["calculation_family"] == "hybrid_functional"
     assert contextual_query["functional"] == "hse06"
     assert "incomplete_first_electronic_cycle" in contextual_query["observed_patterns"]
-    remote_commands = [command[2] for command in remote.commands]
+    remote_commands = [command[2] for command in profiled_remote.commands]
     assert f"tail -c 128000 -- {run_dir}/std_err.txt" in remote_commands
     assert not any(
         shlex.split(command)[0] in {"tar", "find", "ls"}

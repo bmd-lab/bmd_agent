@@ -14,6 +14,7 @@ from typing import Any
 
 from bmd_agent.config import SlurmClusterResource
 from bmd_agent.deployment import DeploymentContext
+from bmd_agent.profiling import profile_phase
 from bmd_agent.resources.custodian import (
     CustodianInterventionEvidence,
     CustodianPolicyEvidence,
@@ -600,22 +601,26 @@ def inspect_remote_run(
     timeout = _remote_command_timeout(cluster, timeout)
     scheduler_timeout = _scheduler_accounting_timeout(cluster, scheduler_timeout)
 
-    submission_path = build_remote_file_path(
-        flow_root,
-        SUBMISSION_FILENAME,
-        allowed_roots=cluster.allowed_remote_roots,
-    )
-    submission = (
-        dict(submission_payload)
-        if submission_payload is not None
-        else _read_json_file(
-            cluster.ssh_host,
-            submission_path,
-            runner=remote_runner,
-            timeout=timeout,
+    with profile_phase("producer_submission_provenance"):
+        submission_path = build_remote_file_path(
+            flow_root,
+            SUBMISSION_FILENAME,
+            allowed_roots=cluster.allowed_remote_roots,
         )
-    )
-    producer = _parse_submission(submission, allowed_roots=cluster.allowed_remote_roots)
+        submission = (
+            dict(submission_payload)
+            if submission_payload is not None
+            else _read_json_file(
+                cluster.ssh_host,
+                submission_path,
+                runner=remote_runner,
+                timeout=timeout,
+            )
+        )
+        producer = _parse_submission(
+            submission,
+            allowed_roots=cluster.allowed_remote_roots,
+        )
 
     stage_directories = tuple(
         _observe_remote_path(
@@ -671,15 +676,16 @@ def inspect_remote_run(
         runner=remote_runner,
         timeout=timeout,
     )
-    custodian_evidence = _observe_remote_custodian_evidence(
-        cluster.ssh_host,
-        producer["stage_dirs"],
-        producer["result_dir"],
-        producer["workflow_stages"],
-        allowed_roots=cluster.allowed_remote_roots,
-        runner=remote_runner,
-        timeout=timeout,
-    )
+    with profile_phase("diagnostic_custodian_evidence"):
+        custodian_evidence = _observe_remote_custodian_evidence(
+            cluster.ssh_host,
+            producer["stage_dirs"],
+            producer["result_dir"],
+            producer["workflow_stages"],
+            allowed_roots=cluster.allowed_remote_roots,
+            runner=remote_runner,
+            timeout=timeout,
+        )
 
     if attempt_checked:
         attempt_state = AttemptStateObservation(
@@ -715,43 +721,46 @@ def inspect_remote_run(
         )
     else:
         scheduler, scheduler_error = scheduler_observation
-    runtime = _parse_runtime_logs(
-        cluster.ssh_host,
-        log_paths,
-        runner=remote_runner,
-        timeout=timeout,
-    )
-    execution_diagnostics = _observe_remote_execution_diagnostics(
-        cluster.ssh_host,
-        authorize_remote_path(flow_root, allowed_roots=cluster.allowed_remote_roots),
-        producer["stage_dirs"],
-        producer["result_dir"],
-        producer["workflow_stages"],
-        allowed_roots=cluster.allowed_remote_roots,
-        runner=remote_runner,
-        timeout=timeout,
-        already_read=runtime.sources,
-        known_file_presence={item.path: item.present for item in final_artifacts},
-    )
-    runtime = _merge_runtime_diagnostics(runtime, execution_diagnostics.logs)
-    oom = _assess_remote_oom_evidence(
-        cluster,
-        scheduler,
-        scheduler_error=scheduler_error,
-        remote_runner=remote_runner,
-        timeout=timeout,
-        existing_log_sources=runtime.sources,
-        existing_log_observations=runtime.oom_diagnostic_messages,
-    )
-    if derive_scientific:
-        scientific = _derive_scientific_result(
+    with profile_phase("diagnostic_custodian_evidence"):
+        runtime = _parse_runtime_logs(
             cluster.ssh_host,
-            final_artifacts,
-            submission["flow_spec"]["workflow_spec"],
+            log_paths,
             runner=remote_runner,
-            parser=scientific_parser or parse_vasp_output_files,
             timeout=timeout,
         )
+        execution_diagnostics = _observe_remote_execution_diagnostics(
+            cluster.ssh_host,
+            authorize_remote_path(flow_root, allowed_roots=cluster.allowed_remote_roots),
+            producer["stage_dirs"],
+            producer["result_dir"],
+            producer["workflow_stages"],
+            allowed_roots=cluster.allowed_remote_roots,
+            runner=remote_runner,
+            timeout=timeout,
+            already_read=runtime.sources,
+            known_file_presence={item.path: item.present for item in final_artifacts},
+        )
+        runtime = _merge_runtime_diagnostics(runtime, execution_diagnostics.logs)
+    with profile_phase("oom_resource_analysis"):
+        oom = _assess_remote_oom_evidence(
+            cluster,
+            scheduler,
+            scheduler_error=scheduler_error,
+            remote_runner=remote_runner,
+            timeout=timeout,
+            existing_log_sources=runtime.sources,
+            existing_log_observations=runtime.oom_diagnostic_messages,
+        )
+    if derive_scientific:
+        with profile_phase("vasp_scientific_evidence"):
+            scientific = _derive_scientific_result(
+                cluster.ssh_host,
+                final_artifacts,
+                submission["flow_spec"]["workflow_spec"],
+                runner=remote_runner,
+                parser=scientific_parser or parse_vasp_output_files,
+                timeout=timeout,
+            )
     else:
         scientific = ScientificResult(
             source_paths=(),
@@ -866,14 +875,15 @@ def diagnose_remote_run(
         attempt_payload=attempt_payload,
         attempt_checked=attempt_checked,
     )
-    trajectories = _observe_stage_trajectories(
-        cluster.ssh_host,
-        inspection,
-        allowed_roots=cluster.allowed_remote_roots,
-        runner=remote_runner,
-        timeout=timeout,
-        max_vasprun_bytes=max_vasprun_bytes,
-    )
+    with profile_phase("vasp_trajectory_evidence"):
+        trajectories = _observe_stage_trajectories(
+            cluster.ssh_host,
+            inspection,
+            allowed_roots=cluster.allowed_remote_roots,
+            runner=remote_runner,
+            timeout=timeout,
+            max_vasprun_bytes=max_vasprun_bytes,
+        )
     return RunDiagnosis(
         inspection=inspection,
         termination=_termination_observation(inspection),
@@ -900,39 +910,42 @@ def inspect_slurm_job(
     timeout = _remote_command_timeout(cluster, timeout)
     scheduler_timeout = _scheduler_accounting_timeout(cluster, scheduler_timeout)
     normalized_job_id = normalize_job_id(job_id)
-    scheduler, scheduler_error = _inspect_scheduler(
-        cluster.ssh_host,
-        normalized_job_id,
-        runner=slurm_runner,
-        timeout=scheduler_timeout,
-        ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
-    )
-    resolution = resolve_bmd_compute_job(
-        cluster,
-        deployment,
-        normalized_job_id,
-        runner=remote_runner,
-        timeout=timeout,
-    )
+    with profile_phase("scheduler_acquisition"):
+        scheduler, scheduler_error = _inspect_scheduler(
+            cluster.ssh_host,
+            normalized_job_id,
+            runner=slurm_runner,
+            timeout=scheduler_timeout,
+            ssh_connect_timeout=cluster.ssh_connect_timeout_seconds,
+        )
+    with profile_phase("job_run_resolution"):
+        resolution = resolve_bmd_compute_job(
+            cluster,
+            deployment,
+            normalized_job_id,
+            runner=remote_runner,
+            timeout=timeout,
+        )
     if resolution.resolution_status == RESOLVED and resolution.run_directory is not None:
         try:
-            diagnosis = diagnose_remote_run(
-                cluster,
-                resolution.run_directory,
-                remote_runner=remote_runner,
-                slurm_runner=slurm_runner,
-                modifier_policies=modifier_policies,
-                timeout=timeout,
-                scheduler_timeout=scheduler_timeout,
-                max_vasprun_bytes=max_vasprun_bytes,
-                scheduler_observation=(scheduler, scheduler_error),
-                expected_job_id=normalized_job_id,
-                derive_scientific=True,
-                scientific_parser=scientific_parser,
-                submission_payload=resolution._submission_payload,
-                attempt_payload=resolution._attempt_payload,
-                attempt_checked=resolution._attempt_checked,
-            )
+            with profile_phase("calculation_workflow_acquisition"):
+                diagnosis = diagnose_remote_run(
+                    cluster,
+                    resolution.run_directory,
+                    remote_runner=remote_runner,
+                    slurm_runner=slurm_runner,
+                    modifier_policies=modifier_policies,
+                    timeout=timeout,
+                    scheduler_timeout=scheduler_timeout,
+                    max_vasprun_bytes=max_vasprun_bytes,
+                    scheduler_observation=(scheduler, scheduler_error),
+                    expected_job_id=normalized_job_id,
+                    derive_scientific=True,
+                    scientific_parser=scientific_parser,
+                    submission_payload=resolution._submission_payload,
+                    attempt_payload=resolution._attempt_payload,
+                    attempt_checked=resolution._attempt_checked,
+                )
         except (RunInspectionError, RemotePathError, subprocess.SubprocessError) as exc:
             return JobInspection(
                 job_id=normalized_job_id,
@@ -1040,34 +1053,36 @@ def inspect_slurm_job(
         timeout=timeout,
     ):
         try:
-            diagnosis = diagnose_remote_run(
-                cluster,
-                str(directory),
-                remote_runner=remote_runner,
-                slurm_runner=slurm_runner,
-                modifier_policies=modifier_policies,
-                timeout=timeout,
-                scheduler_timeout=scheduler_timeout,
-                max_vasprun_bytes=max_vasprun_bytes,
-                scheduler_observation=(scheduler, scheduler_error),
-                expected_job_id=normalized_job_id,
-            )
+            with profile_phase("calculation_workflow_acquisition"):
+                diagnosis = diagnose_remote_run(
+                    cluster,
+                    str(directory),
+                    remote_runner=remote_runner,
+                    slurm_runner=slurm_runner,
+                    modifier_policies=modifier_policies,
+                    timeout=timeout,
+                    scheduler_timeout=scheduler_timeout,
+                    max_vasprun_bytes=max_vasprun_bytes,
+                    scheduler_observation=(scheduler, scheduler_error),
+                    expected_job_id=normalized_job_id,
+                )
         except (RunInspectionError, RemotePathError, subprocess.SubprocessError) as exc:
             producer_reason = (
                 "submission.json was present but no valid BMD Compute producer "
                 f"record could be inspected: {exc}"
             )
-            direct, reason = _inspect_direct_vasp_directory(
-                cluster.ssh_host,
-                directory,
-                allowed_roots=cluster.allowed_remote_roots,
-                remote_runner=remote_runner,
-                scientific_parser=scientific_parser or parse_vasp_output_files,
-                timeout=timeout,
-                max_vasprun_bytes=max_vasprun_bytes,
-                producer_reason=producer_reason,
-                scheduler_state=scheduler.state,
-            )
+            with profile_phase("calculation_workflow_acquisition"):
+                direct, reason = _inspect_direct_vasp_directory(
+                    cluster.ssh_host,
+                    directory,
+                    allowed_roots=cluster.allowed_remote_roots,
+                    remote_runner=remote_runner,
+                    scientific_parser=scientific_parser or parse_vasp_output_files,
+                    timeout=timeout,
+                    max_vasprun_bytes=max_vasprun_bytes,
+                    producer_reason=producer_reason,
+                    scheduler_state=scheduler.state,
+                )
             if direct is None:
                 return JobInspection(
                     job_id=normalized_job_id,
@@ -1115,17 +1130,18 @@ def inspect_slurm_job(
             run_resolution=resolution,
         )
 
-    direct, reason = _inspect_direct_vasp_directory(
-        cluster.ssh_host,
-        directory,
-        allowed_roots=cluster.allowed_remote_roots,
-        remote_runner=remote_runner,
-        scientific_parser=scientific_parser or parse_vasp_output_files,
-        timeout=timeout,
-        max_vasprun_bytes=max_vasprun_bytes,
-        producer_reason="no BMD Compute producer record found",
-        scheduler_state=scheduler.state,
-    )
+    with profile_phase("calculation_workflow_acquisition"):
+        direct, reason = _inspect_direct_vasp_directory(
+            cluster.ssh_host,
+            directory,
+            allowed_roots=cluster.allowed_remote_roots,
+            remote_runner=remote_runner,
+            scientific_parser=scientific_parser or parse_vasp_output_files,
+            timeout=timeout,
+            max_vasprun_bytes=max_vasprun_bytes,
+            producer_reason="no BMD Compute producer record found",
+            scheduler_state=scheduler.state,
+        )
     if direct is None:
         return JobInspection(
             job_id=normalized_job_id,
@@ -2857,9 +2873,14 @@ def _observe_stage_trajectory(
     oszicar_trajectory = _OszicarTrajectory(None, (), (), None, (), (), ())
     if oszicar_present:
         try:
-            oszicar_trajectory = parse_oszicar_trajectory(
-                retrieve_remote_file(ssh_host, oszicar_path, runner=runner, timeout=timeout)
+            oszicar_contents = retrieve_remote_file(
+                ssh_host,
+                oszicar_path,
+                runner=runner,
+                timeout=timeout,
             )
+            with profile_phase("local_vasp_parsing"):
+                oszicar_trajectory = parse_oszicar_trajectory(oszicar_contents)
         except Exception as exc:
             oszicar_error = str(exc)
             unavailable.append(f"OSZICAR could not be parsed: {exc}")
@@ -3289,7 +3310,8 @@ def _observe_outcar_force_trajectory(
             runner=runner,
             timeout=timeout,
         )
-        blocks = parse_outcar_force_extraction(payload, source_path=str(path))
+        with profile_phase("local_vasp_parsing"):
+            blocks = parse_outcar_force_extraction(payload, source_path=str(path))
     except RunInspectionError as exc:
         return _OutcarForceTrajectory(
             present=True,
@@ -3467,24 +3489,29 @@ def _observe_vasprun_trajectory(
             handle.write(contents)
             temporary_path = Path(handle.name)
         try:
-            vasprun, malformed_xml, parse_error = _load_vasprun_tolerantly(
-                Vasprun,
-                temporary_path,
-                parse_eigenvalues=False,
-            )
-            if malformed_xml or parse_error is not None:
-                return _VasprunTrajectory(
-                    present=True,
-                    path=str(path),
-                    error=_INCOMPLETE_VASPRUN_TRAJECTORY_REASON,
+            with profile_phase("local_vasp_parsing"):
+                vasprun, malformed_xml, parse_error = _load_vasprun_tolerantly(
+                    Vasprun,
+                    temporary_path,
+                    parse_eigenvalues=False,
                 )
-            ionic_steps = tuple(getattr(vasprun, "ionic_steps", ()) or ())
-            parameters = _vasp_parameter_values(getattr(vasprun, "parameters", None))
-            converged_electronic = _bool_or_none(
-                getattr(vasprun, "converged_electronic", None)
-            )
-            converged_ionic = _bool_or_none(getattr(vasprun, "converged_ionic", None))
-            max_forces = _max_forces_by_step(ionic_steps)
+                if malformed_xml or parse_error is not None:
+                    return _VasprunTrajectory(
+                        present=True,
+                        path=str(path),
+                        error=_INCOMPLETE_VASPRUN_TRAJECTORY_REASON,
+                    )
+                ionic_steps = tuple(getattr(vasprun, "ionic_steps", ()) or ())
+                parameters = _vasp_parameter_values(
+                    getattr(vasprun, "parameters", None)
+                )
+                converged_electronic = _bool_or_none(
+                    getattr(vasprun, "converged_electronic", None)
+                )
+                converged_ionic = _bool_or_none(
+                    getattr(vasprun, "converged_ionic", None)
+                )
+                max_forces = _max_forces_by_step(ionic_steps)
         finally:
             temporary_path.unlink(missing_ok=True)
     except Exception:
@@ -4615,7 +4642,8 @@ def _derive_scientific_result(
             local_path.write_bytes(contents)
             local_paths[key] = local_path
             display_paths[key] = observation.path
-        return parser(local_paths, display_paths, workflow_spec)
+        with profile_phase("local_vasp_parsing"):
+            return parser(local_paths, display_paths, workflow_spec)
 
 
 def _observe_remote_path(
