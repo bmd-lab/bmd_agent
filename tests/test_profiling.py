@@ -135,7 +135,7 @@ def test_profile_model_is_json_safe() -> None:
     encoded = json.dumps(profiler.snapshot().to_dict(), allow_nan=False)
     payload = json.loads(encoded)
 
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["evidence_type"] == "agent_performance_telemetry"
     assert payload["total_elapsed_seconds"] == 2
     assert payload["operations"]["counts"]["ssh_invocations"] == 0

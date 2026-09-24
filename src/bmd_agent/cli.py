@@ -58,7 +58,11 @@ from bmd_agent.resources.run import (
     serialize_job_trajectory_evidence,
 )
 from bmd_agent.resources.slurm import get_job_accounting, get_queue
-from bmd_agent.resources.vasp import RemotePathError, read_remote_structure
+from bmd_agent.resources.vasp import (
+    RemotePathError,
+    read_remote_structure,
+    remote_acquisition_cache,
+)
 
 
 _EXECUTED_INPUT_DISPLAY_KEYS = (
@@ -892,14 +896,18 @@ def _show_job(
             cluster.ssh_host,
             close_timeout=cluster.ssh_connect_timeout_seconds,
         ) as ssh_session:
-            inspection = inspect_slurm_job(
-                cluster,
-                job_id,
-                modifier_policies=modifier_policies,
-                deployment=deployment,
-                remote_runner=ssh_session.runner("remote"),
-                slurm_runner=ssh_session.runner("scheduler"),
-            )
+            with remote_acquisition_cache(
+                cluster.ssh_host,
+                cluster.allowed_remote_roots,
+            ):
+                inspection = inspect_slurm_job(
+                    cluster,
+                    job_id,
+                    modifier_policies=modifier_policies,
+                    deployment=deployment,
+                    remote_runner=ssh_session.runner("remote"),
+                    slurm_runner=ssh_session.runner("scheduler"),
+                )
 
     except ValueError as exc:
         print(f"Unable to inspect job: {exc}")
@@ -979,6 +987,10 @@ def print_performance_profile(profile: PerformanceProfile) -> None:
         "directory_listing_operations",
         "archive_probes",
         "archive_probe_batches",
+        "metadata_manifest_operations",
+        "batched_file_read_operations",
+        "logical_files_described",
+        "logical_files_read",
         "scheduler_operations",
         "producer_operations",
         "bmdex_operations",

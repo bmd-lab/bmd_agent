@@ -41,12 +41,14 @@ from bmd_agent.resources.slurm import (
     normalize_job_id,
 )
 from bmd_agent.resources.vasp import (
+    RemoteAcquisitionRequest,
     RemotePathError,
     RemoteOutcarForceExtractionError,
     authorize_remote_path,
     build_remote_file_path,
     extract_remote_outcar_force_blocks,
     parse_poscar,
+    prime_remote_acquisition,
     probe_remote_error_archives,
     remote_directory_exists,
     remote_file_exists,
@@ -116,6 +118,7 @@ _OOM_REMOTE_LOG_MAX_BYTES = 128_000
 _REMOTE_DIAGNOSTIC_LOG_MAX_BYTES = 128_000
 _REMOTE_DIAGNOSTIC_LOG_FILENAMES = ("std_err.txt", "vasp.out", "OUTCAR")
 _REMOTE_ERROR_ARCHIVE_LIMIT = 64
+_REMOTE_BATCH_FILE_MAX_BYTES = 2_000_000
 _CUSTODIAN_REMOTE_MAX_BYTES = 2_000_000
 _OSZICAR_IONIC_DE_SEMANTICS = (
     "VASP OSZICAR ionic-line d E value parsed by pymatgen; "
@@ -623,6 +626,19 @@ def inspect_remote_run(
             allowed_roots=cluster.allowed_remote_roots,
         )
 
+    _prime_bmd_run_acquisition(
+        cluster.ssh_host,
+        authorize_remote_path(flow_root, allowed_roots=cluster.allowed_remote_roots),
+        producer["stage_dirs"],
+        producer["result_dir"],
+        producer["log_paths"],
+        producer["workflow_stages"],
+        scheduler=(scheduler_observation[0] if scheduler_observation is not None else None),
+        allowed_roots=cluster.allowed_remote_roots,
+        runner=remote_runner,
+        timeout=timeout,
+    )
+
     stage_directories = tuple(
         _observe_remote_path(
             cluster.ssh_host,
@@ -1024,6 +1040,14 @@ def inspect_slurm_job(
             run_resolution=resolution,
         )
 
+    _prime_direct_vasp_acquisition(
+        cluster.ssh_host,
+        directory,
+        scheduler=scheduler,
+        allowed_roots=cluster.allowed_remote_roots,
+        runner=remote_runner,
+        timeout=timeout,
+    )
     if not remote_directory_exists(
         cluster.ssh_host,
         directory,
@@ -2622,6 +2646,13 @@ def _inspect_direct_vasp_directory(
     producer_reason: str,
     scheduler_state: str | None,
 ) -> tuple[DirectVaspInspection | None, str | None]:
+    _prime_direct_vasp_acquisition(
+        ssh_host,
+        directory,
+        allowed_roots=allowed_roots,
+        runner=remote_runner,
+        timeout=timeout,
+    )
     artifacts = _observe_direct_vasp_artifacts(
         ssh_host,
         directory,
@@ -4277,6 +4308,228 @@ def _scheduler_accounting_timeout(
     timeout: float | None,
 ) -> float:
     return cluster.scheduler_accounting_timeout_seconds if timeout is None else timeout
+
+
+def _prime_bmd_run_acquisition(
+    ssh_host: str,
+    flow_root: PurePosixPath,
+    stage_dirs: Mapping[str, PurePosixPath],
+    result_dir: PurePosixPath,
+    log_paths: Mapping[str, PurePosixPath],
+    workflow_stages: Sequence[WorkflowStage],
+    *,
+    scheduler: SlurmAccountingRecord | None,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> None:
+    bindings = _bound_stage_directories(stage_dirs, result_dir, workflow_stages)
+    stage_directories = {binding.directory for binding in bindings}
+    directories = [flow_root, *(binding.directory for binding in bindings)]
+    requests: list[RemoteAcquisitionRequest] = []
+    seen_directories: set[str] = set()
+    for directory in directories:
+        if str(directory) in seen_directories:
+            continue
+        seen_directories.add(str(directory))
+        if directory not in stage_directories:
+            requests.extend(
+                _diagnostic_directory_acquisition_requests(
+                    directory,
+                    allowed_roots=allowed_roots,
+                )
+            )
+        else:
+            requests.extend(
+                _bmd_stage_acquisition_requests(
+                    directory,
+                    include_final_artifacts=directory == result_dir,
+                    allowed_roots=allowed_roots,
+                )
+            )
+
+    requests.extend(
+        RemoteAcquisitionRequest(path, read_limit=_REMOTE_BATCH_FILE_MAX_BYTES)
+        for path in log_paths.values()
+    )
+    requests.extend(
+        _scheduler_log_acquisition_requests(
+            scheduler,
+            allowed_roots=allowed_roots,
+        )
+    )
+    prime_remote_acquisition(
+        ssh_host,
+        requests,
+        runner=runner,
+        timeout=timeout,
+    )
+
+
+def _prime_direct_vasp_acquisition(
+    ssh_host: str,
+    directory: PurePosixPath,
+    *,
+    scheduler: SlurmAccountingRecord | None = None,
+    allowed_roots: Iterable[PurePosixPath | str],
+    runner: RemoteRunner,
+    timeout: float,
+) -> None:
+    requests = list(
+        _direct_vasp_acquisition_requests(
+            directory,
+            allowed_roots=allowed_roots,
+        )
+    )
+    requests.extend(
+        _scheduler_log_acquisition_requests(
+            scheduler,
+            allowed_roots=allowed_roots,
+        )
+    )
+    prime_remote_acquisition(
+        ssh_host,
+        requests,
+        runner=runner,
+        timeout=timeout,
+    )
+
+
+def _bmd_stage_acquisition_requests(
+    directory: PurePosixPath,
+    *,
+    include_final_artifacts: bool,
+    allowed_roots: Iterable[PurePosixPath | str],
+) -> tuple[RemoteAcquisitionRequest, ...]:
+    requests = [RemoteAcquisitionRequest(directory, kind="directory")]
+    read_limits = {
+        "INCAR": _REMOTE_BATCH_FILE_MAX_BYTES,
+        "POSCAR": _REMOTE_BATCH_FILE_MAX_BYTES,
+        "OSZICAR": _REMOTE_BATCH_FILE_MAX_BYTES,
+        "custodian.json": _CUSTODIAN_REMOTE_MAX_BYTES,
+        "std_err.txt": _REMOTE_DIAGNOSTIC_LOG_MAX_BYTES,
+        "vasp.out": _REMOTE_DIAGNOSTIC_LOG_MAX_BYTES,
+        "OUTCAR": _REMOTE_DIAGNOSTIC_LOG_MAX_BYTES,
+    }
+    metadata_names = {"vasprun.xml"}
+    if include_final_artifacts:
+        read_limits.update(
+            {
+                "KPOINTS": _REMOTE_BATCH_FILE_MAX_BYTES,
+                "CONTCAR": _REMOTE_BATCH_FILE_MAX_BYTES,
+            }
+        )
+        metadata_names.add("DOSCAR")
+    for filename in sorted(set(read_limits) | metadata_names):
+        path = build_remote_file_path(
+            directory,
+            filename,
+            allowed_roots=allowed_roots,
+        )
+        requests.append(
+            RemoteAcquisitionRequest(
+                path,
+                read_limit=read_limits.get(filename, 0),
+            )
+        )
+    requests.extend(
+        _error_archive_acquisition_requests(
+            directory,
+            allowed_roots=allowed_roots,
+        )
+    )
+    return tuple(requests)
+
+
+def _direct_vasp_acquisition_requests(
+    directory: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+) -> tuple[RemoteAcquisitionRequest, ...]:
+    requests = [RemoteAcquisitionRequest(directory, kind="directory")]
+    read_limits = {
+        SUBMISSION_FILENAME: _REMOTE_BATCH_FILE_MAX_BYTES,
+        "INCAR": _REMOTE_BATCH_FILE_MAX_BYTES,
+        "OSZICAR": _REMOTE_BATCH_FILE_MAX_BYTES,
+        "CONTCAR": _REMOTE_BATCH_FILE_MAX_BYTES,
+        "custodian.json": _CUSTODIAN_REMOTE_MAX_BYTES,
+    }
+    metadata_names = {"POSCAR", "KPOINTS", "OUTCAR", "vasprun.xml"}
+    for filename in sorted(set(read_limits) | metadata_names):
+        requests.append(
+            RemoteAcquisitionRequest(
+                build_remote_file_path(
+                    directory,
+                    filename,
+                    allowed_roots=allowed_roots,
+                ),
+                read_limit=read_limits.get(filename, 0),
+            )
+        )
+    return tuple(requests)
+
+
+def _diagnostic_directory_acquisition_requests(
+    directory: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+) -> tuple[RemoteAcquisitionRequest, ...]:
+    requests = [
+        RemoteAcquisitionRequest(
+            build_remote_file_path(
+                directory,
+                filename,
+                allowed_roots=allowed_roots,
+            ),
+            read_limit=_REMOTE_DIAGNOSTIC_LOG_MAX_BYTES,
+        )
+        for filename in _REMOTE_DIAGNOSTIC_LOG_FILENAMES
+    ]
+    requests.extend(
+        _error_archive_acquisition_requests(
+            directory,
+            allowed_roots=allowed_roots,
+        )
+    )
+    return tuple(requests)
+
+
+def _error_archive_acquisition_requests(
+    directory: PurePosixPath,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+) -> tuple[RemoteAcquisitionRequest, ...]:
+    return (
+        RemoteAcquisitionRequest(
+            authorize_remote_path(directory, allowed_roots=allowed_roots),
+            kind="archives",
+            read_limit=_REMOTE_ERROR_ARCHIVE_LIMIT,
+        ),
+    )
+
+
+def _scheduler_log_acquisition_requests(
+    scheduler: SlurmAccountingRecord | None,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+) -> tuple[RemoteAcquisitionRequest, ...]:
+    if scheduler is None:
+        return ()
+    raw_paths = [scheduler.stdout_path, scheduler.stderr_path]
+    for step in scheduler.steps:
+        raw_paths.extend((step.stdout_path, step.stderr_path))
+    requests: list[RemoteAcquisitionRequest] = []
+    for raw_path in raw_paths:
+        if not raw_path:
+            continue
+        try:
+            path = authorize_remote_path(raw_path, allowed_roots=allowed_roots)
+        except RemotePathError:
+            continue
+        requests.append(
+            RemoteAcquisitionRequest(path, read_limit=_OOM_REMOTE_LOG_MAX_BYTES)
+        )
+    return tuple(requests)
 
 
 def _observe_remote_execution_diagnostics(

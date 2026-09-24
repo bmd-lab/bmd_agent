@@ -11,9 +11,11 @@ from bmd_agent.deployment import DeploymentContext
 from bmd_agent.profiling import profile_phase
 from bmd_agent.resources.slurm import normalize_job_id
 from bmd_agent.resources.vasp import (
+    RemoteAcquisitionRequest,
     RemotePathError,
     authorize_remote_path,
     build_remote_file_path,
+    prime_remote_acquisition,
     remote_directory_exists,
     remote_file_exists,
     remote_file_size,
@@ -88,6 +90,12 @@ def resolve_bmd_compute_job(
         allowed_roots=cluster.allowed_remote_roots,
     )
     with profile_phase("producer_submission_provenance"):
+        prime_remote_acquisition(
+            cluster.ssh_host,
+            (RemoteAcquisitionRequest(state_path, read_limit=_MAX_PRODUCER_JSON_BYTES),),
+            runner=runner,
+            timeout=timeout,
+        )
         state_present = remote_file_exists(
             cluster.ssh_host,
             state_path,
@@ -252,7 +260,24 @@ def _validate_resolution(
         cluster=cluster,
     )
 
+    submission_path = build_remote_file_path(
+        run_directory,
+        "submission.json",
+        allowed_roots=cluster.allowed_remote_roots,
+    )
     with profile_phase("producer_submission_provenance"):
+        prime_remote_acquisition(
+            cluster.ssh_host,
+            (
+                RemoteAcquisitionRequest(run_directory, kind="directory"),
+                RemoteAcquisitionRequest(
+                    submission_path,
+                    read_limit=_MAX_PRODUCER_JSON_BYTES,
+                ),
+            ),
+            runner=runner,
+            timeout=timeout,
+        )
         run_directory_present = remote_directory_exists(
             cluster.ssh_host,
             run_directory,
@@ -272,11 +297,6 @@ def _validate_resolution(
             limitations=tuple(limitations),
         )
 
-    submission_path = build_remote_file_path(
-        run_directory,
-        "submission.json",
-        allowed_roots=cluster.allowed_remote_roots,
-    )
     with profile_phase("producer_submission_provenance"):
         submission_present = remote_file_exists(
             cluster.ssh_host,
@@ -324,6 +344,17 @@ def _validate_resolution(
         )
     else:
         with profile_phase("producer_submission_provenance"):
+            prime_remote_acquisition(
+                cluster.ssh_host,
+                (
+                    RemoteAcquisitionRequest(
+                        attempt_path,
+                        read_limit=_MAX_PRODUCER_JSON_BYTES,
+                    ),
+                ),
+                runner=runner,
+                timeout=timeout,
+            )
             attempt_present = remote_file_exists(
                 cluster.ssh_host,
                 attempt_path,

@@ -5,12 +5,13 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import re
+import shlex
 import subprocess
 import time
 from typing import Any
 
 
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 3
 PROFILE_EVIDENCE_TYPE = "agent_performance_telemetry"
 
 _COUNT_KEYS = (
@@ -29,6 +30,10 @@ _COUNT_KEYS = (
     "directory_listing_operations",
     "archive_probes",
     "archive_probe_batches",
+    "metadata_manifest_operations",
+    "batched_file_read_operations",
+    "logical_files_described",
+    "logical_files_read",
     "scheduler_operations",
     "producer_operations",
     "bmdex_operations",
@@ -47,6 +52,8 @@ _ELAPSED_KEYS = (
     "producer_wait",
     "bmdex_wait",
     "archive_probe_wait",
+    "metadata_manifest_wait",
+    "batched_file_read_wait",
 )
 _ARCHIVE_PROBE_RE = re.compile(r"(?:^|/)error\.\d+\.tar\.gz(?:['\"\s]|$)")
 
@@ -78,7 +85,9 @@ class OperationTelemetry:
         "ssh_invocations counts local SSH client processes; ssh_connections counts "
         "transport connections established by those processes; ssh_exec_channels "
         "counts remote command channels; archive_probes counts remote metadata "
-        "commands and archive_probe_batches identifies bounded multi-candidate probes"
+        "commands and archive_probe_batches identifies bounded multi-candidate probes; "
+        "logical_files_described counts structured records returned by fixed batched "
+        "operations and logical_files_read counts records reporting bounded contents"
     )
 
 
@@ -253,6 +262,10 @@ class PerformanceProfiler:
                 categories = _classify_remote_command(remote_command, self._counts)
                 for category in categories:
                     self._elapsed[f"{category}_wait"] += elapsed
+                if _is_acquisition_command(remote_command):
+                    described, read = _acquisition_result_counts(result)
+                    self._counts["logical_files_described"] += described
+                    self._counts["logical_files_read"] += read
             if opens_connection and not _is_ssh_transport_failure(
                 result,
                 timed_out=timed_out,
@@ -340,7 +353,19 @@ def _command_parts(command: object) -> tuple[str, ...]:
 
 def _classify_remote_command(command: str, counts: dict[str, int]) -> tuple[str, ...]:
     categories: list[str] = []
-    if command.startswith("cat -- "):
+    acquisition = _acquisition_command_counts(command)
+    if acquisition is not None:
+        _described, requested_reads, archive_count = acquisition
+        counts["metadata_manifest_operations"] += 1
+        categories.append("metadata_manifest")
+        if requested_reads:
+            counts["batched_file_read_operations"] += 1
+            categories.append("batched_file_read")
+        if archive_count:
+            counts["archive_probes"] += 1
+            counts["archive_probe_batches"] += 1
+            categories.append("archive_probe")
+    elif command.startswith("cat -- "):
         counts["remote_file_reads"] += 1
         categories.append("remote_file_read")
     elif command.startswith("tail -c "):
@@ -371,7 +396,7 @@ def _classify_remote_command(command: str, counts: dict[str, int]) -> tuple[str,
     archive_probe = command.startswith("test -f ") and bool(
         _ARCHIVE_PROBE_RE.search(command)
     )
-    if archive_batch:
+    if archive_batch and acquisition is None:
         counts["archive_probes"] += 1
         counts["archive_probe_batches"] += 1
         categories.append("archive_probe")
@@ -379,6 +404,38 @@ def _classify_remote_command(command: str, counts: dict[str, int]) -> tuple[str,
         counts["archive_probes"] += 1
         categories.append("archive_probe")
     return tuple(categories)
+
+
+def _is_acquisition_command(command: str) -> bool:
+    return _acquisition_command_counts(command) is not None
+
+
+def _acquisition_command_counts(command: str) -> tuple[int, int, int] | None:
+    if not command.startswith("sh -s -- ") or "bmd-agent-acquisition-v1" not in command:
+        return None
+    try:
+        parts = shlex.split(command)
+        if parts[:4] != ["sh", "-s", "--", "bmd-agent-acquisition-v1"]:
+            return None
+        return int(parts[5]), int(parts[6]), int(parts[7])
+    except (IndexError, ValueError):
+        return None
+
+
+def _acquisition_result_counts(result: object | None) -> tuple[int, int]:
+    stdout = getattr(result, "stdout", b"")
+    if isinstance(stdout, bytes):
+        text = stdout.decode("ascii", "ignore")
+    elif isinstance(stdout, str):
+        text = stdout
+    else:
+        return 0, 0
+    records = [
+        line.split("\t")
+        for line in text.splitlines()
+        if line.startswith("item\t") and len(line.split("\t")) == 6
+    ]
+    return len(records), sum(fields[3] == "read" for fields in records)
 
 
 def _is_ssh_control_operation(command: Sequence[str]) -> bool:
