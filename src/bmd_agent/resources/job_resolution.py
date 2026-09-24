@@ -8,11 +8,14 @@ from typing import Any, Mapping
 
 from bmd_agent.config import SlurmClusterResource
 from bmd_agent.deployment import DeploymentContext
+from bmd_agent.profiling import profile_phase
 from bmd_agent.resources.slurm import normalize_job_id
 from bmd_agent.resources.vasp import (
+    RemoteAcquisitionRequest,
     RemotePathError,
     authorize_remote_path,
     build_remote_file_path,
+    prime_remote_acquisition,
     remote_directory_exists,
     remote_file_exists,
     remote_file_size,
@@ -86,12 +89,20 @@ def resolve_bmd_compute_job(
         f"job_{normalized_job_id}.json",
         allowed_roots=cluster.allowed_remote_roots,
     )
-    if not remote_file_exists(
-        cluster.ssh_host,
-        state_path,
-        runner=runner,
-        timeout=timeout,
-    ):
+    with profile_phase("producer_submission_provenance"):
+        prime_remote_acquisition(
+            cluster.ssh_host,
+            (RemoteAcquisitionRequest(state_path, read_limit=_MAX_PRODUCER_JSON_BYTES),),
+            runner=runner,
+            timeout=timeout,
+        )
+        state_present = remote_file_exists(
+            cluster.ssh_host,
+            state_path,
+            runner=runner,
+            timeout=timeout,
+        )
+    if not state_present:
         return JobRunResolution(
             scheduler_job_id=normalized_job_id,
             resolution_status=NOT_BMD_COMPUTE,
@@ -101,12 +112,13 @@ def resolve_bmd_compute_job(
         )
 
     try:
-        state = _read_bounded_json(
-            cluster,
-            state_path,
-            runner=runner,
-            timeout=timeout,
-        )
+        with profile_phase("producer_submission_provenance"):
+            state = _read_bounded_json(
+                cluster,
+                state_path,
+                runner=runner,
+                timeout=timeout,
+            )
         return _validate_resolution(
             cluster,
             normalized_job_id,
@@ -248,12 +260,31 @@ def _validate_resolution(
         cluster=cluster,
     )
 
-    if not remote_directory_exists(
-        cluster.ssh_host,
+    submission_path = build_remote_file_path(
         run_directory,
-        runner=runner,
-        timeout=timeout,
-    ):
+        "submission.json",
+        allowed_roots=cluster.allowed_remote_roots,
+    )
+    with profile_phase("producer_submission_provenance"):
+        prime_remote_acquisition(
+            cluster.ssh_host,
+            (
+                RemoteAcquisitionRequest(run_directory, kind="directory"),
+                RemoteAcquisitionRequest(
+                    submission_path,
+                    read_limit=_MAX_PRODUCER_JSON_BYTES,
+                ),
+            ),
+            runner=runner,
+            timeout=timeout,
+        )
+        run_directory_present = remote_directory_exists(
+            cluster.ssh_host,
+            run_directory,
+            runner=runner,
+            timeout=timeout,
+        )
+    if not run_directory_present:
         return JobRunResolution(
             scheduler_job_id=job_id,
             resolution_status=UNAVAILABLE,
@@ -266,17 +297,14 @@ def _validate_resolution(
             limitations=tuple(limitations),
         )
 
-    submission_path = build_remote_file_path(
-        run_directory,
-        "submission.json",
-        allowed_roots=cluster.allowed_remote_roots,
-    )
-    if not remote_file_exists(
-        cluster.ssh_host,
-        submission_path,
-        runner=runner,
-        timeout=timeout,
-    ):
+    with profile_phase("producer_submission_provenance"):
+        submission_present = remote_file_exists(
+            cluster.ssh_host,
+            submission_path,
+            runner=runner,
+            timeout=timeout,
+        )
+    if not submission_present:
         return JobRunResolution(
             scheduler_job_id=job_id,
             resolution_status=UNAVAILABLE,
@@ -289,12 +317,13 @@ def _validate_resolution(
             limitations=tuple(limitations),
         )
 
-    submission = _read_bounded_json(
-        cluster,
-        submission_path,
-        runner=runner,
-        timeout=timeout,
-    )
+    with profile_phase("producer_submission_provenance"):
+        submission = _read_bounded_json(
+            cluster,
+            submission_path,
+            runner=runner,
+            timeout=timeout,
+        )
     _cross_check_submission(
         state,
         state_spec,
@@ -313,29 +342,44 @@ def _validate_resolution(
         raise _ResolutionInvalid(
             "submission attempt-state path is outside the configured BMD logs root"
         )
-    elif not remote_file_exists(
-        cluster.ssh_host,
-        attempt_path,
-        runner=runner,
-        timeout=timeout,
-    ):
-        limitations.append("submission attempt-state record is unavailable")
     else:
-        attempt_payload = _read_bounded_json(
-            cluster,
-            attempt_path,
-            runner=runner,
-            timeout=timeout,
-        )
-        attempt_id = _cross_check_attempt(
-            attempt_payload,
-            state,
-            state_spec,
-            submission,
-            run_directory,
-            job_id,
-            cluster=cluster,
-        )
+        with profile_phase("producer_submission_provenance"):
+            prime_remote_acquisition(
+                cluster.ssh_host,
+                (
+                    RemoteAcquisitionRequest(
+                        attempt_path,
+                        read_limit=_MAX_PRODUCER_JSON_BYTES,
+                    ),
+                ),
+                runner=runner,
+                timeout=timeout,
+            )
+            attempt_present = remote_file_exists(
+                cluster.ssh_host,
+                attempt_path,
+                runner=runner,
+                timeout=timeout,
+            )
+        if not attempt_present:
+            limitations.append("submission attempt-state record is unavailable")
+        else:
+            with profile_phase("producer_submission_provenance"):
+                attempt_payload = _read_bounded_json(
+                    cluster,
+                    attempt_path,
+                    runner=runner,
+                    timeout=timeout,
+                )
+            attempt_id = _cross_check_attempt(
+                attempt_payload,
+                state,
+                state_spec,
+                submission,
+                run_directory,
+                job_id,
+                cluster=cluster,
+            )
 
     return JobRunResolution(
         scheduler_job_id=job_id,

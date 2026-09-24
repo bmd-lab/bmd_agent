@@ -1,13 +1,83 @@
+import base64
+import binascii
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 import shlex
 import subprocess
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator, Sequence
 
 from pymatgen.io.vasp import Poscar
 
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
+
+_ARCHIVE_PROBE_MARKER = "bmd-agent-archive-probe-v1"
+_MAX_ARCHIVE_PROBE_LIMIT = 64
+_ACQUISITION_MARKER = "bmd-agent-acquisition-v1"
+_MAX_ACQUISITION_REQUESTS = 128
+_MAX_BATCH_FILE_BYTES = 2_000_000
+_MAX_BATCH_TOTAL_BYTES = 8_000_000
+
+_ACQUISITION_SCRIPT = """\
+printf 'schema\\tbmd-agent-acquisition-v1\\n'
+total_limit=$1
+shift
+used=0
+while [ "$#" -ge 4 ]; do
+    item_id=$1
+    kind=$2
+    read_limit=$3
+    path=$4
+    shift 4
+    if [ "$kind" = "archives" ]; then
+        archive_index=1
+        archive_count=0
+        while [ "$archive_index" -le "$read_limit" ]; do
+            candidate="$path/error.$archive_index.tar.gz"
+            if [ ! -f "$candidate" ]; then
+                break
+            fi
+            archive_count=$archive_index
+            archive_index=$((archive_index + 1))
+        done
+        printf 'item\\t%s\\tarchives\\tpresent\\t%s\\t\\n' "$item_id" "$archive_count"
+        continue
+    fi
+    if [ "$kind" = "directory" ]; then
+        if [ -d "$path" ]; then
+            printf 'item\\t%s\\tdirectory\\tpresent\\t\\t\\n' "$item_id"
+        else
+            printf 'item\\t%s\\tdirectory\\tmissing\\t\\t\\n' "$item_id"
+        fi
+        continue
+    fi
+    if [ ! -f "$path" ]; then
+        printf 'item\\t%s\\tfile\\tmissing\\t\\t\\n' "$item_id"
+        continue
+    fi
+    if ! size=$(stat -c %s -- "$path" 2>/dev/null); then
+        printf 'item\\t%s\\tfile\\tread_error\\t\\t\\n' "$item_id"
+        continue
+    fi
+    if [ "$read_limit" -le 0 ]; then
+        printf 'item\\t%s\\tfile\\tpresent\\t%s\\t\\n' "$item_id" "$size"
+        continue
+    fi
+    next_used=$((used + size))
+    if [ "$size" -gt "$read_limit" ] || [ "$next_used" -gt "$total_limit" ]; then
+        printf 'item\\t%s\\tfile\\tdeferred\\t%s\\t\\n' "$item_id" "$size"
+        continue
+    fi
+    if encoded=$(head -c "$size" -- "$path" 2>/dev/null | base64 | tr -d '\\n'); then
+        printf 'item\\t%s\\tfile\\tread\\t%s\\t%s\\n' "$item_id" "$size" "$encoded"
+        used=$next_used
+    else
+        printf 'item\\t%s\\tfile\\tread_error\\t%s\\t\\n' "$item_id" "$size"
+    fi
+done
+"""
 
 _OUTCAR_FORCE_EXTRACTOR_AWK_EMIT = (
     'complete=(emit_status=="complete"&&rows>0&&malformed==0);'
@@ -76,6 +146,281 @@ class StructureInfo:
     c: float
 
 
+@dataclass(frozen=True)
+class RemoteAcquisitionRequest:
+    path: PurePosixPath
+    kind: str = "file"
+    read_limit: int = 0
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"file", "directory", "archives"}:
+            raise ValueError(
+                "remote acquisition kind must be file, directory, or archives"
+            )
+        maximum = (
+            _MAX_ARCHIVE_PROBE_LIMIT
+            if self.kind == "archives"
+            else _MAX_BATCH_FILE_BYTES
+        )
+        if self.read_limit < 0 or self.read_limit > maximum:
+            raise ValueError(
+                f"remote acquisition read limit must be between 0 and {maximum}"
+            )
+        if self.kind == "directory" and self.read_limit:
+            raise ValueError("remote directory acquisition cannot request contents")
+        if self.kind == "archives" and self.read_limit <= 0:
+            raise ValueError("remote archive acquisition limit must be positive")
+
+
+@dataclass(frozen=True)
+class _RemoteAcquisitionRecord:
+    path: PurePosixPath
+    kind: str
+    present: bool
+    size: int | None = None
+    contents: bytes | None = None
+    content_status: str | None = None
+
+
+class RemoteAcquisitionCache:
+    """Invocation-local metadata and bounded-content cache for exact remote paths."""
+
+    def __init__(
+        self,
+        ssh_host: str,
+        allowed_roots: Iterable[PurePosixPath | str],
+    ) -> None:
+        self.ssh_host = ssh_host
+        self.allowed_roots = tuple(PurePosixPath(str(root)) for root in allowed_roots)
+        self._records: dict[tuple[str, str], _RemoteAcquisitionRecord] = {}
+        self._disabled = False
+
+    def prime(
+        self,
+        requests: Iterable[RemoteAcquisitionRequest],
+        *,
+        runner: Runner,
+        timeout: float,
+    ) -> None:
+        if self._disabled:
+            return
+        pending = self._pending_requests(requests)
+        for start in range(0, len(pending), _MAX_ACQUISITION_REQUESTS):
+            batch = pending[start : start + _MAX_ACQUISITION_REQUESTS]
+            try:
+                self._acquire_batch(batch, runner=runner, timeout=timeout)
+            except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+                self._disabled = True
+                return
+
+    def record(self, path: PurePosixPath, kind: str) -> _RemoteAcquisitionRecord | None:
+        return self._records.get((str(path), kind))
+
+    def remember_file(self, path: PurePosixPath, contents: bytes) -> None:
+        self._records[(str(path), "file")] = _RemoteAcquisitionRecord(
+            path=path,
+            kind="file",
+            present=True,
+            size=len(contents),
+            contents=contents,
+            content_status="read",
+        )
+
+    def _pending_requests(
+        self,
+        requests: Iterable[RemoteAcquisitionRequest],
+    ) -> list[RemoteAcquisitionRequest]:
+        merged: dict[tuple[str, str], RemoteAcquisitionRequest] = {}
+        for request in requests:
+            path = authorize_remote_path(
+                request.path,
+                allowed_roots=self.allowed_roots,
+            )
+            normalized = RemoteAcquisitionRequest(
+                path,
+                request.kind,
+                request.read_limit,
+            )
+            key = (str(path), request.kind)
+            previous = merged.get(key)
+            if previous is None or normalized.read_limit > previous.read_limit:
+                merged[key] = normalized
+
+        pending: list[RemoteAcquisitionRequest] = []
+        for key, request in merged.items():
+            existing = self._records.get(key)
+            if existing is None:
+                pending.append(request)
+            elif (
+                request.kind == "file"
+                and request.read_limit
+                and existing.present
+                and existing.contents is None
+            ):
+                pending.append(request)
+        return pending
+
+    def _acquire_batch(
+        self,
+        requests: Sequence[RemoteAcquisitionRequest],
+        *,
+        runner: Runner,
+        timeout: float,
+    ) -> None:
+        if not requests:
+            return
+        read_count = sum(
+            bool(request.read_limit)
+            for request in requests
+            if request.kind == "file"
+        )
+        archive_count = sum(request.kind == "archives" for request in requests)
+        arguments = [
+            "sh",
+            "-s",
+            "--",
+            _ACQUISITION_MARKER,
+            str(_MAX_BATCH_TOTAL_BYTES),
+            str(len(requests)),
+            str(read_count),
+            str(archive_count),
+        ]
+        for index, request in enumerate(requests, start=1):
+            arguments.extend(
+                (
+                    str(index),
+                    request.kind,
+                    str(request.read_limit),
+                    str(request.path),
+                )
+            )
+        remote_command = " ".join(shlex.quote(argument) for argument in arguments)
+        result = runner(
+            ["ssh", self.ssh_host, remote_command],
+            input=_ACQUISITION_SCRIPT.encode("ascii"),
+            capture_output=True,
+            check=True,
+            timeout=timeout,
+        )
+        parsed = _parse_acquisition_output(result.stdout, requests)
+        for record in parsed:
+            self._records[(str(record.path), record.kind)] = record
+
+
+_ACTIVE_REMOTE_ACQUISITION: ContextVar[RemoteAcquisitionCache | None] = ContextVar(
+    "bmd_agent_remote_acquisition",
+    default=None,
+)
+
+
+@contextmanager
+def remote_acquisition_cache(
+    ssh_host: str,
+    allowed_roots: Iterable[PurePosixPath | str],
+) -> Iterator[RemoteAcquisitionCache]:
+    cache = RemoteAcquisitionCache(ssh_host, allowed_roots)
+    token = _ACTIVE_REMOTE_ACQUISITION.set(cache)
+    try:
+        yield cache
+    finally:
+        _ACTIVE_REMOTE_ACQUISITION.reset(token)
+
+
+def prime_remote_acquisition(
+    ssh_host: str,
+    requests: Iterable[RemoteAcquisitionRequest],
+    *,
+    runner: Runner,
+    timeout: float,
+) -> None:
+    cache = _active_acquisition(ssh_host)
+    if cache is not None:
+        cache.prime(requests, runner=runner, timeout=timeout)
+
+
+def _active_acquisition(ssh_host: str) -> RemoteAcquisitionCache | None:
+    cache = _ACTIVE_REMOTE_ACQUISITION.get()
+    return cache if cache is not None and cache.ssh_host == ssh_host else None
+
+
+def _parse_acquisition_output(
+    stdout: bytes,
+    requests: Sequence[RemoteAcquisitionRequest],
+) -> tuple[_RemoteAcquisitionRecord, ...]:
+    text = stdout.decode("ascii", "strict")
+    lines = text.splitlines()
+    if not lines or lines[0] != f"schema\t{_ACQUISITION_MARKER}":
+        raise ValueError("remote acquisition returned an unsupported schema")
+    records_by_index: dict[int, _RemoteAcquisitionRecord] = {}
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if len(fields) != 6 or fields[0] != "item":
+            raise ValueError("remote acquisition returned a malformed record")
+        try:
+            index = int(fields[1])
+        except ValueError as exc:
+            raise ValueError("remote acquisition returned an invalid record index") from exc
+        if index < 1 or index > len(requests) or index in records_by_index:
+            raise ValueError("remote acquisition returned an unexpected record index")
+        request = requests[index - 1]
+        kind, status, size_text, encoded = fields[2:]
+        if kind != request.kind or status not in {
+            "present",
+            "missing",
+            "deferred",
+            "read",
+            "read_error",
+        }:
+            raise ValueError("remote acquisition returned invalid record metadata")
+        try:
+            size = int(size_text) if size_text else None
+        except ValueError as exc:
+            raise ValueError("remote acquisition returned an invalid file size") from exc
+        if size is not None and size < 0:
+            raise ValueError("remote acquisition returned an invalid file size")
+        if kind == "directory" and (
+            status not in {"present", "missing"} or size is not None or encoded
+        ):
+            raise ValueError("remote acquisition returned invalid directory metadata")
+        if kind == "archives" and (
+            status != "present"
+            or size is None
+            or size > request.read_limit
+            or encoded
+        ):
+            raise ValueError("remote acquisition returned invalid archive metadata")
+        if kind == "file":
+            if status == "read" and not request.read_limit:
+                raise ValueError("remote acquisition returned unexpected file contents")
+            if status == "missing" and size is not None:
+                raise ValueError("remote acquisition returned invalid missing-file metadata")
+            if status in {"present", "deferred", "read"} and size is None:
+                raise ValueError("remote acquisition returned missing file size")
+        contents: bytes | None = None
+        content_status = status if request.kind == "file" and request.read_limit else None
+        if status == "read":
+            try:
+                contents = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                content_status = "read_error"
+            if contents is not None and size != len(contents):
+                contents = None
+                content_status = "read_error"
+        elif encoded:
+            raise ValueError("remote acquisition returned unexpected file contents")
+        records_by_index[index] = _RemoteAcquisitionRecord(
+            path=request.path,
+            kind=kind,
+            present=status != "missing",
+            size=size,
+            contents=contents,
+            content_status=content_status,
+        )
+    if len(records_by_index) != len(requests):
+        raise ValueError("remote acquisition did not describe every requested path")
+    return tuple(records_by_index[index] for index in range(1, len(requests) + 1))
+
+
 def read_remote_structure(
     ssh_host: str,
     directory: str,
@@ -111,6 +456,18 @@ def retrieve_remote_file(
 ) -> bytes:
     """Retrieve one already-authorized remote file over SSH."""
 
+    cache = _active_acquisition(ssh_host)
+    if cache is not None:
+        cached = cache.record(remote_path, "file")
+        if cached is not None and cached.contents is not None:
+            return cached.contents
+        if cached is not None and not cached.present:
+            raise subprocess.CalledProcessError(
+                1,
+                ["ssh", ssh_host, "cached remote file read"],
+                stderr=b"missing",
+            )
+
     remote_command = "cat -- " + shlex.quote(str(remote_path))
 
     result = runner(
@@ -120,6 +477,8 @@ def retrieve_remote_file(
         timeout=timeout,
     )
 
+    if cache is not None:
+        cache.remember_file(remote_path, result.stdout)
     return result.stdout
 
 
@@ -135,6 +494,17 @@ def retrieve_remote_file_tail(
 
     if limit <= 0:
         raise ValueError("remote tail byte limit must be positive")
+    cache = _active_acquisition(ssh_host)
+    if cache is not None:
+        cached = cache.record(remote_path, "file")
+        if cached is not None and cached.contents is not None:
+            return cached.contents[-limit:]
+        if cached is not None and not cached.present:
+            raise subprocess.CalledProcessError(
+                1,
+                ["ssh", ssh_host, "cached remote tail read"],
+                stderr=b"missing",
+            )
     remote_command = " ".join(
         ["tail", "-c", str(limit), "--", shlex.quote(str(remote_path))]
     )
@@ -156,6 +526,12 @@ def remote_file_exists(
 ) -> bool:
     """Return whether one already-authorized remote file exists."""
 
+    cache = _active_acquisition(ssh_host)
+    if cache is not None:
+        cached = cache.record(remote_path, "file")
+        if cached is not None:
+            return cached.present
+
     return _remote_path_exists(
         ssh_host,
         remote_path,
@@ -174,6 +550,12 @@ def remote_file_size(
 ) -> int:
     """Return the byte size of one already-authorized remote file."""
 
+    cache = _active_acquisition(ssh_host)
+    if cache is not None:
+        cached = cache.record(remote_path, "file")
+        if cached is not None and cached.present and cached.size is not None:
+            return cached.size
+
     remote_command = "stat -c %s -- " + shlex.quote(str(remote_path))
     result = runner(
         ["ssh", ssh_host, remote_command],
@@ -183,6 +565,76 @@ def remote_file_size(
     )
 
     return int(result.stdout.decode("utf-8", "replace").strip())
+
+
+def probe_remote_error_archives(
+    ssh_host: str,
+    directory: PurePosixPath | str,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    limit: int,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> tuple[PurePosixPath, ...]:
+    """Probe a bounded contiguous error.N.tar.gz sequence without reading archives."""
+
+    if limit <= 0 or limit > _MAX_ARCHIVE_PROBE_LIMIT:
+        raise ValueError(
+            f"remote error archive probe limit must be between 1 and {_MAX_ARCHIVE_PROBE_LIMIT}"
+        )
+    authorized_directory = authorize_remote_path(
+        directory,
+        allowed_roots=allowed_roots,
+    )
+    cache = _active_acquisition(ssh_host)
+    if cache is not None:
+        request = RemoteAcquisitionRequest(
+            authorized_directory,
+            kind="archives",
+            read_limit=limit,
+        )
+        cache.prime((request,), runner=runner, timeout=timeout)
+        record = cache.record(authorized_directory, "archives")
+        if record is not None and record.size is not None:
+            return tuple(
+                authorized_directory / f"error.{index}.tar.gz"
+                for index in range(1, record.size + 1)
+            )
+    program = (
+        'i=1; while [ "$i" -le "$2" ]; do '
+        'candidate="$1/error.$i.tar.gz"; '
+        'if [ -f "$candidate" ]; then printf "%s\\n" "$candidate"; else break; fi; '
+        'i=$((i + 1)); done'
+    )
+    remote_command = " ".join(
+        (
+            "sh",
+            "-c",
+            shlex.quote(program),
+            _ARCHIVE_PROBE_MARKER,
+            shlex.quote(str(authorized_directory)),
+            str(limit),
+        )
+    )
+    result = runner(
+        ["ssh", ssh_host, remote_command],
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        return ()
+
+    lines = result.stdout.decode("utf-8", "strict").splitlines()
+    if len(lines) > limit:
+        raise ValueError("remote error archive probe returned too many paths")
+    archives: list[PurePosixPath] = []
+    for index, line in enumerate(lines, start=1):
+        expected = authorized_directory / f"error.{index}.tar.gz"
+        if line != str(expected):
+            raise ValueError("remote error archive probe returned an unexpected path")
+        archives.append(expected)
+    return tuple(archives)
 
 
 def extract_remote_outcar_force_blocks(
@@ -304,6 +756,12 @@ def remote_directory_exists(
     timeout: float = 20,
 ) -> bool:
     """Return whether one already-authorized remote directory exists."""
+
+    cache = _active_acquisition(ssh_host)
+    if cache is not None:
+        cached = cache.record(remote_path, "directory")
+        if cached is not None:
+            return cached.present
 
     return _remote_path_exists(
         ssh_host,

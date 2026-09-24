@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 import hashlib
 import json
 from pathlib import Path
@@ -14,6 +14,12 @@ from bmd_agent.config import (
     load_resources,
 )
 from bmd_agent.deployment import DeploymentContext, resolve_deployment_context
+from bmd_agent.profiling import (
+    PerformanceProfile,
+    PerformanceProfiler,
+    profile_phase,
+    profiled_runner,
+)
 from bmd_agent.resources.bmdex import (
     BmdexDomainContextEnrichment,
     bmdex_repository,
@@ -36,6 +42,7 @@ from bmd_agent.resources.lifecycle import (
     analyze_calculation_directory,
 )
 from bmd_agent.resources.oom import MemoryObservation, OomDiagnosticEvidence
+from bmd_agent.resources.remote import ReusableSshSession
 from bmd_agent.resources.run import (
     PRODUCER_REQUESTED,
     JobInspection,
@@ -51,7 +58,11 @@ from bmd_agent.resources.run import (
     serialize_job_trajectory_evidence,
 )
 from bmd_agent.resources.slurm import get_job_accounting, get_queue
-from bmd_agent.resources.vasp import RemotePathError, read_remote_structure
+from bmd_agent.resources.vasp import (
+    RemotePathError,
+    read_remote_structure,
+    remote_acquisition_cache,
+)
 
 
 _EXECUTED_INPUT_DISPLAY_KEYS = (
@@ -835,13 +846,45 @@ def show_job(
     registry: ResourceRegistry | None = None,
     *,
     trajectory_json: bool = False,
+    profile: bool = False,
 ) -> int:
     """Display scheduler-bound evidence for one calculation job."""
 
-    registry = registry or load_resources()
-    cluster = powerslurm_cluster(registry)
-    deployment = resolve_deployment_context(registry, cluster_key=cluster.key)
-    modifier_policies, _ = modifier_policies_from_compute(registry)
+    if not profile:
+        return _show_job(job_id, registry, trajectory_json=trajectory_json)
+
+    profiler = PerformanceProfiler()
+    with profiler.activate():
+        exit_code = _show_job(
+            job_id,
+            registry,
+            trajectory_json=trajectory_json,
+            profiling=True,
+        )
+    print_performance_profile(profiler.snapshot())
+    return exit_code
+
+
+def _show_job(
+    job_id: str,
+    registry: ResourceRegistry | None,
+    *,
+    trajectory_json: bool,
+    profiling: bool = False,
+) -> int:
+    """Run the shared job inspection path with optional active telemetry."""
+
+    with profile_phase("configuration_and_policy"):
+        registry = registry or load_resources()
+        cluster = powerslurm_cluster(registry)
+        deployment = resolve_deployment_context(registry, cluster_key=cluster.key)
+        if profiling:
+            modifier_policies, _ = modifier_policies_from_compute(
+                registry,
+                runner=profiled_runner(subprocess.run, role="producer"),
+            )
+        else:
+            modifier_policies, _ = modifier_policies_from_compute(registry)
 
     if not trajectory_json:
         print("BMD Job Inspection")
@@ -849,40 +892,117 @@ def show_job(
         print()
 
     try:
-        inspection = inspect_slurm_job(
-            cluster,
-            job_id,
-            modifier_policies=modifier_policies,
-            deployment=deployment,
-        )
+        with ReusableSshSession(
+            cluster.ssh_host,
+            close_timeout=cluster.ssh_connect_timeout_seconds,
+        ) as ssh_session:
+            with remote_acquisition_cache(
+                cluster.ssh_host,
+                cluster.allowed_remote_roots,
+            ):
+                inspection = inspect_slurm_job(
+                    cluster,
+                    job_id,
+                    modifier_policies=modifier_policies,
+                    deployment=deployment,
+                    remote_runner=ssh_session.runner("remote"),
+                    slurm_runner=ssh_session.runner("scheduler"),
+                )
 
     except ValueError as exc:
         print(f"Unable to inspect job: {exc}")
         return 2
 
-    except (RemotePathError, subprocess.TimeoutExpired, subprocess.CalledProcessError, RunInspectionError) as exc:
+    except (
+        RemotePathError,
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        RunInspectionError,
+    ) as exc:
         print(f"Unable to inspect job: {exc}")
         return 1
 
     if trajectory_json:
-        print(
-            json.dumps(
-                serialize_job_trajectory_evidence(inspection),
-                indent=2,
-                sort_keys=True,
-                allow_nan=False,
+        with profile_phase("synthesis_rendering"):
+            print(
+                json.dumps(
+                    serialize_job_trajectory_evidence(inspection),
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
             )
-        )
     else:
-        contextual_enrichment = enrich_job_with_bmdex_domain_context(
-            inspection,
-            bmdex_repository(registry),
-        )
-        print_job_inspection(
-            inspection,
-            contextual_enrichment=contextual_enrichment,
-        )
+        with profile_phase("bmdex_acquisition"):
+            if profiling:
+                contextual_enrichment = enrich_job_with_bmdex_domain_context(
+                    inspection,
+                    bmdex_repository(registry),
+                    runner=profiled_runner(subprocess.run, role="bmdex"),
+                )
+            else:
+                contextual_enrichment = enrich_job_with_bmdex_domain_context(
+                    inspection,
+                    bmdex_repository(registry),
+                )
+        with profile_phase("synthesis_rendering"):
+            print_job_inspection(
+                inspection,
+                contextual_enrichment=contextual_enrichment,
+            )
     return 0
+
+
+def print_performance_profile(profile: PerformanceProfile) -> None:
+    """Render opt-in developer telemetry separately from scientific evidence."""
+
+    print()
+    print("Performance profile (developer telemetry)")
+    print("=========================================")
+    print(f"Total wall time: {profile.total_elapsed_seconds:.3f} s")
+    print("Phase timings (inclusive; nested phases may overlap):")
+    for phase in profile.phases:
+        suffix = f", failures={phase.failures}" if phase.failures else ""
+        print(
+            f"  {phase.name}: {phase.elapsed_seconds:.3f} s "
+            f"(calls={phase.calls}{suffix})"
+        )
+
+    counts = profile.operations.counts
+    elapsed = profile.operations.elapsed_seconds
+    print("Remote/subprocess operations:")
+    for key in (
+        "subprocess_invocations",
+        "ssh_invocations",
+        "ssh_connections",
+        "ssh_exec_channels",
+        "ssh_control_operations",
+        "remote_commands",
+        "remote_file_reads",
+        "bounded_remote_file_reads",
+        "remote_extractor_operations",
+        "existence_probes",
+        "stat_probes",
+        "directory_probes",
+        "directory_listing_operations",
+        "archive_probes",
+        "archive_probe_batches",
+        "metadata_manifest_operations",
+        "batched_file_read_operations",
+        "logical_files_described",
+        "logical_files_read",
+        "scheduler_operations",
+        "producer_operations",
+        "bmdex_operations",
+    ):
+        print(f"  {key}: {counts[key]}")
+    print("Nested operation wait time:")
+    for key, value in elapsed.items():
+        print(f"  {key}: {value:.3f} s")
+    print(f"Captured subprocess output: {profile.operations.bytes_transferred} bytes")
+    print(f"Captured SSH output: {profile.operations.ssh_bytes_transferred} bytes")
+    print(f"Subprocess failures: {profile.operations.failure_count}")
+    print(f"Subprocess timeouts: {profile.operations.timeout_count}")
 
 
 def print_job_inspection(
@@ -2032,15 +2152,23 @@ def main(argv: list[str] | None = None) -> int:
             return show_queue()
 
         if command == "job":
-            if (
-                len(argv) < 2
-                or len(argv) > 3
-                or (len(argv) == 3 and argv[2] != "--trajectory-json")
-            ):
-                print("Usage: bmd-agent job <SLURM_JOB_ID> [--trajectory-json]")
+            option = argv[2] if len(argv) == 3 else None
+            if len(argv) < 2 or len(argv) > 3 or option not in {
+                None,
+                "--trajectory-json",
+                "--profile",
+            }:
+                print(
+                    "Usage: bmd-agent job <SLURM_JOB_ID> "
+                    "[--trajectory-json | --profile]"
+                )
                 return 2
 
-            return show_job(argv[1], trajectory_json=len(argv) == 3)
+            if option == "--trajectory-json":
+                return show_job(argv[1], trajectory_json=True)
+            if option == "--profile":
+                return show_job(argv[1], profile=True)
+            return show_job(argv[1])
 
         if command == "compute":
             return show_compute()
@@ -2072,10 +2200,15 @@ def main(argv: list[str] | None = None) -> int:
 
             return show_diagnose_run(argv[1])
 
-        if len(argv) == 1:
-            if _is_positive_decimal_job_id(command):
+        if _is_positive_decimal_job_id(command):
+            if len(argv) == 1:
                 return show_job(command)
+            if len(argv) == 2 and argv[1] == "--profile":
+                return show_job(command, profile=True)
+            print("Usage: bmd-agent <SLURM_JOB_ID> [--profile]")
+            return 2
 
+        if len(argv) == 1:
             target = _existing_target_path(command)
             if target is not None:
                 return show_current_directory(target)
@@ -2094,13 +2227,13 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("Usage: bmd-agent [TARGET]")
     print("  no target: analyze the current calculation directory")
-    print("  positive decimal integer: analyze that SLURM job")
+    print("  positive decimal integer [--profile]: analyze that SLURM job")
     print("  existing filesystem path: analyze that calculation directory")
     print()
     print("Expert commands:")
     print("  status")
     print("  queue")
-    print("  job <SLURM_JOB_ID> [--trajectory-json]")
+    print("  job <SLURM_JOB_ID> [--trajectory-json | --profile]")
     print("  compute")
     print("  structure <remote-directory>")
     print(f"  {_check_input_usage()}")
@@ -2124,6 +2257,8 @@ def _existing_target_path(target: str) -> Path | None:
 
 def modifier_policies_from_compute(
     registry: ResourceRegistry,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> tuple[tuple[Mapping[str, Any], ...], str | None]:
     """Return configured producer modifier policies when the capability adapter can read them."""
 
@@ -2133,7 +2268,10 @@ def modifier_policies_from_compute(
         return (), None
 
     try:
-        capabilities = inspect_compute_capabilities(repository)
+        if runner is None:
+            capabilities = inspect_compute_capabilities(repository)
+        else:
+            capabilities = inspect_compute_capabilities(repository, runner=runner)
     except ComputeCapabilityError as exc:
         return (), str(exc)
 

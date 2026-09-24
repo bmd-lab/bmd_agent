@@ -47,6 +47,29 @@ def test_bare_numeric_target_and_explicit_job_use_same_job_implementation(
     assert calls == [("21853598", False), ("21853598", False)]
 
 
+def test_bare_numeric_and_explicit_job_profile_use_same_job_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def fake_show_job(
+        job_id: str,
+        registry: ResourceRegistry | None = None,
+        *,
+        trajectory_json: bool = False,
+        profile: bool = False,
+    ) -> int:
+        assert trajectory_json is False
+        calls.append((job_id, profile))
+        return 0
+
+    monkeypatch.setattr(cli, "show_job", fake_show_job)
+
+    assert cli.main(["21853598", "--profile"]) == 0
+    assert cli.main(["job", "21853598", "--profile"]) == 0
+    assert calls == [("21853598", True), ("21853598", True)]
+
+
 def test_bare_numeric_target_wins_over_same_named_local_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -99,6 +122,39 @@ def test_existing_path_target_uses_lifecycle_analysis(
 
     assert cli.main([targets[target_kind]]) == 0
     assert analyzed == [calculation.resolve()]
+
+
+def test_local_path_analysis_does_not_create_reusable_remote_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calculation = tmp_path / "calculation"
+    calculation.mkdir()
+
+    class ForbiddenRemoteSession:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pytest.fail("local path analysis must not create a reusable SSH session")
+
+    monkeypatch.setattr(cli, "ReusableSshSession", ForbiddenRemoteSession)
+    monkeypatch.setattr(cli, "load_resources", lambda: ResourceRegistry({}, {}))
+    monkeypatch.setattr(
+        cli,
+        "analyze_calculation_directory",
+        lambda directory, **kwargs: SimpleNamespace(
+            directory=directory,
+            state=SimpleNamespace(value="UNKNOWN"),
+            calculation_kind="none",
+            message="no calculation",
+        ),
+    )
+    monkeypatch.setattr(cli, "print_lifecycle_analysis", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "enrich_lifecycle_with_bmdex_domain_context",
+        lambda *args, **kwargs: None,
+    )
+
+    assert cli.show_current_directory(calculation) == 0
 
 
 def test_cli_structure_requires_directory(capsys: pytest.CaptureFixture[str]) -> None:

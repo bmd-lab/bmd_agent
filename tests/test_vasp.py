@@ -14,6 +14,7 @@ from bmd_agent.resources.vasp import (
     build_remote_file_path,
     extract_remote_outcar_force_blocks,
     parse_poscar,
+    probe_remote_error_archives,
     read_remote_structure,
     remote_directory_exists,
     remote_file_exists,
@@ -178,6 +179,94 @@ def test_remote_file_size_uses_read_only_stat_command() -> None:
             "stat -c %s -- '/home/example/calculations/project with spaces/vasprun.xml'",
         ]
     ]
+
+
+def test_remote_error_archive_probe_is_bounded_exact_and_read_only() -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(command)
+        assert kwargs == {"capture_output": True, "check": False, "timeout": 17}
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                b"/home/example/calculations/run/error.1.tar.gz\n"
+                b"/home/example/calculations/run/error.2.tar.gz\n"
+            ),
+            stderr=b"",
+        )
+
+    archives = probe_remote_error_archives(
+        "powerslurm-bmdguest",
+        PurePosixPath("/home/example/calculations/run"),
+        allowed_roots=(PurePosixPath("/home/example/calculations"),),
+        limit=64,
+        runner=runner,
+        timeout=17,
+    )
+
+    assert archives == (
+        PurePosixPath("/home/example/calculations/run/error.1.tar.gz"),
+        PurePosixPath("/home/example/calculations/run/error.2.tar.gz"),
+    )
+    remote_command = calls[0][-1]
+    parts = shlex.split(remote_command)
+    assert parts[0:2] == ["sh", "-c"]
+    assert parts[3:] == [
+        "bmd-agent-archive-probe-v1",
+        "/home/example/calculations/run",
+        "64",
+    ]
+    assert "error.$i.tar.gz" in parts[2]
+    assert all(token not in parts[2] for token in ("cat ", "tar ", "find ", "ls ", "POTCAR"))
+    assert "*" not in parts[2]
+
+
+def test_remote_error_archive_probe_authorizes_before_remote_acquisition() -> None:
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        pytest.fail("unauthorized directory must not reach the remote runner")
+
+    with pytest.raises(RemotePathError, match="outside configured allowed roots"):
+        probe_remote_error_archives(
+            "powerslurm-bmdguest",
+            PurePosixPath("/etc/not-allowed"),
+            allowed_roots=(PurePosixPath("/home/example/calculations"),),
+            limit=64,
+            runner=runner,
+        )
+
+
+@pytest.mark.parametrize("limit", (0, 65))
+def test_remote_error_archive_probe_enforces_fixed_bound(limit: int) -> None:
+    with pytest.raises(ValueError, match="between 1 and 64"):
+        probe_remote_error_archives(
+            "powerslurm-bmdguest",
+            PurePosixPath("/home/example/calculations/run"),
+            allowed_roots=(PurePosixPath("/home/example/calculations"),),
+            limit=limit,
+        )
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    (
+        b"/home/example/calculations/run/error.2.tar.gz\n",
+        b"/etc/error.1.tar.gz\n",
+    ),
+)
+def test_remote_error_archive_probe_rejects_unexpected_output(stdout: bytes) -> None:
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=b"")
+
+    with pytest.raises(ValueError, match="unexpected path"):
+        probe_remote_error_archives(
+            "powerslurm-bmdguest",
+            PurePosixPath("/home/example/calculations/run"),
+            allowed_roots=(PurePosixPath("/home/example/calculations"),),
+            limit=64,
+            runner=runner,
+        )
 
 
 def test_remote_outcar_force_extractor_uses_fixed_read_only_awk_command() -> None:
