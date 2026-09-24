@@ -83,6 +83,9 @@ def test_profiled_runners_count_existing_operations_bytes_and_wait_time() -> Non
     assert len(calls) == 10
     assert counts["subprocess_invocations"] == 10
     assert counts["ssh_invocations"] == 8
+    assert counts["ssh_connections"] == 8
+    assert counts["ssh_exec_channels"] == 8
+    assert counts["ssh_control_operations"] == 0
     assert counts["remote_commands"] == 8
     assert counts["remote_file_reads"] == 2
     assert counts["bounded_remote_file_reads"] == 1
@@ -92,6 +95,7 @@ def test_profiled_runners_count_existing_operations_bytes_and_wait_time() -> Non
     assert counts["remote_extractor_operations"] == 1
     assert counts["directory_listing_operations"] == 1
     assert counts["archive_probes"] == 1
+    assert counts["archive_probe_batches"] == 0
     assert counts["scheduler_operations"] == 1
     assert counts["producer_operations"] == 1
     assert counts["bmdex_operations"] == 1
@@ -131,10 +135,12 @@ def test_profile_model_is_json_safe() -> None:
     encoded = json.dumps(profiler.snapshot().to_dict(), allow_nan=False)
     payload = json.loads(encoded)
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["evidence_type"] == "agent_performance_telemetry"
     assert payload["total_elapsed_seconds"] == 2
     assert payload["operations"]["counts"]["ssh_invocations"] == 0
+    assert payload["operations"]["counts"]["ssh_connections"] == 0
+    assert "ssh_exec_channels" in payload["operations"]["count_semantics"]
 
 
 def test_profile_output_is_opt_in_and_follows_unchanged_normal_output(

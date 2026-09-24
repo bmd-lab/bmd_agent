@@ -9,6 +9,9 @@ from pymatgen.io.vasp import Poscar
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
 
+_ARCHIVE_PROBE_MARKER = "bmd-agent-archive-probe-v1"
+_MAX_ARCHIVE_PROBE_LIMIT = 64
+
 _OUTCAR_FORCE_EXTRACTOR_AWK_EMIT = (
     'complete=(emit_status=="complete"&&rows>0&&malformed==0);'
     'final_status=emit_status;value="";'
@@ -183,6 +186,62 @@ def remote_file_size(
     )
 
     return int(result.stdout.decode("utf-8", "replace").strip())
+
+
+def probe_remote_error_archives(
+    ssh_host: str,
+    directory: PurePosixPath | str,
+    *,
+    allowed_roots: Iterable[PurePosixPath | str],
+    limit: int,
+    runner: Runner = subprocess.run,
+    timeout: float = 20,
+) -> tuple[PurePosixPath, ...]:
+    """Probe a bounded contiguous error.N.tar.gz sequence without reading archives."""
+
+    if limit <= 0 or limit > _MAX_ARCHIVE_PROBE_LIMIT:
+        raise ValueError(
+            f"remote error archive probe limit must be between 1 and {_MAX_ARCHIVE_PROBE_LIMIT}"
+        )
+    authorized_directory = authorize_remote_path(
+        directory,
+        allowed_roots=allowed_roots,
+    )
+    program = (
+        'i=1; while [ "$i" -le "$2" ]; do '
+        'candidate="$1/error.$i.tar.gz"; '
+        'if [ -f "$candidate" ]; then printf "%s\\n" "$candidate"; else break; fi; '
+        'i=$((i + 1)); done'
+    )
+    remote_command = " ".join(
+        (
+            "sh",
+            "-c",
+            shlex.quote(program),
+            _ARCHIVE_PROBE_MARKER,
+            shlex.quote(str(authorized_directory)),
+            str(limit),
+        )
+    )
+    result = runner(
+        ["ssh", ssh_host, remote_command],
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        return ()
+
+    lines = result.stdout.decode("utf-8", "strict").splitlines()
+    if len(lines) > limit:
+        raise ValueError("remote error archive probe returned too many paths")
+    archives: list[PurePosixPath] = []
+    for index, line in enumerate(lines, start=1):
+        expected = authorized_directory / f"error.{index}.tar.gz"
+        if line != str(expected):
+            raise ValueError("remote error archive probe returned an unexpected path")
+        archives.append(expected)
+    return tuple(archives)
 
 
 def extract_remote_outcar_force_blocks(

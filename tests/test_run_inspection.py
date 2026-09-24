@@ -15,7 +15,7 @@ from bmd_agent import cli
 import bmd_agent.resources.run as run_resource
 from bmd_agent.config import ResourceRegistry, SlurmClusterResource
 from bmd_agent.deployment import DeploymentContext, load_deployment_profile
-from bmd_agent.profiling import PerformanceProfiler, profiled_runner
+from bmd_agent.profiling import PerformanceProfiler
 from bmd_agent.resources.bmdex import build_bmdex_domain_query_for_job
 from bmd_agent.resources.job_resolution import NOT_BMD_COMPUTE, RESOLVED
 from bmd_agent.resources.run import (
@@ -73,6 +73,7 @@ from bmd_agent.resources.oom import (
     NO_OOM_EVIDENCE,
     OOM_ESTABLISHED,
 )
+from bmd_agent.resources.remote import ReusableSshSession
 from bmd_agent.resources.slurm import (
     DEFAULT_SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS,
     SlurmAccountingRecord,
@@ -376,6 +377,21 @@ class RemoteFixture:
                 stdout=b"",
                 stderr=b"",
             )
+
+        if parts[:2] == ["sh", "-c"] and parts[3:4] == [
+            "bmd-agent-archive-probe-v1"
+        ]:
+            assert kwargs["check"] is False
+            directory = parts[4]
+            limit = int(parts[5])
+            archives: list[str] = []
+            for index in range(1, limit + 1):
+                path = f"{directory}/error.{index}.tar.gz"
+                if path not in self.files:
+                    break
+                archives.append(path)
+            stdout = "".join(f"{path}\n" for path in archives).encode("utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=b"")
 
         if parts[:4] == ["stat", "-c", "%s", "--"]:
             assert kwargs["check"] is True
@@ -830,6 +846,43 @@ def job_slurm_runner(
         )
 
     return runner
+
+
+class MultiplexedInspectionRunner:
+    """Model OpenSSH transport reuse while delegating fixture command behavior."""
+
+    def __init__(
+        self,
+        remote: RemoteFixture,
+        scheduler: Callable[..., subprocess.CompletedProcess[str]],
+    ) -> None:
+        self.remote = remote
+        self.scheduler = scheduler
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        self.commands.append(command)
+        if getattr(command, "ssh_control_operation", False):
+            control_path = Path(command[command.index("-S") + 1])
+            control_path.unlink(missing_ok=True)
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+        if getattr(command, "ssh_opens_connection", False):
+            option = next(part for part in command if part.startswith("ControlPath="))
+            Path(option.split("=", 1)[1]).touch()
+
+        remote_command = command[-1]
+        if remote_command.startswith("sacct "):
+            normalized = [
+                "ssh",
+                "-o",
+                "ConnectTimeout=10",
+                "powerslurm-bmdguest",
+                remote_command,
+            ]
+            return self.scheduler(normalized, **kwargs)
+        normalized = ["ssh", "powerslurm-bmdguest", remote_command]
+        return self.remote(normalized, **kwargs)
 
 
 def test_inspect_slurm_job_rejects_invalid_job_id_without_scheduler_or_remote_reads() -> None:
@@ -1325,34 +1378,44 @@ def test_historical_failed_bmd_fixture_resolves_trajectory_and_custodian_evidenc
 
     profiled_remote = RemoteFixture(files=files, directories={run_dir})
     profiler = PerformanceProfiler()
+    transport = MultiplexedInspectionRunner(
+        profiled_remote,
+        job_slurm_runner(
+            job_id="21906221",
+            state="FAILED",
+            work_dir="/a/home/cc/tree/taucc/enginer/bmdguest",
+            max_rss="45045764K",
+        ),
+    )
     with profiler.activate():
-        inspection = inspect_slurm_job(
-            cluster(),
-            "21906221",
-            remote_runner=profiled_runner(profiled_remote, role="remote"),
-            slurm_runner=profiled_runner(
-                job_slurm_runner(
-                    job_id="21906221",
-                    state="FAILED",
-                    work_dir="/a/home/cc/tree/taucc/enginer/bmdguest",
-                    max_rss="45045764K",
+        with ReusableSshSession(
+            "powerslurm-bmdguest",
+            runner=transport,
+            multiplex=True,
+        ) as session:
+            inspection = inspect_slurm_job(
+                cluster(),
+                "21906221",
+                remote_runner=session.runner("remote"),
+                slurm_runner=session.runner("scheduler"),
+                scientific_parser=lambda local, display, workflow: ScientificResult(
+                    source_paths=tuple(display.values()),
+                    final_formula="fixture",
                 ),
-                role="scheduler",
-            ),
-            scientific_parser=lambda local, display, workflow: ScientificResult(
-                source_paths=tuple(display.values()),
-                final_formula="fixture",
-            ),
-            max_vasprun_bytes=0,
-            deployment=power_deployment(),
-        )
+                max_vasprun_bytes=0,
+                deployment=power_deployment(),
+            )
     profile = profiler.snapshot()
 
     assert inspection == unprofiled_inspection
     assert profiled_remote.commands == unprofiled_remote.commands
     assert profile.operations.counts["scheduler_operations"] == 1
-    assert profile.operations.counts["ssh_invocations"] == len(profiled_remote.commands) + 1
-    assert profile.operations.counts["archive_probes"] == 6
+    assert profile.operations.counts["ssh_connections"] == 1
+    assert profile.operations.counts["ssh_exec_channels"] == len(profiled_remote.commands) + 1
+    assert profile.operations.counts["ssh_control_operations"] == 1
+    assert profile.operations.counts["ssh_invocations"] == len(profiled_remote.commands) + 2
+    assert profile.operations.counts["archive_probes"] == 1
+    assert profile.operations.counts["archive_probe_batches"] == 1
     assert profile.operations.bytes_transferred > 0
     assert profile.operations.failure_count == 0
     phase_names = {phase.name for phase in profile.phases}
@@ -1442,7 +1505,13 @@ def test_remote_execution_diagnostics_use_bounded_exact_read_only_paths() -> Non
     ]
     commands = [command[2] for command in remote.commands]
     assert f"tail -c 128000 -- {FLOW_ROOT}/std_err.txt" in commands
-    assert f"test -f {FLOW_ROOT}/error.3.tar.gz" in commands
+    archive_commands = [
+        command
+        for command in commands
+        if "bmd-agent-archive-probe-v1" in command
+    ]
+    assert len(archive_commands) == 1
+    assert shlex.split(archive_commands[0])[4:] == [FLOW_ROOT, "64"]
     assert not any(command.startswith("cat --") for command in commands)
     assert not any(shlex.split(command)[0] in {"tar", "find", "ls"} for command in commands)
     assert not any("error.*.tar.gz" in command or "POTCAR" in command for command in commands)

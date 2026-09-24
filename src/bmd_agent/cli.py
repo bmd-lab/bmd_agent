@@ -42,6 +42,7 @@ from bmd_agent.resources.lifecycle import (
     analyze_calculation_directory,
 )
 from bmd_agent.resources.oom import MemoryObservation, OomDiagnosticEvidence
+from bmd_agent.resources.remote import ReusableSshSession
 from bmd_agent.resources.run import (
     PRODUCER_REQUESTED,
     JobInspection,
@@ -887,16 +888,18 @@ def _show_job(
         print()
 
     try:
-        inspection_kwargs: dict[str, Any] = {
-            "modifier_policies": modifier_policies,
-            "deployment": deployment,
-        }
-        if profiling:
-            inspection_kwargs.update(
-                remote_runner=profiled_runner(subprocess.run, role="remote"),
-                slurm_runner=profiled_runner(subprocess.run, role="scheduler"),
+        with ReusableSshSession(
+            cluster.ssh_host,
+            close_timeout=cluster.ssh_connect_timeout_seconds,
+        ) as ssh_session:
+            inspection = inspect_slurm_job(
+                cluster,
+                job_id,
+                modifier_policies=modifier_policies,
+                deployment=deployment,
+                remote_runner=ssh_session.runner("remote"),
+                slurm_runner=ssh_session.runner("scheduler"),
             )
-        inspection = inspect_slurm_job(cluster, job_id, **inspection_kwargs)
 
     except ValueError as exc:
         print(f"Unable to inspect job: {exc}")
@@ -963,6 +966,9 @@ def print_performance_profile(profile: PerformanceProfile) -> None:
     for key in (
         "subprocess_invocations",
         "ssh_invocations",
+        "ssh_connections",
+        "ssh_exec_channels",
+        "ssh_control_operations",
         "remote_commands",
         "remote_file_reads",
         "bounded_remote_file_reads",
@@ -972,6 +978,7 @@ def print_performance_profile(profile: PerformanceProfile) -> None:
         "directory_probes",
         "directory_listing_operations",
         "archive_probes",
+        "archive_probe_batches",
         "scheduler_operations",
         "producer_operations",
         "bmdex_operations",

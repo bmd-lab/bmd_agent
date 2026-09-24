@@ -10,12 +10,15 @@ import time
 from typing import Any
 
 
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 PROFILE_EVIDENCE_TYPE = "agent_performance_telemetry"
 
 _COUNT_KEYS = (
     "subprocess_invocations",
     "ssh_invocations",
+    "ssh_connections",
+    "ssh_exec_channels",
+    "ssh_control_operations",
     "remote_commands",
     "remote_file_reads",
     "bounded_remote_file_reads",
@@ -25,6 +28,7 @@ _COUNT_KEYS = (
     "directory_probes",
     "directory_listing_operations",
     "archive_probes",
+    "archive_probe_batches",
     "scheduler_operations",
     "producer_operations",
     "bmdex_operations",
@@ -70,6 +74,12 @@ class OperationTelemetry:
         "captured subprocess stdout and stderr byte lengths; measured from existing "
         "results without additional reads"
     )
+    count_semantics: str = (
+        "ssh_invocations counts local SSH client processes; ssh_connections counts "
+        "transport connections established by those processes; ssh_exec_channels "
+        "counts remote command channels; archive_probes counts remote metadata "
+        "commands and archive_probe_batches identifies bounded multi-candidate probes"
+    )
 
 
 @dataclass(frozen=True)
@@ -109,6 +119,7 @@ class PerformanceProfile:
                 "failure_count": self.operations.failure_count,
                 "timeout_count": self.operations.timeout_count,
                 "byte_semantics": self.operations.byte_semantics,
+                "count_semantics": self.operations.count_semantics,
             },
         }
 
@@ -224,11 +235,29 @@ class PerformanceProfiler:
         remote_command = command_parts[-1] if is_ssh else ""
         if is_ssh:
             self._counts["ssh_invocations"] += 1
-            self._counts["remote_commands"] += 1
             self._elapsed["ssh_wait"] += elapsed
-            categories = _classify_remote_command(remote_command, self._counts)
-            for category in categories:
-                self._elapsed[f"{category}_wait"] += elapsed
+            control_operation = bool(
+                getattr(command, "ssh_control_operation", False)
+            ) or _is_ssh_control_operation(command_parts)
+            exec_channel = bool(
+                getattr(command, "ssh_exec_channel", not control_operation)
+            )
+            opens_connection = bool(
+                getattr(command, "ssh_opens_connection", not control_operation)
+            )
+            if control_operation:
+                self._counts["ssh_control_operations"] += 1
+            if exec_channel:
+                self._counts["ssh_exec_channels"] += 1
+                self._counts["remote_commands"] += 1
+                categories = _classify_remote_command(remote_command, self._counts)
+                for category in categories:
+                    self._elapsed[f"{category}_wait"] += elapsed
+            if opens_connection and not _is_ssh_transport_failure(
+                result,
+                timed_out=timed_out,
+            ):
+                self._counts["ssh_connections"] += 1
 
         transferred = _result_bytes(result)
         self._bytes_transferred += transferred
@@ -335,13 +364,31 @@ def _classify_remote_command(command: str, counts: dict[str, int]) -> tuple[str,
         counts["directory_listing_operations"] += 1
         categories.append("directory_listing")
 
+    archive_batch = (
+        command.startswith("sh -c ")
+        and "bmd-agent-archive-probe-v1" in command
+    )
     archive_probe = command.startswith("test -f ") and bool(
         _ARCHIVE_PROBE_RE.search(command)
     )
-    if archive_probe:
+    if archive_batch:
+        counts["archive_probes"] += 1
+        counts["archive_probe_batches"] += 1
+        categories.append("archive_probe")
+    elif archive_probe:
         counts["archive_probes"] += 1
         categories.append("archive_probe")
     return tuple(categories)
+
+
+def _is_ssh_control_operation(command: Sequence[str]) -> bool:
+    return "-O" in command and "exit" in command
+
+
+def _is_ssh_transport_failure(result: object | None, *, timed_out: bool) -> bool:
+    if timed_out or result is None:
+        return True
+    return getattr(result, "returncode", None) == 255
 
 
 def _is_expected_negative_probe(command: object, returncode: object) -> bool:

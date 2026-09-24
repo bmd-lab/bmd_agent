@@ -47,6 +47,7 @@ from bmd_agent.resources.vasp import (
     build_remote_file_path,
     extract_remote_outcar_force_blocks,
     parse_poscar,
+    probe_remote_error_archives,
     remote_directory_exists,
     remote_file_exists,
     remote_file_size,
@@ -4396,20 +4397,19 @@ def _observe_remote_error_archives(
 ) -> tuple[PathObservation, ...]:
     observations: list[PathObservation] = []
     for directory in directories:
-        for index in range(1, _REMOTE_ERROR_ARCHIVE_LIMIT + 1):
-            filename = f"error.{index}.tar.gz"
-            path = build_remote_file_path(
-                directory,
-                filename,
-                allowed_roots=allowed_roots,
-            )
-            if not remote_file_exists(
+        try:
+            archives = probe_remote_error_archives(
                 ssh_host,
-                path,
+                directory,
+                allowed_roots=allowed_roots,
+                limit=_REMOTE_ERROR_ARCHIVE_LIMIT,
                 runner=runner,
                 timeout=timeout,
-            ):
-                break
+            )
+        except (UnicodeError, ValueError):
+            continue
+        for path in archives:
+            filename = path.name
             observations.append(
                 PathObservation(
                     label=filename,

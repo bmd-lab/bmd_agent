@@ -124,6 +124,39 @@ def test_existing_path_target_uses_lifecycle_analysis(
     assert analyzed == [calculation.resolve()]
 
 
+def test_local_path_analysis_does_not_create_reusable_remote_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calculation = tmp_path / "calculation"
+    calculation.mkdir()
+
+    class ForbiddenRemoteSession:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pytest.fail("local path analysis must not create a reusable SSH session")
+
+    monkeypatch.setattr(cli, "ReusableSshSession", ForbiddenRemoteSession)
+    monkeypatch.setattr(cli, "load_resources", lambda: ResourceRegistry({}, {}))
+    monkeypatch.setattr(
+        cli,
+        "analyze_calculation_directory",
+        lambda directory, **kwargs: SimpleNamespace(
+            directory=directory,
+            state=SimpleNamespace(value="UNKNOWN"),
+            calculation_kind="none",
+            message="no calculation",
+        ),
+    )
+    monkeypatch.setattr(cli, "print_lifecycle_analysis", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "enrich_lifecycle_with_bmdex_domain_context",
+        lambda *args, **kwargs: None,
+    )
+
+    assert cli.show_current_directory(calculation) == 0
+
+
 def test_cli_structure_requires_directory(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = cli.main(["structure"])
 
