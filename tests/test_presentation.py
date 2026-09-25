@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
+from bmd_agent import cli
 from bmd_agent.presentation import (
     build_job_concise_summary,
     build_lifecycle_concise_summary,
     render_concise_summary,
 )
 from bmd_agent.resources.bmdex import (
+    BmdexContextualAssessment,
     BmdexContextualReferenceRecord,
     BmdexDomainContextEnrichment,
     BmdexDomainContextEvidence,
@@ -24,6 +27,7 @@ from bmd_agent.resources.lifecycle import (
     BmdWorkflowDiscovery,
     LifecycleAnalysis,
     LifecycleState,
+    LocalStageEvidence,
 )
 from bmd_agent.resources.oom import (
     INSUFFICIENT_OOM_EVIDENCE,
@@ -186,7 +190,11 @@ def bmd_job(
     )
 
 
-def contextual_enrichment(statement: str) -> BmdexDomainContextEnrichment:
+def contextual_enrichment(
+    statement: str,
+    *,
+    input_tags: dict | None = None,
+) -> BmdexDomainContextEnrichment:
     record = BmdexContextualReferenceRecord(
         record={
             "id": "vasp.hybrid.test",
@@ -201,7 +209,10 @@ def contextual_enrichment(statement: str) -> BmdexDomainContextEnrichment:
         match={"matched_fields": ["calculation_family"]},
     )
     return BmdexDomainContextEnrichment(
-        query={"calculation_family": "hybrid_functional"},
+        query={
+            "calculation_family": "hybrid_functional",
+            "input_tags": input_tags or {},
+        },
         evidence=BmdexDomainContextEvidence(
             payload={
                 "schema_version": 1,
@@ -211,7 +222,18 @@ def contextual_enrichment(statement: str) -> BmdexDomainContextEnrichment:
             },
             records=(record,),
         ),
+        assessment=BmdexContextualAssessment(
+            basis=("The producer-owned record is applicable to the observed run.",),
+            limitations=(
+                "Contextual reference evidence does not establish a hang or a method incompatibility by itself.",
+            ),
+            source_record_ids=(record.record_id,),
+        ),
     )
+
+
+def normalized(text: str) -> str:
+    return " ".join(text.split())
 
 
 def rendered_job(job: JobInspection, **kwargs) -> str:
@@ -255,6 +277,62 @@ def test_completed_multi_stage_workflow_preserves_compact_stage_statuses() -> No
     assert output.count("COMPLETED") == 4
 
 
+def test_completed_si_hse_path_summary_uses_producer_workflow_identity() -> None:
+    root = Path("/calculation/hse06_dos_completed")
+    workflow_stages = (
+        {"index": 1, "stage_type": "relax", "theory": "pbe", "modifiers": []},
+        {"index": 2, "stage_type": "static", "theory": "hse06", "modifiers": []},
+        {"index": 3, "stage_type": "dos", "theory": "hse06", "modifiers": []},
+    )
+    stage_evidence = tuple(
+        LocalStageEvidence(
+            label=f"stage_{index:02d}",
+            path=root / f"stage_{index:02d}",
+            stage_index=index,
+            producer_path=f"/producer/stage_{index:02d}",
+            has_required_inputs=True,
+            has_meaningful_execution=True,
+            normal_completion=True,
+        )
+        for index in range(1, 4)
+    )
+    workflow = BmdWorkflowDiscovery(
+        workflow_root=root,
+        submission_path=root / "submission.json",
+        submission={},
+        workflow_stages=workflow_stages,
+        stage_bindings=(),
+        stage_evidence=stage_evidence,
+    )
+    analysis = LifecycleAnalysis(
+        state=LifecycleState.COMPLETED,
+        directory=root,
+        calculation_kind="BMD Compute",
+        message="complete",
+        bmd_workflow=workflow,
+        scientific=scientific(),
+    )
+
+    output = render_concise_summary(build_lifecycle_concise_summary(analysis))
+
+    assert "PBE Geometry Optimisation -> HSE06 Static Energy -> HSE06 DOS" in output
+    assert "Status: COMPLETED" in output
+    assert "Stage 1  COMPLETED" in output
+    assert "Stage 2  COMPLETED" in output
+    assert "Stage 3  COMPLETED" in output
+    assert "Si\n2 atoms" in output
+    assert "Electronic convergence: reached" in output
+    assert "Final energy: -12.579584 eV" in output
+    assert "Band gap: 1.232 eV" in output
+    assert "No execution problems were detected." in output
+    assert "SOC" not in output
+    assert "What happened" not in output
+    assert "Why this may have happened" not in output
+    assert "Assessment" not in output
+    assert "vasprun" not in output
+    assert "provenance" not in output
+
+
 def test_running_job_reports_progress_without_calling_it_failed() -> None:
     job = bmd_job(
         scheduler_record=scheduler(state="RUNNING", exit_code="0:0"),
@@ -262,6 +340,7 @@ def test_running_job_reports_progress_without_calling_it_failed() -> None:
             trajectory(
                 stage_type="relax",
                 completed_ionic_steps=14,
+                incomplete_iterations=2,
                 converged_electronic=True,
             ),
         ),
@@ -271,6 +350,8 @@ def test_running_job_reports_progress_without_calling_it_failed() -> None:
 
     assert "Status: RUNNING" in output
     assert "14 ionic steps were completed." in output
+    assert "2 electronic iterations have been observed in the current electronic cycle." in normalized(output)
+    assert "before the calculation was interrupted" not in output
     assert "Electronic convergence was reached." in output
     assert "No execution error has been established." in output
     assert "Status: FAILED" not in output
@@ -287,7 +368,7 @@ def test_pending_job_is_minimal_and_includes_useful_queue_reason() -> None:
     assert "Progress" not in output
 
 
-def test_historical_21906221_fixture_renders_supported_custodian_failure() -> None:
+def test_historical_21906221_fixture_renders_supported_custodian_failure(capsys) -> None:
     job_fixture = json.loads(
         (Path(__file__).parent / "fixtures" / "job_21906221.json").read_text(
             encoding="utf-8"
@@ -338,31 +419,62 @@ def test_historical_21906221_fixture_renders_supported_custodian_failure() -> No
     job = bmd_job(
         stages=(stage,),
         scheduler_record=scheduler(state="FAILED", exit_code="1:0"),
-        trajectories=(trajectory(incomplete_iterations=4, converged_electronic=False),),
+        trajectories=(
+            trajectory(
+                incomplete_iterations=4,
+                converged_electronic=False,
+                vasprun_error="file could not be parsed completely",
+            ),
+        ),
         termination=termination,
         custodian=(evidence,),
         oom=oom,
     )
     enrichment = contextual_enrichment(
-        "Long electronic steps can be normal for hybrid calculations and do not by themselves mean that VASP is frozen."
+        "VASP hybrid-functional and HF-type calculations include nonlocal Hartree-Fock "
+        "exchange, whose evaluation can be much more expensive than semilocal DFT. "
+        "In starts where NELMDL applies, VASP may first perform non-self-consistent "
+        "blocked-Davidson delay steps with a fixed Hamiltonian; for HF-type calculations "
+        "with NELMDL >= 3, these delay steps use the corresponding semilocal local "
+        "Hamiltonian. When the calculation leaves that delay and begins evaluating the "
+        "hybrid/HF exact-exchange workload, the wall time per electronic step can "
+        "increase dramatically."
     )
 
     output = rendered_job(job, contextual_enrichment=enrichment)
+    plain = normalized(output)
 
     assert "HSE06 Static Energy + SOC" in output
     assert "Status: FAILED" in output
-    assert "Automatic frozen-job protection intervened 5 times" in output
-    assert "after 6 hours passed without new VASP output" in output
-    assert "An automatic correction changed SYMPREC to 1e-08." in output
-    assert "Long electronic steps can be normal for hybrid calculations" in output
-    assert "does not establish its termination cause" in output
+    assert "Automatic frozen-job protection intervened 5 times" in plain
+    assert "after 6 hours passed without new VASP output" in plain
+    assert (
+        "Each intervention also applied the same automatic VASP setting correction."
+        in plain
+    )
+    assert "INCAR.SYMPREC" not in output
+    assert "1e-08" not in output
+    assert "VASP hybrid-functional and HF-type calculations include" in plain
+    assert "NELMDL" not in output
+    assert "When the calculation leaves that delay" not in output
+    assert (
+        "A long period without new VASP output does not, by itself, establish that the "
+        "calculation is frozen."
+        in plain
+    )
+    assert "This is contextual scientific evidence" not in output
     assert "No evidence of an out-of-memory failure was found." in output
     assert "Peak observed use was about 43 GB of 192 GB allocated." in output
-    assert "incomplete electronic cycle contains 4 observed iterations" in output
+    assert (
+        "4 electronic iterations were observed before the calculation was interrupted."
+        in plain
+    )
     assert "Electronic convergence was not reached." in output
-    assert "immediate cause of termination" in output
-    assert "does not establish whether the calculation would eventually have converged" in output
-    assert "historical submission does not record the execution policy" in output
+    assert "immediate cause of termination" in plain
+    assert "It is not known whether the calculation would eventually have converged." in plain
+    assert "historical submission does not record the execution policy" not in output
+    assert "vasprun.xml" not in output
+    assert "file could not be parsed completely" not in output
     assert "bmd-agent 21906221 --verbose" in output
     for internal_name in (
         "termination_observation",
@@ -375,7 +487,70 @@ def test_historical_21906221_fixture_renders_supported_custodian_failure() -> No
         "FrozenJobErrorHandler",
     ):
         assert internal_name not in output
-    assert len(output.splitlines()) <= 40
+    assert len(output.splitlines()) <= 45
+
+    cli.print_job_inspection(job, contextual_enrichment=enrichment)
+    verbose = capsys.readouterr().out
+    assert "repeated correction: INCAR.SYMPREC -> 1e-08" in verbose
+    assert "submission has no persisted policy" in verbose
+    assert (
+        "vasprun trajectory enrichment unavailable: file could not be parsed completely"
+        in verbose
+    )
+    assert "NELMDL applies" in verbose
+
+
+def test_concise_context_is_extractive_and_does_not_mutate_evidence() -> None:
+    job = bmd_job(
+        scheduler_record=scheduler(state="FAILED", exit_code="1:0"),
+        termination=TerminationEvidenceAssessment("unknown", "insufficient_evidence"),
+    )
+    enrichment = contextual_enrichment(
+        "EXTRA_PARAM detail is producer-specific. Producer-owned concise explanation."
+    )
+    original_job = copy.deepcopy(job)
+    original_enrichment = copy.deepcopy(enrichment)
+
+    output = rendered_job(job, contextual_enrichment=enrichment)
+
+    assert "Producer-owned concise explanation." in output
+    assert "EXTRA_PARAM" not in output
+    assert "exact exchange" not in output.lower()
+    assert job == original_job
+    assert enrichment == original_enrichment
+
+
+def test_supported_interruption_keeps_decisive_convergence_uncertainty() -> None:
+    job = bmd_job(
+        scheduler_record=scheduler(state="TIMEOUT", exit_code="0:0"),
+        trajectories=(
+            trajectory(
+                incomplete_iterations=4,
+                vasprun_error="file could not be parsed completely",
+            ),
+        ),
+        result=ScientificResult(
+            source_paths=("/flow/vasprun.xml",),
+            error="file could not be parsed completely",
+        ),
+        termination=TerminationEvidenceAssessment(
+            "slurm_timeout",
+            "supported",
+            basis=("scheduler reports TIMEOUT",),
+        ),
+    )
+
+    output = rendered_job(job)
+    plain = normalized(output)
+
+    assert "4 electronic iterations were observed before the calculation was interrupted." in plain
+    assert (
+        "Agent could not determine whether electronic convergence was reached from the "
+        "available results."
+        in plain
+    )
+    assert "vasprun.xml" not in output
+    assert "file could not be parsed completely" not in output
 
 
 def test_established_oom_is_explained_without_changing_termination_logic() -> None:
@@ -448,11 +623,12 @@ def test_geometry_relaxation_progress_uses_existing_force_evidence() -> None:
     )
 
     output = rendered_job(job)
+    plain = normalized(output)
 
     assert "2 ionic steps were completed." in output
     assert "Ionic convergence was not reached." in output
-    assert "0.0719 eV/A" in output
-    assert "0.0100 eV/A" in output
+    assert "0.0719 eV/A" in plain
+    assert "0.0100 eV/A" in plain
 
 
 def test_current_policy_does_not_emit_historical_policy_gap() -> None:
@@ -535,7 +711,13 @@ def test_manual_direct_vasp_and_partial_outputs_remain_neutral() -> None:
     assert "Status: FAILED" in output
     assert "3 observed iterations" in output
     assert "Agent could not determine the cause" in output
-    assert "vasprun.xml could not be parsed completely" in output
+    assert (
+        "Agent could not determine whether electronic convergence was reached from the "
+        "available results."
+        in normalized(output)
+    )
+    assert "vasprun.xml" not in output
+    assert "file could not be parsed completely" not in output
     assert "list index out of range" not in output
 
 
@@ -574,6 +756,7 @@ def test_failed_multi_stage_summary_focuses_on_active_stage() -> None:
     assert "Stage 2  FAILED" in output
     assert "Stage 3  NOT STARTED" in output
     assert "incomplete electronic cycle contains 7 observed iterations" in output
+    assert "before the calculation was interrupted" not in output
 
 
 def test_lifecycle_summary_is_structured_and_uses_caller_detail_hint() -> None:

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
+import textwrap
 from typing import Any, Iterable, Mapping, Sequence
 
 from bmd_agent.resources.bmdex import BmdexDomainContextEnrichment
 from bmd_agent.resources.custodian import (
     CustodianInterventionEvidence,
-    CustodianPolicyEvidence,
     TerminationEvidenceAssessment,
 )
 from bmd_agent.resources.lifecycle import LifecycleAnalysis, LifecycleState
@@ -95,6 +96,8 @@ def build_job_concise_summary(
         progress = _progress_lines(
             _job_focus_trajectory(inspection),
             scientific=_job_scientific(inspection),
+            interrupted=_interruption_supported(_job_termination(inspection)),
+            running=status == "RUNNING",
         )
         if progress:
             sections.append(ConciseSection("Progress", progress))
@@ -148,7 +151,14 @@ def build_lifecycle_concise_summary(
                 ("The calculation is currently running.", "No execution error has been established."),
             )
         )
-        progress = _progress_lines(_lifecycle_focus_trajectory(analysis), scientific=analysis.scientific)
+        progress = _progress_lines(
+            _lifecycle_focus_trajectory(analysis),
+            scientific=analysis.scientific,
+            interrupted=_interruption_supported(
+                analysis.diagnostics.termination if analysis.diagnostics else None
+            ),
+            running=True,
+        )
         if progress:
             sections.append(ConciseSection("Progress", progress))
     elif status == "COMPLETED":
@@ -166,7 +176,13 @@ def build_lifecycle_concise_summary(
     else:
         unsuccessful = _unsuccessful_lifecycle_sections(analysis, contextual_enrichment)
         sections.extend(section for section in unsuccessful if section.title != "Assessment")
-        progress = _progress_lines(_lifecycle_focus_trajectory(analysis), scientific=analysis.scientific)
+        progress = _progress_lines(
+            _lifecycle_focus_trajectory(analysis),
+            scientific=analysis.scientific,
+            interrupted=_interruption_supported(
+                analysis.diagnostics.termination if analysis.diagnostics else None
+            ),
+        )
         if progress:
             sections.append(ConciseSection("Progress", progress))
         sections.extend(section for section in unsuccessful if section.title == "Assessment")
@@ -201,7 +217,20 @@ def render_concise_summary(summary: ConciseDiagnosticSummary) -> str:
     for section in summary.sections:
         if not section.lines:
             continue
-        lines.extend(("", section.title, "-" * len(section.title), *section.lines))
+        lines.extend(("", section.title, "-" * len(section.title)))
+        for line in section.lines:
+            if not line:
+                lines.append("")
+                continue
+            lines.extend(
+                textwrap.wrap(
+                    line,
+                    width=76,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                )
+                or [line]
+            )
 
     if summary.detailed_evidence_command:
         lines.extend(
@@ -237,11 +266,14 @@ def _unsuccessful_job_sections(
 
     assessment_lines = _assessment_lines(
         termination,
-        policy=_job_custodian_policy(inspection),
-        has_frozen_intervention=_has_frozen_intervention(custodian),
     )
     assessment_lines = tuple(
-        _ordered_unique((*assessment_lines, *_job_evidence_uncertainties(inspection)))
+        _ordered_unique(
+            (
+                *assessment_lines,
+                *_job_evidence_uncertainties(inspection),
+            )
+        )
     )
     if assessment_lines:
         sections.append(ConciseSection("Assessment", assessment_lines))
@@ -270,14 +302,14 @@ def _unsuccessful_lifecycle_sections(
     if memory_lines:
         sections.append(ConciseSection("Memory", memory_lines))
 
-    policy = analysis.bmd_workflow.custodian_policy if analysis.bmd_workflow else None
-    assessment = _assessment_lines(
-        termination,
-        policy=policy,
-        has_frozen_intervention=_has_frozen_intervention(custodian),
-    )
+    assessment = _assessment_lines(termination)
     assessment = tuple(
-        _ordered_unique((*assessment, *_lifecycle_evidence_uncertainties(analysis)))
+        _ordered_unique(
+            (
+                *assessment,
+                *_lifecycle_evidence_uncertainties(analysis),
+            )
+        )
     )
     if not assessment and analysis.state == LifecycleState.UNKNOWN:
         assessment = ("Agent could not determine the calculation state from the available evidence.",)
@@ -299,7 +331,10 @@ def _termination_lines(
             if timeout:
                 first += f" after {timeout} passed without new VASP output"
             lines = [first + ".", "The run stopped after the final intervention."]
-            correction = _plain_correction(frozen.action_summaries)
+            correction = _plain_correction(
+                frozen.action_summaries,
+                intervention_count=frozen.count,
+            )
             if correction:
                 lines.append(correction)
             return tuple(lines)
@@ -334,9 +369,6 @@ def _lifecycle_termination_lines(
 
 def _assessment_lines(
     termination: TerminationEvidenceAssessment | None,
-    *,
-    policy: CustodianPolicyEvidence | None,
-    has_frozen_intervention: bool,
 ) -> tuple[str, ...]:
     lines: list[str] = []
     if termination is not None and termination.status == "supported":
@@ -355,11 +387,7 @@ def _assessment_lines(
         lines.append("Agent could not determine the cause from the available evidence.")
 
     if termination is not None and any("eventually converge" in item for item in termination.limitations):
-        lines.append("This does not establish whether the calculation would eventually have converged.")
-    if has_frozen_intervention and policy is not None and not policy.available:
-        lines.append(
-            "This historical submission does not record the execution policy used, so Agent cannot compare it with the current policy."
-        )
+        lines.append("It is not known whether the calculation would eventually have converged.")
     return tuple(_ordered_unique(lines))
 
 
@@ -368,21 +396,82 @@ def _context_lines(
 ) -> tuple[str, ...]:
     if enrichment is None or enrichment.evidence is None or not enrichment.evidence.records:
         return ()
-    lines = [record.contextual_statement for record in enrichment.evidence.records]
-    lines.append(
-        "This is contextual scientific evidence; it may help interpret the run but does not establish its termination cause."
+    lines: list[str] = []
+    input_tags = enrichment.query.get("input_tags") if enrichment.query else None
+    observed_tags = (
+        {str(key).upper() for key in input_tags}
+        if isinstance(input_tags, Mapping)
+        else set()
     )
+    for record in enrichment.evidence.records:
+        selected = _concise_context_sentences(
+            record.contextual_statement,
+            observed_tags=observed_tags,
+        )
+        if lines and selected:
+            lines.append("")
+        lines.extend(selected)
+
+    assessment = enrichment.assessment
+    if assessment is not None and any(
+        "does not establish a hang" in limitation.lower()
+        for limitation in assessment.limitations
+    ):
+        if lines:
+            lines.append("")
+        lines.append(
+            "A long period without new VASP output does not, by itself, establish that the calculation is frozen."
+        )
     return tuple(_ordered_unique(lines))
+
+
+def _concise_context_sentences(
+    statement: str,
+    *,
+    observed_tags: set[str],
+) -> tuple[str, ...]:
+    """Select producer-authored context without creating new scientific claims."""
+
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", statement.strip())
+        if item.strip()
+    ]
+    general = [
+        sentence
+        for sentence in sentences
+        if not _contains_unobserved_parameter_name(sentence, observed_tags)
+    ]
+    if not general:
+        general = sentences[:1]
+    return tuple(general[:1])
+
+
+def _contains_unobserved_parameter_name(
+    sentence: str,
+    observed_tags: set[str],
+) -> bool:
+    tokens = re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", sentence)
+    return any(token not in observed_tags for token in tokens)
 
 
 def _job_evidence_uncertainties(inspection: JobInspection) -> tuple[str, ...]:
     trajectories = _job_trajectories(inspection)
     scientific = _job_scientific(inspection)
     lines: list[str] = []
-    if any(item.vasprun_error or item.vasprun_skipped_reason for item in trajectories):
-        lines.append(
-            "Some result and trajectory evidence is unavailable because vasprun.xml could not be parsed completely."
-        )
+    parsing_incomplete = any(
+        item.vasprun_error or item.vasprun_skipped_reason
+        for item in trajectories
+    )
+    if parsing_incomplete:
+        focus = trajectories[-1] if trajectories else None
+        electronic = focus.converged_electronic if focus is not None else None
+        if electronic is None and (
+            scientific is None or scientific.electronic_convergence is None
+        ):
+            lines.append(
+                "Agent could not determine whether electronic convergence was reached from the available results."
+            )
     elif scientific is not None and scientific.error:
         lines.append("Final scientific results could not be reconstructed from the available artifacts.")
     return tuple(lines)
@@ -396,8 +485,14 @@ def _lifecycle_evidence_uncertainties(
         item.vasprun_error or item.vasprun_skipped_reason
         for item in diagnostics.trajectories
     ):
+        focus = diagnostics.trajectories[-1]
+        electronic = focus.converged_electronic
+        if electronic is None and analysis.scientific is not None:
+            electronic = analysis.scientific.electronic_convergence
+        if electronic is not None:
+            return ()
         return (
-            "Some result and trajectory evidence is unavailable because vasprun.xml could not be parsed completely.",
+            "Agent could not determine whether electronic convergence was reached from the available results.",
         )
     if analysis.scientific is not None and analysis.scientific.error:
         return ("Final scientific results could not be reconstructed from the available artifacts.",)
@@ -454,6 +549,8 @@ def _progress_lines(
     trajectory: StageTrajectoryObservation | None,
     *,
     scientific: ScientificResult | None,
+    interrupted: bool = False,
+    running: bool = False,
 ) -> tuple[str, ...]:
     if trajectory is None:
         if scientific is not None and scientific.electronic_convergence is False:
@@ -466,7 +563,18 @@ def _progress_lines(
     if trajectory.incomplete_electronic_iteration_count is not None:
         count = trajectory.incomplete_electronic_iteration_count
         noun = "iteration" if count == 1 else "iterations"
-        lines.append(f"An incomplete electronic cycle contains {count} observed {noun}.")
+        if interrupted:
+            verb = "was" if count == 1 else "were"
+            lines.append(
+                f"{count} electronic {noun} {verb} observed before the calculation was interrupted."
+            )
+        elif running:
+            verb = "has" if count == 1 else "have"
+            lines.append(
+                f"{count} electronic {noun} {verb} been observed in the current electronic cycle."
+            )
+        else:
+            lines.append(f"An incomplete electronic cycle contains {count} observed {noun}.")
 
     electronic = trajectory.converged_electronic
     if electronic is None and scientific is not None:
@@ -707,12 +815,6 @@ def _job_custodian_evidence(
     return ()
 
 
-def _job_custodian_policy(inspection: JobInspection) -> CustodianPolicyEvidence | None:
-    if inspection.bmd_compute is None:
-        return None
-    return inspection.bmd_compute.inspection.custodian_policy
-
-
 def _scheduler_state(inspection: JobInspection) -> str:
     if inspection.scheduler is None:
         return ""
@@ -747,6 +849,21 @@ def _supported_classification(
     )
 
 
+def _interruption_supported(
+    assessment: TerminationEvidenceAssessment | None,
+) -> bool:
+    return bool(
+        assessment is not None
+        and assessment.status == "supported"
+        and assessment.classification
+        in {
+            "custodian_triggered_process_termination",
+            "slurm_timeout",
+            "slurm_out_of_memory",
+        }
+    )
+
+
 def _first_frozen_intervention(
     evidence: Sequence[CustodianInterventionEvidence],
 ):
@@ -761,22 +878,18 @@ def _first_frozen_intervention(
     )
 
 
-def _has_frozen_intervention(evidence: Sequence[CustodianInterventionEvidence]) -> bool:
-    return _first_frozen_intervention(evidence) is not None
-
-
-def _plain_correction(summaries: Sequence[str]) -> str | None:
+def _plain_correction(
+    summaries: Sequence[str],
+    *,
+    intervention_count: int,
+) -> str | None:
     if not summaries:
         return None
     if len(summaries) != 1:
         return "Automatic corrections were applied during the run."
-    summary = summaries[0]
-    if " -> " not in summary:
-        return "An automatic correction was applied during the run."
-    target, value = summary.split(" -> ", 1)
-    if target.startswith("INCAR."):
-        target = target.removeprefix("INCAR.")
-    return f"An automatic correction changed {target} to {value}."
+    if intervention_count > 1:
+        return "Each intervention also applied the same automatic VASP setting correction."
+    return "The intervention also applied an automatic VASP setting correction."
 
 
 def _duration(seconds: Any) -> str | None:
