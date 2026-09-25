@@ -5,6 +5,14 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+.tox/
+.nox/
 
 # Environments
 .venv/
@@ -14,8 +22,34 @@ venv/
 .env
 .env.*
 !.env.example
+resources.toml
 config/resources.toml
 config/resources.local.toml
+config/resources.*.toml
+!config/resources.example.toml
+secrets.*
+*.secrets.*
+
+# Private keys and credential containers
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+id_ecdsa
+id_ecdsa.*
+id_dsa
+id_dsa.*
+
+# Licensed VASP potential data
+POTCAR
+POTCAR.*
+!POTCAR.spec
+!**/POTCAR.spec
 
 # Agent runtime state
 state/

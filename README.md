@@ -1,152 +1,193 @@
 # BMD Agent
 
-BMD Agent is a persistent, physics-grounded scientific reference,
-troubleshooting, and coordination agent for the BMD Lab at Tel Aviv
-University.
+BMD Agent is a small, deterministic observation and diagnostic layer for the
+BMD Lab at Tel Aviv University. It helps researchers understand VASP
+calculations without replacing the software and knowledge sources that produced
+them.
 
-It is intended to help researchers understand and use the group's
-computational infrastructure, scientific knowledge, research data,
-documentation, and software while preserving clear boundaries between
-those systems.
+BMD Agent observes and diagnoses calculations. It can inspect:
 
-BMD Agent's canonical ecosystem role is the understanding and coordination
-layer. It consumes evidence and capabilities exposed by BMD Compute, BMDex, and
-infrastructure without duplicating their authority.
+- VASP inputs and results;
+- SLURM state, accounting, resource use, and out-of-memory evidence;
+- Custodian interventions;
+- BMD Compute workflow and Git provenance;
+- compact convergence trajectories; and
+- applicable contextual knowledge supplied by BMDex.
 
-BMD Agent is an independent project. It is not part of BMD Compute,
-BMDex, BMDwiki, or the BMD Lab website.
+The default output is a concise student-facing diagnosis. Detailed evidence
+remains available for advanced users and reproducibility.
 
-## BMD ecosystem
+## Install
 
-The BMD software and knowledge ecosystem has distinct components with
-different responsibilities:
+BMD Agent requires Python 3.12 or newer. From a fresh clone:
 
-- **BMD Compute — generate**
-  - Core VASP data-generation pipeline.
-  - Owns the authoritative implementation of decisions required to construct,
-    validate, execute, and provenance BMD VASP calculations.
-  - Generates new computational materials data.
-  - Uses pymatgen, atomate2/jobflow, VASP, and the TAU PowerSLURM
-    cluster.
+```bash
+git clone https://github.com/bmd-lab/bmd_agent.git
+cd bmd_agent
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
 
-- **BMDex — preserve**
-  - BMD-curated supporting scientific data, reference evidence, and non-core
-    scientific tools outside the BMD Compute VASP data-generation pipeline.
-  - Records provenance, validation evidence, limitations, chemical/composition
-    resources, structure prototypes, literature/database tooling, and
-    non-core scientific utilities.
+On Windows PowerShell, activate the environment with:
 
-- **BMDwiki — explain**
-  - Human-oriented documentation.
-  - Tutorials, explanations, troubleshooting guides, onboarding, and
-    educational material.
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
 
-- **BMD Lab website — present and connect**
-  - Public face of the group.
-  - Presents people, publications, teaching, news, and links to BMD
-    resources.
+For development, install the declared test dependency and run the suite:
 
-- **BMD Agent — understand, diagnose, advise, and coordinate**
-  - Reasons across the BMD ecosystem.
-  - Helps researchers find information, understand calculations,
-    troubleshoot problems, identify evidence, and determine appropriate
-    next steps.
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest
+```
 
-These systems remain independently version-controlled and authoritative
-for their respective responsibilities.
+No BMD Compute checkout, BMDex checkout, SSH connection, PowerSLURM access, or
+VASP installation is required to run the unit tests.
 
-If a capability determines how BMD generates a VASP calculation, its
-authoritative implementation belongs in BMD Compute. If it provides supporting
-scientific data or tooling but is not part of the core VASP data-generation
-pipeline, it belongs in BMDex. BMD Agent consumes and coordinates these
-capabilities without duplicating their authority.
+## Configure resources
 
-## Scientific philosophy
+The tracked [example configuration](config/resources.example.toml) documents
+the supported resource fields. Copy it to a deployment-local location and edit
+the copy. The example is never used automatically for real execution.
 
-BMD Agent is physics-first.
+The normal Linux location is:
 
-The scientific foundation of the group is computational materials
-physics using tools including:
+```text
+~/.config/bmd-agent/resources.toml
+```
 
-- VASP
-- pymatgen
-- Materials Project
-- atomate2
-- jobflow
-- high-performance computing
+On Windows, the normal location is:
 
-AI and machine learning are used to accelerate and enhance this
-scientific workflow, not to replace physically meaningful calculations
-or scientific validation.
+```text
+%APPDATA%\bmd-agent\resources.toml
+```
 
-The agent must preserve distinctions between different forms of
-evidence. For example:
+Set `BMD_AGENT_RESOURCES` to use a different file:
 
-- an ML prediction is not a DFT result;
-- a DFT result is not experimental validation;
-- negative formation energy is not equivalent to thermodynamic
-  stability against competing phases;
-- implementation of a workflow is not evidence that the workflow has
-  been validated;
-- absence of a composition from a database does not by itself establish
-  structural novelty.
+```bash
+export BMD_AGENT_RESOURCES=/secure/local/path/resources.toml
+```
 
-Scientific conclusions should remain traceable to their methods,
-assumptions, data, and validation state.
+Deployment configuration identifies resources; it does not define scientific
+workflow policy. The main fields are:
 
-## Initial scope
+- `repositories`: trusted BMD Compute and BMDex checkout paths;
+- `capability_python`: the Python executable for each checkout's own
+  environment;
+- `ssh_host`: a configured SSH alias for the observational cluster identity;
+- `allowed_remote_roots`: absolute POSIX roots authorized for remote reads;
+- `deployment_profile`: an optional shipped infrastructure reference profile;
+- timeout values for SSH, fixed remote commands, and scheduler accounting; and
+- `access`, `protected`, and `live` declarations describing Agent policy.
 
-BMD Agent v0 is observational.
+Keep `resources.toml` local. Do not commit credentials, private keys, or
+deployment-local configuration. SSH credentials belong in the user's SSH
+configuration or agent, not in this repository or `resources.toml`.
 
-It may inspect authorized resources, perform analysis, and provide
-evidence-backed scientific and technical advice.
+## Use
 
-It may not modify authoritative BMD resources.
+The normal interface is deliberately simple:
 
-Initial resources include:
+```bash
+bmd-agent
+bmd-agent JOB_ID
+bmd-agent PATH
+```
 
-- the local BMD Compute Git repository;
-- the local BMDex Git repository;
-- the BMD Lab website;
-- authorized BMD files on PowerSLURM;
-- the BMD PowerSLURM queue;
-- VASP calculation outputs;
-- pymatgen;
-- Materials Project.
+- No target analyzes the current working directory.
+- A bare positive decimal integer inspects that SLURM job and resolves its BMD
+  Compute run when producer evidence permits.
+- Any other existing filesystem path analyzes that calculation or workflow.
 
-BMDwiki and additional scientific tools will be integrated incrementally.
+Examples:
 
-## Governance
+```bash
+cd /path/to/calculation
+bmd-agent
 
-BMD Agent is a group resource and a research/training project.
+bmd-agent 21853598
+bmd-agent ./copied-calculation
+```
 
-Group members may use the agent and may contribute to its development.
+Use `--verbose` for detailed evidence, provenance, parser limitations, and
+scheduler accounting. On job inspection, use `--profile` for
+developer-oriented acquisition and performance telemetry. Additional
+expert/debug subcommands remain available for compatibility and testing, but
+are not required for normal use.
 
-Authoritative changes to BMD resources remain under PI control.
+BMD Agent remains independently callable on a cluster with these same commands.
+Its Python interfaces may also be called by BMD Compute in the future, but this
+repository does not implement that integration.
 
-Future capabilities that can modify repositories, submit or cancel
-calculations, deploy software, publish information, or adopt scientific
-standards must cross an explicit approval boundary.
+## Observation boundary
 
-BMD Agent v0 avoids this problem entirely by not exposing such action
-capabilities.
+BMD Agent does not intentionally modify calculations, submit or cancel jobs,
+restart calculations, alter scientific inputs, delete calculation files, or
+extract Custodian error archives. It does not read POTCAR contents.
 
-See `ARCHITECTURE.md` and `SECURITY.md` for the architectural and
-security contracts.
+In particular, Agent does not provide commands to edit `INCAR`, `KPOINTS`, or
+`POSCAR`, and it does not expose arbitrary user-controlled remote shell
+execution. Remote scheduler and file operations are fixed-purpose observation
+interfaces.
 
-## Development philosophy
+Safe deployment relies on all three of the following:
 
-The initial implementation should remain:
+1. Agent's read-only, action-free implementation;
+2. correctly configured `allowed_remote_roots`; and
+3. appropriately restricted OS/SSH credentials and filesystem permissions.
 
-- small;
-- understandable;
-- auditable;
-- modular;
-- evidence-oriented;
-- physics-grounded.
+Remote path authorization is lexical. It rejects paths outside configured
+roots after POSIX normalization, but it is not a filesystem sandbox and does
+not resolve every remote symlink before access. A symlink beneath an allowed
+root may point outside that root if the SSH identity can follow it. Likewise,
+`access = "read_only"` is an Agent policy declaration; it does not remove write
+permission from the operating-system account. Deploy Agent with a
+least-privileged observational identity and suitable server-side permissions.
 
-Existing scientific and software tools should be orchestrated rather
-than reimplemented.
+BMD Agent invokes only fixed producer modules from explicitly configured BMD
+Compute and BMDex checkouts, using each checkout's configured Python executable.
+Those checkouts are trusted code dependencies: their module code executes with
+the Agent caller's OS privileges. Do not configure arbitrary third-party
+checkouts as producers.
 
-The project will grow incrementally after each capability has been
-tested and validated.
+See [SECURITY.md](SECURITY.md) for the complete security model.
+
+## Deployment profiles
+
+[`src/bmd_agent/deployment_profiles/power.toml`](src/bmd_agent/deployment_profiles/power.toml)
+is a versioned record of expected and observed POWER infrastructure facts. It
+supports reproducibility and compatibility checks; its paths do not grant
+access.
+
+Deployment-local `resources.toml` remains authoritative for the SSH alias,
+allowed roots, operational timeouts, and access policy. The current VM-to-POWER
+SSH route is a supported deployment, not a promise about the final production
+architecture.
+
+## Scientific and ecosystem boundaries
+
+BMD Agent preserves the responsibilities of independently version-controlled
+BMD projects:
+
+- **BMD Compute** owns what its VASP workflows execute.
+- **BMDex** owns curated supporting scientific data and contextual evidence.
+- **BMDwiki** owns human-oriented tutorials and explanations.
+- **BMD Agent** connects evidence so researchers can understand and diagnose a
+  calculation.
+
+Implementation is not scientific validation, a completed job is not methodology
+adoption, and Agent observations do not automatically become BMD standards.
+Human scientific review and governance remain separate.
+
+The architecture is described in [ARCHITECTURE.md](ARCHITECTURE.md). Graduate
+students can contribute using the lightweight process in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+BMD Agent's repository-owned source and documentation are released under the
+[MIT License](LICENSE). This license does not grant rights to VASP, POTCAR/PAW
+datasets, or third-party dependencies; those remain subject to their own
+licenses and access terms.

@@ -100,7 +100,7 @@ def generate_input_reference(
         )
 
     request_text = json.dumps(_json_safe_value(request), sort_keys=True)
-    command = [str(repository.capability_python), "-m", PRODUCER_MODULE]
+    command = [str(repository.capability_python), "-B", "-m", PRODUCER_MODULE]
 
     try:
         completed = runner(

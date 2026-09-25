@@ -92,7 +92,9 @@ def test_valid_schema_v1_consumption_preserves_payload(tmp_path: Path) -> None:
     )
 
     assert capabilities.payload == payload
-    assert calls == [([str(python), "-m", "backend.calculations.capabilities"], checkout)]
+    assert calls == [
+        ([str(python), "-B", "-m", "backend.calculations.capabilities"], checkout)
+    ]
 
 
 def test_all_advertised_capabilities_are_preserved() -> None:

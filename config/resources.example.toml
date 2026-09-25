@@ -14,6 +14,11 @@
 #
 # This example is documentation only. BMD Agent never uses it as the
 # runtime configuration.
+#
+# Repository producer modules execute as the Agent caller. Configure only
+# trusted BMD Compute/BMDex checkouts and use least-privileged OS/SSH
+# identities. The access declarations below express Agent policy; they do not
+# remove permissions from the underlying operating-system accounts.
 
 [repositories.bmd_compute]
 name = "BMD Compute"
@@ -27,8 +32,8 @@ live = true
 # only to run fixed read-only producer modules from the configured checkout,
 # currently:
 #
-#   python -m backend.calculations.capabilities
-#   python -m backend.calculations.input_reference
+#   python -B -m backend.calculations.capabilities
+#   python -B -m backend.calculations.input_reference
 #
 # from the configured checkout.
 capability_python = "/home/example/micromamba/envs/bmd-compute/bin/python"
@@ -71,7 +76,9 @@ scheduler_accounting_timeout_seconds = 60
 
 # Absolute POSIX directories that BMD Agent may read through this SSH
 # identity when inspecting calculation files. User-supplied paths must
-# stay within one of these roots after lexical normalization.
+# stay within one of these roots after lexical normalization. This is not a
+# filesystem sandbox: remote symlinks may resolve outside a lexical root if
+# the SSH identity has permission to follow them.
 allowed_remote_roots = [
     "/bmd-db/guest/flows",
     "/bmd-db/guest/logs",
