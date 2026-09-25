@@ -147,15 +147,20 @@ def test_profile_output_is_opt_in_and_follows_unchanged_normal_output(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    modes: list[tuple[bool, bool]] = []
+
     def fake_show_job(
         job_id: str,
         registry: object,
         *,
         trajectory_json: bool,
         profiling: bool = False,
+        verbose: bool = False,
+        detailed_evidence_command: str | None = None,
     ) -> int:
         assert job_id == "21906221"
         assert trajectory_json is False
+        modes.append((verbose, profiling))
         print("ordinary scientific conclusion")
         return 0
 
@@ -169,6 +174,13 @@ def test_profile_output_is_opt_in_and_follows_unchanged_normal_output(
     profiled_output = capsys.readouterr().out
     assert profiled_output.startswith(normal_output + "\nPerformance profile")
     assert "developer telemetry" in profiled_output
+
+    assert cli.show_job("21906221", verbose=True, profile=True) == 0
+    verbose_profiled_output = capsys.readouterr().out
+    assert verbose_profiled_output.startswith(
+        "ordinary scientific conclusion\n\nPerformance profile"
+    )
+    assert modes == [(False, False), (False, True), (True, True)]
 
 
 def test_runner_is_unwrapped_when_no_profile_is_active() -> None:

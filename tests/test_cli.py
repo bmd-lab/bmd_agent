@@ -36,6 +36,7 @@ def test_bare_numeric_target_and_explicit_job_use_same_job_implementation(
         registry: ResourceRegistry | None = None,
         *,
         trajectory_json: bool = False,
+        **kwargs: object,
     ) -> int:
         calls.append((job_id, trajectory_json))
         return 0
@@ -58,6 +59,7 @@ def test_bare_numeric_and_explicit_job_profile_use_same_job_implementation(
         *,
         trajectory_json: bool = False,
         profile: bool = False,
+        **kwargs: object,
     ) -> int:
         assert trajectory_json is False
         calls.append((job_id, profile))
@@ -108,6 +110,7 @@ def test_existing_path_target_uses_lifecycle_analysis(
     def fake_show_current_directory(
         directory: Path | None = None,
         registry: ResourceRegistry | None = None,
+        **kwargs: object,
     ) -> int:
         assert directory is not None
         analyzed.append(directory.resolve())
@@ -122,6 +125,72 @@ def test_existing_path_target_uses_lifecycle_analysis(
 
     assert cli.main([targets[target_kind]]) == 0
     assert analyzed == [calculation.resolve()]
+
+
+def test_normal_job_verbose_and_profile_flags_compose_through_same_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_show_job(job_id: str, **kwargs: object) -> int:
+        calls.append({"job_id": job_id, **kwargs})
+        return 0
+
+    monkeypatch.setattr(cli, "show_job", fake_show_job)
+
+    assert cli.main(["21853598", "--verbose"]) == 0
+    assert cli.main(["21853598", "--verbose", "--profile"]) == 0
+    assert calls[0]["verbose"] is True
+    assert calls[0]["profile"] is False
+    assert calls[1]["verbose"] is True
+    assert calls[1]["profile"] is True
+    assert calls[0]["detailed_evidence_command"] == "bmd-agent 21853598 --verbose"
+
+
+def test_explicit_job_verbose_profile_uses_same_job_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli,
+        "show_job",
+        lambda job_id, **kwargs: calls.append({"job_id": job_id, **kwargs}) or 0,
+    )
+
+    assert cli.main(["job", "21853598", "--profile", "--verbose"]) == 0
+
+    assert calls == [
+        {
+            "job_id": "21853598",
+            "trajectory_json": False,
+            "verbose": True,
+            "profile": True,
+            "detailed_evidence_command": "bmd-agent job 21853598 --verbose",
+        }
+    ]
+
+
+def test_cwd_and_path_verbose_route_to_existing_lifecycle_implementation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Path | None, bool]] = []
+
+    def fake_show_current_directory(
+        directory: Path | None = None,
+        registry: ResourceRegistry | None = None,
+        *,
+        verbose: bool = False,
+        detailed_evidence_command: str | None = None,
+    ) -> int:
+        calls.append((directory, verbose))
+        return 0
+
+    monkeypatch.setattr(cli, "show_current_directory", fake_show_current_directory)
+
+    assert cli.main(["--verbose"]) == 0
+    assert cli.main([str(tmp_path), "--verbose"]) == 0
+    assert calls == [(None, True), (tmp_path, True)]
 
 
 def test_local_path_analysis_does_not_create_reusable_remote_session(
@@ -154,7 +223,7 @@ def test_local_path_analysis_does_not_create_reusable_remote_session(
         lambda *args, **kwargs: None,
     )
 
-    assert cli.show_current_directory(calculation) == 0
+    assert cli.show_current_directory(calculation, verbose=True) == 0
 
 
 def test_cli_structure_requires_directory(capsys: pytest.CaptureFixture[str]) -> None:

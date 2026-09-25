@@ -20,6 +20,11 @@ from bmd_agent.profiling import (
     profile_phase,
     profiled_runner,
 )
+from bmd_agent.presentation import (
+    build_job_concise_summary,
+    build_lifecycle_concise_summary,
+    render_concise_summary,
+)
 from bmd_agent.resources.bmdex import (
     BmdexDomainContextEnrichment,
     bmdex_repository,
@@ -235,6 +240,9 @@ def show_queue(registry: ResourceRegistry | None = None) -> int:
 def show_current_directory(
     directory: Path | None = None,
     registry: ResourceRegistry | None = None,
+    *,
+    verbose: bool = False,
+    detailed_evidence_command: str | None = None,
 ) -> int:
     """Analyze the calculation associated with one local directory."""
 
@@ -266,7 +274,20 @@ def show_current_directory(
         analysis,
         bmdex_repository(registry) if registry is not None else None,
     )
-    print_lifecycle_analysis(analysis, contextual_enrichment=contextual_enrichment)
+    if verbose:
+        print_lifecycle_analysis(analysis, contextual_enrichment=contextual_enrichment)
+    else:
+        command = detailed_evidence_command or _path_detail_command(directory)
+        print(
+            render_concise_summary(
+                build_lifecycle_concise_summary(
+                    analysis,
+                    contextual_enrichment=contextual_enrichment,
+                    detailed_evidence_command=command,
+                )
+            ),
+            end="",
+        )
     return 0
 
 
@@ -275,7 +296,7 @@ def print_lifecycle_analysis(
     *,
     contextual_enrichment: BmdexDomainContextEnrichment | None = None,
 ) -> None:
-    """Print a concise lifecycle-oriented calculation summary."""
+    """Print the detailed lifecycle evidence report."""
 
     print("BMD Agent")
     print("=========")
@@ -847,11 +868,19 @@ def show_job(
     *,
     trajectory_json: bool = False,
     profile: bool = False,
+    verbose: bool = False,
+    detailed_evidence_command: str | None = None,
 ) -> int:
     """Display scheduler-bound evidence for one calculation job."""
 
     if not profile:
-        return _show_job(job_id, registry, trajectory_json=trajectory_json)
+        return _show_job(
+            job_id,
+            registry,
+            trajectory_json=trajectory_json,
+            verbose=verbose,
+            detailed_evidence_command=detailed_evidence_command,
+        )
 
     profiler = PerformanceProfiler()
     with profiler.activate():
@@ -860,6 +889,8 @@ def show_job(
             registry,
             trajectory_json=trajectory_json,
             profiling=True,
+            verbose=verbose,
+            detailed_evidence_command=detailed_evidence_command,
         )
     print_performance_profile(profiler.snapshot())
     return exit_code
@@ -871,6 +902,8 @@ def _show_job(
     *,
     trajectory_json: bool,
     profiling: bool = False,
+    verbose: bool = False,
+    detailed_evidence_command: str | None = None,
 ) -> int:
     """Run the shared job inspection path with optional active telemetry."""
 
@@ -886,7 +919,7 @@ def _show_job(
         else:
             modifier_policies, _ = modifier_policies_from_compute(registry)
 
-    if not trajectory_json:
+    if not trajectory_json and verbose:
         print("BMD Job Inspection")
         print("==================")
         print()
@@ -946,10 +979,23 @@ def _show_job(
                     bmdex_repository(registry),
                 )
         with profile_phase("synthesis_rendering"):
-            print_job_inspection(
-                inspection,
-                contextual_enrichment=contextual_enrichment,
-            )
+            if verbose:
+                print_job_inspection(
+                    inspection,
+                    contextual_enrichment=contextual_enrichment,
+                )
+            else:
+                command = detailed_evidence_command or f"bmd-agent {job_id} --verbose"
+                print(
+                    render_concise_summary(
+                        build_job_concise_summary(
+                            inspection,
+                            contextual_enrichment=contextual_enrichment,
+                            detailed_evidence_command=command,
+                        )
+                    ),
+                    end="",
+                )
     return 0
 
 
@@ -1010,7 +1056,7 @@ def print_job_inspection(
     *,
     contextual_enrichment: BmdexDomainContextEnrichment | None = None,
 ) -> None:
-    """Print a concise student-oriented job inspection summary."""
+    """Print the detailed job evidence report."""
 
     print("Job (scheduler_observation):")
     print(f"  ID: {_diagnosis_value(inspection.job_id)}")
@@ -2140,7 +2186,12 @@ def main(argv: list[str] | None = None) -> int:
 
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
-        return show_current_directory()
+        return show_current_directory(
+            detailed_evidence_command="bmd-agent --verbose",
+        )
+
+    if argv == ["--verbose"]:
+        return show_current_directory(verbose=True)
 
     command = argv[0]
 
@@ -2152,23 +2203,21 @@ def main(argv: list[str] | None = None) -> int:
             return show_queue()
 
         if command == "job":
-            option = argv[2] if len(argv) == 3 else None
-            if len(argv) < 2 or len(argv) > 3 or option not in {
-                None,
-                "--trajectory-json",
-                "--profile",
-            }:
+            options = _parse_job_options(argv[2:], allow_trajectory_json=True)
+            if len(argv) < 2 or options is None:
                 print(
                     "Usage: bmd-agent job <SLURM_JOB_ID> "
-                    "[--trajectory-json | --profile]"
+                    "[--trajectory-json | --verbose [--profile] | --profile]"
                 )
                 return 2
-
-            if option == "--trajectory-json":
-                return show_job(argv[1], trajectory_json=True)
-            if option == "--profile":
-                return show_job(argv[1], profile=True)
-            return show_job(argv[1])
+            trajectory_json, verbose, profile = options
+            return show_job(
+                argv[1],
+                trajectory_json=trajectory_json,
+                verbose=verbose,
+                profile=profile,
+                detailed_evidence_command=f"bmd-agent job {argv[1]} --verbose",
+            )
 
         if command == "compute":
             return show_compute()
@@ -2201,17 +2250,31 @@ def main(argv: list[str] | None = None) -> int:
             return show_diagnose_run(argv[1])
 
         if _is_positive_decimal_job_id(command):
-            if len(argv) == 1:
-                return show_job(command)
-            if len(argv) == 2 and argv[1] == "--profile":
-                return show_job(command, profile=True)
-            print("Usage: bmd-agent <SLURM_JOB_ID> [--profile]")
-            return 2
+            options = _parse_job_options(argv[1:], allow_trajectory_json=False)
+            if options is None:
+                print("Usage: bmd-agent <SLURM_JOB_ID> [--verbose] [--profile]")
+                return 2
+            _, verbose, profile = options
+            return show_job(
+                command,
+                verbose=verbose,
+                profile=profile,
+                detailed_evidence_command=f"bmd-agent {command} --verbose",
+            )
 
-        if len(argv) == 1:
+        if len(argv) in {1, 2} and (len(argv) == 1 or argv[1] == "--verbose"):
             target = _existing_target_path(command)
             if target is not None:
-                return show_current_directory(target)
+                verbose = len(argv) == 2
+                return show_current_directory(
+                    target,
+                    verbose=verbose,
+                    detailed_evidence_command=(
+                        None
+                        if verbose
+                        else f"bmd-agent {_quote_cli_target(command)} --verbose"
+                    ),
+                )
 
             print(
                 "Target was not recognized as a SLURM job ID or existing "
@@ -2225,15 +2288,15 @@ def main(argv: list[str] | None = None) -> int:
 
     print("Target was not recognized as a SLURM job ID or existing calculation path.")
     print()
-    print("Usage: bmd-agent [TARGET]")
-    print("  no target: analyze the current calculation directory")
-    print("  positive decimal integer [--profile]: analyze that SLURM job")
-    print("  existing filesystem path: analyze that calculation directory")
+    print("Usage: bmd-agent [TARGET] [--verbose] [--profile]")
+    print("  no target [--verbose]: analyze the current calculation directory")
+    print("  positive decimal integer [--verbose] [--profile]: analyze that SLURM job")
+    print("  existing filesystem path [--verbose]: analyze that calculation directory")
     print()
     print("Expert commands:")
     print("  status")
     print("  queue")
-    print("  job <SLURM_JOB_ID> [--trajectory-json | --profile]")
+    print("  job <SLURM_JOB_ID> [--trajectory-json | --verbose [--profile] | --profile]")
     print("  compute")
     print("  structure <remote-directory>")
     print(f"  {_check_input_usage()}")
@@ -2253,6 +2316,32 @@ def _existing_target_path(target: str) -> Path | None:
         return path if path.exists() else None
     except (OSError, RuntimeError):
         return None
+
+
+def _parse_job_options(
+    options: list[str],
+    *,
+    allow_trajectory_json: bool,
+) -> tuple[bool, bool, bool] | None:
+    allowed = {"--verbose", "--profile"}
+    if allow_trajectory_json:
+        allowed.add("--trajectory-json")
+    if len(options) != len(set(options)) or any(option not in allowed for option in options):
+        return None
+    trajectory_json = "--trajectory-json" in options
+    if trajectory_json and len(options) != 1:
+        return None
+    return trajectory_json, "--verbose" in options, "--profile" in options
+
+
+def _path_detail_command(target: Path | None) -> str:
+    if target is None:
+        return "bmd-agent --verbose"
+    return f"bmd-agent {_quote_cli_target(str(target))} --verbose"
+
+
+def _quote_cli_target(target: str) -> str:
+    return f'"{target}"' if any(character.isspace() for character in target) else target
 
 
 def modifier_policies_from_compute(
