@@ -282,7 +282,7 @@ def test_input_reference_invokes_fixed_producer_with_stdin_and_check_false(
 
     assert response.status == "ok"
     command, kwargs = calls[0]
-    assert command == [str(repo.capability_python), "-m", PRODUCER_MODULE]
+    assert command == [str(repo.capability_python), "-B", "-m", PRODUCER_MODULE]
     assert kwargs["cwd"] == repo.path
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True

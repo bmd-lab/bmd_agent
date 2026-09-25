@@ -180,7 +180,40 @@ Internal development may temporarily use lower-level mechanisms, but the
 security model must not depend on the language model voluntarily
 avoiding dangerous commands.
 
-## 9. Least privilege
+Current producer integrations invoke fixed Python modules from explicitly
+configured BMD Compute and BMDex checkouts. They do not expose a user-selected
+module or arbitrary shell command. These checkouts and their configured Python
+environments are trusted code dependencies: imported module code executes with
+the operating-system privileges of the Agent caller. Agent must not be
+configured to execute untrusted third-party checkout code.
+
+Python producer invocations use `-B` to avoid creating import bytecode caches in
+trusted checkouts. This reduces incidental writes but does not sandbox producer
+code or remove the need to trust it.
+
+## 9. Path authorization and OS enforcement
+
+`allowed_remote_roots` constrains remote reads using lexical POSIX path
+normalization. It rejects traversal and paths outside configured roots, but it
+is not a remote filesystem sandbox. In particular, it does not prove that a
+symlink beneath an authorized root resolves beneath that root. If the remote
+SSH identity can follow such a symlink, the operating system may permit access
+outside the lexical root.
+
+Likewise, configuration values such as `access = "read_only"` and
+`access = "observational"` are enforced Agent policy declarations. They do not
+technically remove write permissions from the configured OS or SSH identity.
+
+Safe deployment therefore combines:
+
+1. Agent's fixed-purpose, action-free implementation;
+2. correctly configured allowed roots; and
+3. least-privileged OS/SSH credentials, filesystem permissions, and ACLs.
+
+Do not describe BMD Agent as a filesystem security sandbox. Server-side
+identity and permission controls remain part of the security boundary.
+
+## 10. Least privilege
 
 Where practical, security should be enforced by:
 
@@ -198,7 +231,7 @@ The persistent production agent should eventually run under a dedicated
 VM service identity rather than inheriting the PI's personal
 credentials and filesystem authority.
 
-## 10. Credentials
+## 11. Credentials
 
 The agent must not unnecessarily inherit:
 
@@ -212,7 +245,7 @@ Credentials should be scoped to the minimum capabilities required.
 Read credentials and write credentials should be separate where
 possible.
 
-## 11. Future action plane
+## 12. Future action plane
 
 Action capabilities may be introduced later.
 
@@ -240,7 +273,7 @@ Introducing such a capability requires:
 The ability of the underlying operating-system account to perform an
 operation does not imply that BMD Agent is authorized to perform it.
 
-## 12. Auditability
+## 13. Auditability
 
 Material agent operations should eventually record:
 
@@ -267,7 +300,7 @@ The objective is to make it possible to reconstruct:
 - what tests it ran;
 - what scientific evidence supported its claims.
 
-## 13. Scientific safety
+## 14. Scientific safety
 
 The agent must distinguish observation from inference.
 
@@ -283,12 +316,18 @@ It should preserve important methodological distinctions such as:
 When evidence is incomplete, the agent should state the validation gap
 rather than silently promote the claim.
 
-## 14. v0 guarantee
+## 15. v0 guarantee
 
-The simplest security property of v0 is:
+The central security property of v0 is:
 
-    no mutation tools exist
+    no user-facing calculation, scheduler, or repository mutation actions exist
 
 The first implementation should prove that useful scientific
 observation, troubleshooting, and advice are possible before any action
 capabilities are introduced.
+
+BMD Agent does not intentionally modify calculations, submit or cancel jobs,
+restart calculations, alter scientific inputs, delete calculation files, or
+read POTCAR contents. This statement describes Agent's implemented interfaces;
+it is not a claim that the configured OS identity lacks write permissions or
+that trusted producer module code is sandboxed.

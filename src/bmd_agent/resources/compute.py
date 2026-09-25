@@ -67,7 +67,7 @@ def inspect_compute_capabilities(
 
     try:
         completed = runner(
-            [str(repository.capability_python), "-m", PRODUCER_MODULE],
+            [str(repository.capability_python), "-B", "-m", PRODUCER_MODULE],
             cwd=repository.path,
             capture_output=True,
             text=True,
