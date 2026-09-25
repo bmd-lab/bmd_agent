@@ -687,7 +687,7 @@ def test_relocated_cli_prints_current_acquisition_and_original_producer_paths(
         lambda: (_ for _ in ()).throw(ConfigurationError("missing config")),
     )
 
-    exit_code = cli.main([])
+    exit_code = cli.main(["--verbose"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -714,7 +714,7 @@ def test_relocated_partial_cli_prints_diagnostics_without_vasprun_exception(
         lambda: (_ for _ in ()).throw(ConfigurationError("missing config")),
     )
 
-    exit_code = cli.main([])
+    exit_code = cli.main(["--verbose"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -838,7 +838,7 @@ def test_relocated_cli_lists_multistage_acquisition_and_producer_provenance(
         lambda: (_ for _ in ()).throw(ConfigurationError("missing config")),
     )
 
-    exit_code = cli.main([])
+    exit_code = cli.main(["--verbose"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -981,8 +981,9 @@ def test_bare_cli_routes_to_cwd_lifecycle_analysis(
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert "Calculation state: PRE_RUN" in captured.out
+    assert "Status: PRE_RUN" in captured.out
     assert "BMD Agent" in captured.out
+    assert "bmd-agent --verbose" in captured.out
 
 
 def test_explicit_path_and_cwd_produce_equivalent_lifecycle_output(
@@ -1004,7 +1005,12 @@ def test_explicit_path_and_cwd_produce_equivalent_lifecycle_output(
     assert cli.main([]) == 0
     cwd_output = capsys.readouterr().out
 
-    assert explicit_output == cwd_output
+    assert explicit_output.split("Detailed evidence:", 1)[0] == cwd_output.split(
+        "Detailed evidence:", 1
+    )[0]
+    detail_target = f'"{tmp_path}"' if any(char.isspace() for char in str(tmp_path)) else str(tmp_path)
+    assert f"bmd-agent {detail_target} --verbose" in explicit_output
+    assert "bmd-agent --verbose" in cwd_output
 
 
 def test_existing_explicit_cli_commands_remain_available(capsys) -> None:

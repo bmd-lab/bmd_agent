@@ -2899,7 +2899,7 @@ def test_cli_job_trajectory_json_uses_existing_inspection_once(
     assert captured.err == ""
 
 
-def test_cli_job_without_trajectory_json_keeps_normal_summary(
+def test_cli_job_defaults_to_concise_summary_and_verbose_keeps_detailed_evidence(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2922,9 +2922,18 @@ def test_cli_job_without_trajectory_json_keeps_normal_summary(
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    assert captured.out.startswith("BMD Agent\n=========\n\n")
+    assert "Status: UNKNOWN" in captured.out
+    assert "bmd-agent job 20893681 --verbose" in captured.out
+    assert "Job (scheduler_observation):" not in captured.out
+    assert "{" not in captured.out
+
+    exit_code = cli.main(["job", "20893681", "--verbose"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
     assert captured.out.startswith("BMD Job Inspection\n==================\n\n")
     assert "Job (scheduler_observation):" in captured.out
-    assert "{" not in captured.out
 
 
 def test_diagnose_malformed_vasprun_keeps_oszicar_evidence_and_quiet_cli(
